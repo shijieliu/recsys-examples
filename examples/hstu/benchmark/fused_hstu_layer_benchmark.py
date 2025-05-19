@@ -110,12 +110,13 @@ def create_hstu_layer(
     required=False,
 )
 @click.option("--max-seqlen", type=int, default=1024, required=True)
-@click.option("--full-sequence", type=bool, default=False, required=True)
+@click.option("--full-sequence", type=bool, default=True, required=True)
 @click.option("--batchsize", type=int, default=32, required=True)
 @click.option("--profiler-start", type=int, default=20, required=False)
 @click.option("--profiler-end", type=int, default=40, required=False)
 @click.option("--dump-memory-snapshot", type=bool, default=True, required=False)
 @click.option("--num-layers", type=int, default=1, required=False)
+@click.option("--enable-cuda-graph", type=bool, default=False, required=False)
 def run(
     iters,
     warmup_iters,
@@ -132,6 +133,7 @@ def run(
     async_wgrad,
     dump_memory_snapshot,
     num_layers,
+    enable_cuda_graph,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -166,6 +168,10 @@ def run(
             dtype=torch.int32,
             device="cuda",
         )
+
+    if enable_cuda_graph:
+        assert full_sequence, "Cuda graph is not supported for non-full sequence"
+
     seq_offsets = length_to_complete_offsets(lengths)
     L = int(seq_offsets[-1].item())
     input = torch.randn(L, hidden_size, dtype=dtype, device="cuda")
@@ -187,11 +193,30 @@ def run(
     # warmup
     if dump_memory_snapshot:
         torch.cuda.memory._record_memory_history(max_entries=10000)
-    for _ in range(warmup_iters):
-        ret_jd = hstu_blocks[0](jagged_input)
-        for hstu_layer in hstu_blocks[1:]:
-            ret_jd = hstu_layer(ret_jd)
-        ret_jd.values.backward(grad_output)
+
+    if enable_cuda_graph:
+        cuda_graph_stream = torch.cuda.Stream()
+        cuda_graph_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cuda_graph_stream):
+            for _ in range(warmup_iters):
+                ret_jd = hstu_blocks[0](jagged_input)
+                for hstu_layer in hstu_blocks[1:]:
+                    ret_jd = hstu_layer(ret_jd)
+                ret_jd.values.backward(grad_output)
+        torch.cuda.current_stream().wait_stream(cuda_graph_stream)
+
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cuda_graph):
+            ret_jd = hstu_blocks[0](jagged_input)
+            for hstu_layer in hstu_blocks[1:]:
+                ret_jd = hstu_layer(ret_jd)
+            ret_jd.values.backward(grad_output)
+    else:
+        for _ in range(warmup_iters):
+            ret_jd = hstu_blocks[0](jagged_input)
+            for hstu_layer in hstu_blocks[1:]:
+                ret_jd = hstu_layer(ret_jd)
+            ret_jd.values.backward(grad_output)
 
     if dump_memory_snapshot:
         torch.cuda.memory._dump_snapshot(
@@ -200,49 +225,63 @@ def run(
         torch.cuda.memory._record_memory_history(enabled=None)
 
     # benchmark
-    igpu_timer = IGPUTimer(max_iters=iters)
-    # fwd
-    for iteration in range(iters):
-        igpu_timer.start(iteration)
-        ret_jd = hstu_blocks[0](jagged_input)
-        for hstu_layer in hstu_blocks[1:]:
-            ret_jd = hstu_layer(ret_jd)
-        # ret_jd.values.backward(grad_output)
-        igpu_timer.stop(iteration)
+    if enable_cuda_graph:
+        igpu_timer = IGPUTimer()
+        igpu_timer.start()
+        for iteration in range(iters):
+            cuda_graph.replay()
+        igpu_timer.stop()
+        fwd_and_bwd_median_time = igpu_timer.elapsed_time(reduction="median")
+        print(
+            f"[{log_layer_type}] [fwd+bwd] tokens {L};time (median): {fwd_and_bwd_median_time/iters:.4f} ms."
+        )
+    else:
+        igpu_timer = IGPUTimer(max_iters=iters)
+        # fwd
+        for iteration in range(iters):
+            igpu_timer.start(iteration)
+            ret_jd = hstu_blocks[0](jagged_input)
+            for hstu_layer in hstu_blocks[1:]:
+                ret_jd = hstu_layer(ret_jd)
+            # ret_jd.values.backward(grad_output)
+            igpu_timer.stop(iteration)
 
-    fwd_median_time = igpu_timer.elapsed_time(reduction="median")
-    print(
-        f"[{log_layer_type}] [fwd] tokens {L};time (median): {fwd_median_time:.4f} ms."
-    )
+        fwd_median_time = igpu_timer.elapsed_time(reduction="median")
+        print(
+            f"[{log_layer_type}] [fwd] tokens {L};time (median): {fwd_median_time:.4f} ms."
+        )
 
-    # bwd
-    for iteration in range(iters):
-        ret_jd = hstu_blocks[0](jagged_input)
-        for hstu_layer in hstu_blocks[1:]:
-            ret_jd = hstu_layer(ret_jd)
-        igpu_timer.start(iteration)
-        ret_jd.values.backward(grad_output)
-        igpu_timer.stop(iteration)
+        # bwd
+        for iteration in range(iters):
+            ret_jd = hstu_blocks[0](jagged_input)
+            for hstu_layer in hstu_blocks[1:]:
+                ret_jd = hstu_layer(ret_jd)
+            igpu_timer.start(iteration)
+            ret_jd.values.backward(grad_output)
+            igpu_timer.stop(iteration)
 
-    bwd_median_time = igpu_timer.elapsed_time(reduction="median")
-    print(
-        f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms."
-    )
-    print(
-        f"[{log_layer_type}] [e2e] tokens {L};time: {fwd_median_time + bwd_median_time:.4f} ms."
-    )
+        bwd_median_time = igpu_timer.elapsed_time(reduction="median")
+        print(
+            f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms."
+        )
+        print(
+            f"[{log_layer_type}] [e2e] tokens {L};time: {fwd_median_time + bwd_median_time:.4f} ms."
+        )
     # nsys
     for iteration in range(iters):
         if iteration == profiler_start or iteration == iters - 1:
             torch.cuda.profiler.start()
 
-        with nvtx.annotate(f"hstu_layer_fwd {iteration}", color="ORANGE"):
-            ret_jd = hstu_blocks[0](jagged_input)
-            for hstu_layer in hstu_blocks[1:]:
-                ret_jd = hstu_layer(ret_jd)
+        if enable_cuda_graph:
+            cuda_graph.replay()
+        else:
+            with nvtx.annotate(f"hstu_layer_fwd {iteration}", color="ORANGE"):
+                ret_jd = hstu_blocks[0](jagged_input)
+                for hstu_layer in hstu_blocks[1:]:
+                    ret_jd = hstu_layer(ret_jd)
 
-        with nvtx.annotate(f"hstu_layer_bwd {iteration}", color="PURPLE"):
-            ret_jd.values.backward(grad_output)
+            with nvtx.annotate(f"hstu_layer_bwd {iteration}", color="PURPLE"):
+                ret_jd.values.backward(grad_output)
 
         if iteration == profiler_end or iteration == iters - 1:
             torch.cuda.profiler.stop()

@@ -44,6 +44,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --max-seqlen $max_seqlen \
                     --batchsize $batchsize \
                     --async-wgrad $ASYNC_WGRAD \
+                    --enable-cuda-graph True \
                     --profiler-start $profiler_start \
                     --profiler-end $profiler_end | tee ./profile/${gpu_arch}_${fused_output_profile_name}.log
 
@@ -61,6 +62,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --max-seqlen $max_seqlen \
                     --batchsize $batchsize \
                     --async-wgrad $ASYNC_WGRAD \
+                    --enable-cuda-graph True \
                     --profiler-start $profiler_start \
                     --profiler-end $profiler_end | tee ./profile/${gpu_arch}_${native_output_profile_name}.log
                   sleep 1
