@@ -53,6 +53,11 @@ class RankingGR(BaseModel):
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
         self._hstu_block = HSTUBlock(hstu_config)
+        self._stream = torch.cuda.Stream()
+
+        self._end_hstu_block = HSTUBlock(hstu_config)
+        self._stream_end = torch.cuda.Stream()
+
         self._mlp = MLP(
             hstu_config.hidden_size,
             task_config.prediction_head_arch,
@@ -123,11 +128,25 @@ class RankingGR(BaseModel):
         )
         batch = dmp_batch_to_tp(batch)
         # hidden_states is a JaggedData
-        hidden_states_jagged, seqlen_after_preprocessor = self._hstu_block(
-            embeddings=embeddings,
-            batch=batch,
-        )
-        hidden_states = hidden_states_jagged.values
+        # hidden_states_jagged, seqlen_after_preprocessor = self._hstu_block(
+        #     embeddings=embeddings,
+        #     batch=batch,
+        # )
+        with torch.cuda.stream(self._stream_end):
+            end_hidden, _ = self._end_hstu_block(
+                embeddings=embeddings,
+                batch=batch,
+            )
+
+        with torch.cuda.stream(self._stream):
+            hidden_states_jagged, _ = self._hstu_block(
+                embeddings=embeddings,
+                batch=batch,
+            )
+
+        torch.cuda.current_stream().wait_stream(self._stream)
+        torch.cuda.current_stream().wait_stream(self._stream_end)
+        hidden_states = hidden_states_jagged.values + end_hidden.values
         logits = self._mlp(hidden_states)
         return logits, seqlen_after_preprocessor, batch.labels
 
