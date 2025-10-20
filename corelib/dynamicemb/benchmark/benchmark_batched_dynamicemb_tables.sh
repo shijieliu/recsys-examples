@@ -2,14 +2,14 @@
 
 export CUDA_VISIBLE_DEVICES=0
 
-declare -A hbm=(["sgd"]=12.8 ["adam"]=38.4)
+declare -A hbm=(["sgd"]=12.8 ["adam"]=0)
 use_index_dedups=("False")
-batch_sizes=(65536 1048576)
-capacities=("64")
-optimizer_types=("sgd" "adam")
-embedding_dims=(512)
+batch_sizes=(65536)
+capacities=("100")
+optimizer_types=("adam")
+embedding_dims=(128)
 alphas=(1.05)
-gpu_ratio=0.1
+gpu_ratio=0.01
 
 rm benchmark_results.json
 for batch_size in "${batch_sizes[@]}"; do
@@ -23,20 +23,20 @@ for batch_size in "${batch_sizes[@]}"; do
         for alpha in "${alphas[@]}"; do
           echo "alpha: $alpha"
 
-          torchrun --nnodes 1 --nproc_per_node 1 \
-              ./benchmark/benchmark_batched_dynamicemb_tables.py  \
-                --caching \
-                --cache_algorithm "lru" \
-                --gpu_ratio $gpu_ratio \
-                --batch_size $batch_size \
-                --num_embeddings_per_feature $capacity \
-                --embedding_dim $embedding_dim \
-                --hbm_for_embeddings ${hbm[$optimizer_type]} \
-                --optimizer_type $optimizer_type \
-                --feature_distribution "pow-law" \
-                --alpha $alpha \
-                --num_iterations 100 \
-                --table_version 2
+          # torchrun --nnodes 1 --nproc_per_node 1 \
+          #     ./benchmark/benchmark_batched_dynamicemb_tables.py  \
+          #       --caching \
+          #       --cache_algorithm "lru" \
+          #       --gpu_ratio $gpu_ratio \
+          #       --batch_size $batch_size \
+          #       --num_embeddings_per_feature $capacity \
+          #       --embedding_dim $embedding_dim \
+          #       --hbm_for_embeddings ${hbm[$optimizer_type]} \
+          #       --optimizer_type $optimizer_type \
+          #       --feature_distribution "pow-law" \
+          #       --alpha $alpha \
+          #       --num_iterations 100 \
+          #       --table_version 2
 
           torchrun --nnodes 1 --nproc_per_node 1 \
               ./benchmark/benchmark_batched_dynamicemb_tables.py  \

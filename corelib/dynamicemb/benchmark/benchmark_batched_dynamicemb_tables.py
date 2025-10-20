@@ -191,7 +191,6 @@ def parse_args():
     args.hbm_for_embeddings = [
         int(float(v) * (1024**3)) for v in args.hbm_for_embeddings.split(",")
     ]
-
     return args
 
 
@@ -676,86 +675,96 @@ def main():
         clear_cache(args, var, torchrec_emb)
 
     warmup_gpu(device)
-    for i in range(0, args.num_iterations, report_interval):
-        for j in range(report_interval):
-            (
-                forward_latency,
-                backward_latency,
-                iteration_latency,
-            ) = benchmark_one_iteration(var, sparse_features[i + j])
-            cache_info = ""
-            if args.caching:
-                cache_metrics = var.caches[0].cache_metrics
-                unique_num = cache_metrics[0].item()
-                cache_hit = cache_metrics[1].item()
-                cache_miss = unique_num - cache_hit
-                hit_rate = 1.0 * cache_hit / unique_num
-                cache_info = f"cache_miss:{cache_miss}, unique: {unique_num}, hit_rate: {hit_rate:.8f},"
-            print(
-                f"dynamicemb: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-                f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
-            )
+    import time
+    start_time = time.time()
+    var.dump("./debug", optim=True)
+    end_time = time.time()
+    print(f"Dump dynamic embedding done in {end_time - start_time:.3f} s.")
+    import time
+    start_time = time.time()
+    var.load("./debug", optim=True)
+    end_time = time.time()
+    print(f"Load dynamic embedding done in {end_time - start_time:.3f} s.")
+    # for i in range(0, args.num_iterations, report_interval):
+    #     for j in range(report_interval):
+    #         (
+    #             forward_latency,
+    #             backward_latency,
+    #             iteration_latency,
+    #         ) = benchmark_one_iteration(var, sparse_features[i + j])
+    #         cache_info = ""
+    #         if args.caching:
+    #             cache_metrics = var.caches[0].cache_metrics
+    #             unique_num = cache_metrics[0].item()
+    #             cache_hit = cache_metrics[1].item()
+    #             cache_miss = unique_num - cache_hit
+    #             hit_rate = 1.0 * cache_hit / unique_num
+    #             cache_info = f"cache_miss:{cache_miss}, unique: {unique_num}, hit_rate: {hit_rate:.8f},"
+    #         print(
+    #             f"dynamicemb: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
+    #             f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
+    #         )
 
-        for j in range(report_interval):
-            (
-                forward_latency,
-                backward_latency,
-                iteration_latency,
-            ) = benchmark_one_iteration(torchrec_emb, sparse_features[i + j])
-            cache_info = ""
-            if args.caching:
-                cache_miss_counter_ = torchrec_emb.get_cache_miss_counter().clone()
-                # table_wise_cache_miss_ = torchrec_emb.get_table_wise_cache_miss().clone()
-                if cache_miss_counter_torchrec is not None:
-                    cache_miss_counter_incerment = (
-                        cache_miss_counter_ - cache_miss_counter_torchrec
-                    )
-                else:
-                    cache_miss_counter_incerment = torch.tensor([0, 0])
-                # if table_wise_cache_miss is not None:
-                #     table_wise_cache_miss_increment = table_wise_cache_miss_ - table_wise_cache_miss
-                # else:
-                #     table_wise_cache_miss_increment = torch.tensor([0])
-                cache_info = f"cache miss: {cache_miss_counter_incerment[1].item()}"
-                cache_miss_counter_torchrec = cache_miss_counter_
+    #     for j in range(report_interval):
+    #         (
+    #             forward_latency,
+    #             backward_latency,
+    #             iteration_latency,
+    #         ) = benchmark_one_iteration(torchrec_emb, sparse_features[i + j])
+    #         cache_info = ""
+    #         if args.caching:
+    #             cache_miss_counter_ = torchrec_emb.get_cache_miss_counter().clone()
+    #             # table_wise_cache_miss_ = torchrec_emb.get_table_wise_cache_miss().clone()
+    #             if cache_miss_counter_torchrec is not None:
+    #                 cache_miss_counter_incerment = (
+    #                     cache_miss_counter_ - cache_miss_counter_torchrec
+    #                 )
+    #             else:
+    #                 cache_miss_counter_incerment = torch.tensor([0, 0])
+    #             # if table_wise_cache_miss is not None:
+    #             #     table_wise_cache_miss_increment = table_wise_cache_miss_ - table_wise_cache_miss
+    #             # else:
+    #             #     table_wise_cache_miss_increment = torch.tensor([0])
+    #             cache_info = f"cache miss: {cache_miss_counter_incerment[1].item()}"
+    #             cache_miss_counter_torchrec = cache_miss_counter_
 
-            print(
-                f"torchrec: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-                f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
-            )
+    #         print(
+    #             f"torchrec: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
+    #             f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
+    #         )
 
-    if args.caching:
-        var.set_record_cache_metrics(False)
-        torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
-        clear_cache(args, var, torchrec_emb)
+    # if args.caching:
+    #     var.set_record_cache_metrics(False)
+    #     torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
+    #     clear_cache(args, var, torchrec_emb)
 
-    torch.cuda.profiler.start()
-    dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
-    torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
-    torch.cuda.profiler.stop()
+    # torch.cuda.profiler.start()
+    # dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
+    # torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
+    # torch.cuda.profiler.stop()
 
-    test_result = {
-        "caching": args.caching,
-        "table_version": args.table_version,
-        "batch_size": args.batch_size,
-        "num_embeddings_per_feature": args.num_embeddings_per_feature,
-        "hbm_for_embeddings": args.hbm_for_embeddings,
-        "optimizer_type": args.optimizer_type,
-        "feature_distribution-alpha": f"{args.feature_distribution}-{args.alpha}",
-        "embedding_dim": args.embedding_dim,
-        "num_iterations": args.num_iterations,
-        "cache_algorithm": args.cache_algorithm,
-        "use_index_dedup": args.use_index_dedup,
-        "eval(torchrec)": torchrec_res[3],
-        "forward(torchrec)": torchrec_res[1],
-        "backward(torchrec)": torchrec_res[2],
-        "train(torchrec)": torchrec_res[0],
-        "eval(dynamicemb)": dynamicemb_res[3],
-        "forward(dynamicemb)": dynamicemb_res[1],
-        "backward(dynamicemb)": dynamicemb_res[2],
-        "train(dynamicemb)": dynamicemb_res[0],
-    }
-    append_to_json("benchmark_results.json", test_result)
+    # test_result = {
+    #     "caching": args.caching,
+    #     "table_version": args.table_version,
+    #     "batch_size": args.batch_size,
+    #     "num_embeddings_per_feature": args.num_embeddings_per_feature,
+    #     "hbm_for_embeddings": args.hbm_for_embeddings,
+    #     "optimizer_type": args.optimizer_type,
+    #     "feature_distribution-alpha": f"{args.feature_distribution}-{args.alpha}",
+    #     "embedding_dim": args.embedding_dim,
+    #     "num_iterations": args.num_iterations,
+    #     "cache_algorithm": args.cache_algorithm,
+    #     "use_index_dedup": args.use_index_dedup,
+    #     "eval(torchrec)": torchrec_res[3],
+    #     "forward(torchrec)": torchrec_res[1],
+    #     "backward(torchrec)": torchrec_res[2],
+    #     "train(torchrec)": torchrec_res[0],
+    #     "eval(dynamicemb)": dynamicemb_res[3],
+    #     "forward(dynamicemb)": dynamicemb_res[1],
+    #     "backward(dynamicemb)": dynamicemb_res[2],
+    #     "train(dynamicemb)": dynamicemb_res[0],
+    # }
+    # append_to_json("benchmark_results.json", test_result)
 
     dist.barrier()
     dist.destroy_process_group()

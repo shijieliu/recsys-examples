@@ -611,15 +611,16 @@ class KeyValueTable(Cache, Storage):
         opt_file_path: Optional[str],
         include_optim: bool,
     ) -> None:
-        meta_data = load_from_json(meta_json_file_path)
-        opt_type = meta_data.get(
-            "opt_type", None
-        )  # for compatibility with old format, which doesn't have opt_type
-        if opt_type and self.optimizer.get_opt_args().get("opt_type", None) != opt_type:
-            include_optim = False
-            print(
-                f"Optimizer type mismatch: {opt_type} != {self.optimizer.get_opt_args().get('opt_type')}. Will not load optimizer states."
-            )
+        if os.path.exists(meta_json_file_path):
+            meta_data = load_from_json(meta_json_file_path)
+            opt_type = meta_data.get(
+                "opt_type", None
+            )  # for compatibility with old format, which doesn't have opt_type
+            if opt_type and self.optimizer.get_opt_args().get("opt_type", None) != opt_type:
+                include_optim = False
+                print(
+                    f"Optimizer type mismatch: {opt_type} != {self.optimizer.get_opt_args().get('opt_type')}. Will not load optimizer states."
+                )
 
         if not opt_file_path or not os.path.exists(opt_file_path):
             include_optim = False
@@ -640,7 +641,7 @@ class KeyValueTable(Cache, Storage):
         if optstate_dim == 0:
             include_optim = False
 
-        if include_optim:
+        if include_optim and os.path.exists(meta_json_file_path):
             self.optimizer.set_opt_args(meta_data)
 
         fkey = open(emb_key_path, "rb")
