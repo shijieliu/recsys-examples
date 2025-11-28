@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import warnings
+
+# Ignore all FutureWarnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+import argparse
+from typing import List, Union
+
+import commons.utils.initialize as init
+import gin
+import torch  # pylint: disable-unused-import
+from configs import RetrievalConfig
+from distributed.sharding import make_optimizer_and_shard
+from model import get_retrieval_model
+from modules.metrics import RetrievalTaskMetricWithSampling
+from pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainNonePipeline,
+    JaggedMegatronTrainPipelineSparseDist,
+)
+from trainer.training import maybe_load_ckpts, train_with_pipeline
+from trainer.utils import (
+    create_dynamic_optitons_dict,
+    create_embedding_configs,
+    create_hstu_config,
+    create_optimizer_params,
+    get_data_loader,
+    get_dataset_and_embedding_args,
+    get_embedding_vector_storage_multiplier,
+)
+from utils import (  # from hstu.utils
+    BenchmarkDatasetArgs,
+    DatasetArgs,
+    EmbeddingArgs,
+    NetworkArgs,
+    OptimizerArgs,
+    RetrievalArgs,
+    TensorModelParallelArgs,
+    TrainerArgs,
+)
+from commons.checkpoint import get_unwrapped_module
+
+def create_retrieval_config(
+    dataset_args: Union[DatasetArgs, BenchmarkDatasetArgs],
+    network_args: NetworkArgs,
+    embedding_args: List[EmbeddingArgs],
+) -> RetrievalConfig:
+    retrieval_args = RetrievalArgs()
+
+    return RetrievalConfig(
+        embedding_configs=create_embedding_configs(
+            dataset_args, network_args, embedding_args
+        ),
+        temperature=retrieval_args.temperature,
+        l2_norm_eps=retrieval_args.l2_norm_eps,
+        num_negatives=retrieval_args.num_negatives,
+        eval_metrics=retrieval_args.eval_metrics,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Distributed GR Arguments", allow_abbrev=False
+    )
+    parser.add_argument("--gin-config-file", type=str)
+    args = parser.parse_args()
+    gin.parse_config_file(args.gin_config_file)
+    trainer_args = TrainerArgs()
+    dataset_args, embedding_args = get_dataset_and_embedding_args()
+    network_args = NetworkArgs()
+    optimizer_args = OptimizerArgs()
+    tp_args = TensorModelParallelArgs()
+
+    init.initialize_distributed()
+    init.initialize_model_parallel(
+        tensor_model_parallel_size=tp_args.tensor_model_parallel_size
+    )
+    init.set_random_seed(trainer_args.seed)
+
+    hstu_config = create_hstu_config(network_args, tp_args)
+    task_config = create_retrieval_config(dataset_args, network_args, embedding_args)
+    model = get_retrieval_model(hstu_config=hstu_config, task_config=task_config)
+
+    dynamic_options_dict = create_dynamic_optitons_dict(
+        embedding_args,
+        network_args.hidden_size,
+        training=True,
+        embedding_dim_multiplier=get_embedding_vector_storage_multiplier(
+            optimizer_args.optimizer_str
+        ),
+    )
+    optimizer_param = create_optimizer_params(optimizer_args)
+    model_train, dense_optimizer = make_optimizer_and_shard(
+        model,
+        config=hstu_config,
+        sparse_optimizer_param=optimizer_param,
+        dense_optimizer_param=optimizer_param,
+        dynamicemb_options_dict=dynamic_options_dict,
+        pipeline_type=trainer_args.pipeline_type,
+    )
+    train_dataloader, test_dataloader = get_data_loader(
+        "retrieval", dataset_args, trainer_args, 0
+    )
+    maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
+
+    model_train.eval()
+    with torch.no_grad():
+        for batch in test_dataloader:
+            embedding, _, _, _ = get_unwrapped_module(model_train).get_logit_and_labels(batch.to(torch.device("cuda", torch.cuda.current_device())))
+            print(embedding.shape)
+    init.destroy_global_state()
+
+
+if __name__ == "__main__":
+    main()
