@@ -326,6 +326,12 @@ def run(args):
     debugger = Debugger()
 
     for i in range(args.num_iterations):
+        if i == 10:
+            print('start profiler')
+            torch.cuda.profiler.start()
+        if i == 20:
+            torch.cuda.profiler.stop()
+            print('stop profiler')
         assert args.num_embedding_table == len(args.num_embeddings_per_feature)
         assert args.num_embedding_table == len(args.multi_hot_sizes)
         mid = args.num_embedding_table // 2

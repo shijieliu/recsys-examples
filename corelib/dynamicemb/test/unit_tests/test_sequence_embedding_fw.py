@@ -296,6 +296,12 @@ def run(args):
     debugger = Debugger()
 
     for i in range(args.num_iterations):
+        if i == 10:
+            print('start profiler')
+            torch.cuda.profiler.start()
+        if i == 20:
+            torch.cuda.profiler.stop()
+            print('stop profiler')
         sparse_feature = generate_sparse_feature(
             feature_num=args.num_embedding_table,
             num_embeddings_list=args.num_embeddings_per_feature,

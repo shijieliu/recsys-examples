@@ -327,69 +327,61 @@ class GroupedScoredHashTable(abc.ABC):
     @abc.abstractmethod
     def lookup(
         self,
-        table_range: torch.Tensor,
         keys: torch.Tensor,
-        scores: List[ScoreArg],
-        founds: Optional[torch.Tensor],
-        indices: torch.Tensor = None,
-    ) -> None:
+        table_ids: torch.Tensor,
+        scores: ScoreArg | List[ScoreArg],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        TODO: kernel fusion
         Argument:
-            missing_table_range: torch.Tensor
-            missing_keys: torch.Tensor=None
-            missing_indices: torch.Tensor=None
-            missing_scores: List[ScoreArg]=None
+            keys: torch.Tensor
+            table_ids: torch.Tensor
+            scores: ScoreArg | List[ScoreArg]
         Returns:
-            num_missing: int
+            indices: torch.Tensor
+            scores: Optional[torch.Tensor]
         """
 
     @abc.abstractmethod
     def insert(
         self,
-        table_range: torch.Tensor,
         keys: torch.Tensor,
-        scores: List[ScoreArg],
-        indices: Optional[torch.Tensor] = None,
-        insert_results: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
+        scores: ScoreArg | List[ScoreArg],
     ) -> None:
         """
-        Keys have to be unique.
-        Indices is output buffer if provided.
+        Argument:
+            keys: torch.Tensor
+            table_ids: torch.Tensor
+            scores: ScoreArg | List[ScoreArg]
+        Returns:
+            indices: torch.Tensor
         """
 
     @abc.abstractmethod
     def insert_and_evict(
         self,
-        table_range: torch.Tensor,
         keys: torch.Tensor,
-        scores: List[ScoreArg],
-        indices: Optional[torch.Tensor] = None,
-        insert_results: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        table_ids: torch.Tensor,
+        scores: ScoreArg | List[ScoreArg],
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
-        Keys have to be unique.
-        Indices is output buffer if provided.
+        Argument:
+            keys: torch.Tensor
+            table_ids: torch.Tensor
+            scores: ScoreArg | List[ScoreArg]
+        Returns:
+            indices: torch.Tensor
+            num_evicted_keys: torch.Tensor
+            evicted_keys: torch.Tensor
+            evicted_indices: torch.Tensor
+            evicted_scores: Optional[torch.Tensor]
         """
-
-        num_evicted: int
-        missing_table_range: torch.Tensor
-        evicted_keys: torch.Tensor
-        evicted_indices: torch.Tensor
-        evicted_scores: List[torch.Tensor]
-        return (
-            num_evicted,
-            missing_table_range,
-            evicted_keys,
-            evicted_indices,
-            evicted_scores,
-        )
 
     @abc.abstractmethod
     def erase(
         self,
-        table_range: torch.Tensor,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
     ) -> None:
         """
         Erase Keys.
@@ -398,61 +390,61 @@ class GroupedScoredHashTable(abc.ABC):
     @abc.abstractmethod
     def load(
         self,
-        table_names: List[str],
-        key_files: List[str],
-        score_files: List[Dict[str, str]],
+        table_name: str,
+        key_file: str,
+        score_file: Dict[str, str],
     ) -> None:
         """
         Load keys and scores from input file path.
 
         Args:
-            table_names: List[str]
-            key_files: List[str],
-            score_files: List[Dict[str, str]]: Dict from score name to score file path.
+            table_name: str
+            key_file: str,
+            score_file: Dict[str, str]: Dict from score name to score file path.
         """
 
     @abc.abstractmethod
     def dump(
         self,
-        table_names: List[str],
-        key_files: List[str],
-        score_files: List[Dict[str, str]],
+        table_name: str,
+        key_file: str,
+        score_file: Dict[str, str],
     ) -> None:
         """
         Dump keys and scores to output file path.
 
         Args:
-            table_names: List[str]
-            key_files: List[str],
-            score_files: List[Dict[str, str]]: Dict from score name to score file path.
+            table_name: str
+            key_file: str,
+            score_file: Dict[str, str]: Dict from score name to score file path.
         """
 
     @abc.abstractmethod
     def incremental_dump(
         self,
-        table_names: List[str],
-        score_threshold: List[Dict[str, int]],
+        table_name: str,
+        score_threshold: Dict[str, int],
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
-    ) -> Tuple[List[torch.Tensor], List[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Dump incremental keys and scores into cpu tensors.
 
         Args:
-            table_names (List[str]): table names.
-            score_threshold (List[Dict[str, int]]): input threshold of each score for tables.
+            table_name: str
+            score_threshold: Dict[str, int]
             batch_size (int): the batch size when scan the table.
             pg (Optional[dist.ProcessGroup]): process group.
 
         Returns:
-            out_keys (List[torch.Tensor]): output tensor of keys for tables.
-            out_scores (List[Dict[str, torch.Tensor]]): output tensors of scores for tables.
+            out_keys: torch.Tensor
+            out_scores: Dict[str, torch.Tensor]
         """
 
     @abc.abstractmethod
     def reset(
         self,
-        table_names: List[str],
+        table_name: str,
     ) -> None:
         """
         Reset the table in `table_names`.
@@ -1249,6 +1241,515 @@ class LinearBucketTable(ScoredHashTable):
         return bkt_keys, offsets, inverse
 
 
+class GroupedLinearBucketTable(GroupedScoredHashTable):
+    """
+    Implementation of GroupedScoredHashTable that wraps multiple LinearBucketTable instances.
+    
+    This class provides a unified interface for multiple logical hash tables that share
+    a common index space. Each table has its own capacity, and indices are mapped to
+    a global index space using table offsets.
+    
+    For example, if we have 3 tables with capacities [1000, 2000, 1500]:
+    - table_offsets = [0, 1000, 3000, 4500]
+    - Table 0 uses global indices [0, 1000)
+    - Table 1 uses global indices [1000, 3000)
+    - Table 2 uses global indices [3000, 4500)
+    """
+
+    def __init__(
+        self,
+        capacities: List[int],
+        table_names: List[str],
+        score_specs: List[ScoreSpec],
+        key_type: torch.dtype = torch.int64,
+        bucket_capacity: Optional[int] = None,
+        device: torch.device = None,
+        expand_fns: Optional[List[Optional[Any]]] = None,
+    ):
+        """
+        Initialize a GroupedLinearBucketTable by creating LinearBucketTable instances.
+        
+        Args:
+            capacities: List of capacities for each table
+            table_names: List of table names
+            score_specs: Score specifications (shared by all tables)
+            key_type: Key type (default torch.int64)
+            bucket_capacity: Bucket capacity for each table
+            device: Device to create tables on
+            expand_fns: Optional list of expand functions (one per table)
+        """
+        assert len(capacities) > 0, "At least one table is required"
+        assert len(capacities) == len(table_names), "capacities and table_names must have same length"
+        
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        
+        # Create tables
+        self._tables = []
+        self._table_offsets = [0]
+        for capacity in capacities:
+            table = LinearBucketTable(
+                capacity=capacity,
+                score_specs=score_specs,
+                key_type=key_type,
+                bucket_capacity=bucket_capacity,
+                device=device,
+            )
+            self._tables.append(table)
+            self._table_offsets.append(self._table_offsets[-1] + table.capacity())
+        
+        self._table_names = table_names
+        self._name_to_idx = {name: idx for idx, name in enumerate(table_names)}
+        self._expand_fns = expand_fns
+        self._key_type = key_type
+        self._score_specs = score_specs
+        self._device = device
+
+    @classmethod
+    def from_tables(
+        cls,
+        tables: List[ScoredHashTable],
+        table_names: List[str],
+        table_offsets: Optional[List[int]] = None,
+        expand_fns: Optional[List[Optional[Any]]] = None,
+    ) -> "GroupedLinearBucketTable":
+        """
+        Create a GroupedLinearBucketTable from existing ScoredHashTable instances.
+        
+        Args:
+            tables: List of ScoredHashTable instances (one per logical table)
+            table_names: List of table names (one per table)
+            table_offsets: Optional list of offsets for global index mapping.
+            expand_fns: Optional list of expand functions (one per table)
+        """
+        assert len(tables) > 0, "At least one table is required"
+        assert len(tables) == len(table_names), "tables and table_names must have same length"
+        
+        # Create instance without calling __init__
+        instance = object.__new__(cls)
+        instance._tables = tables
+        instance._table_names = table_names
+        instance._name_to_idx = {name: idx for idx, name in enumerate(table_names)}
+        instance._expand_fns = expand_fns
+        
+        # Compute table offsets if not provided
+        if table_offsets is None:
+            instance._table_offsets = [0]
+            for table in tables:
+                instance._table_offsets.append(instance._table_offsets[-1] + table.capacity())
+        else:
+            assert len(table_offsets) == len(tables) + 1, \
+                "table_offsets should have len(tables) + 1 elements"
+            instance._table_offsets = table_offsets
+        
+        instance._key_type = tables[0].key_type
+        instance._score_specs = tables[0].score_specs
+        instance._device = tables[0].device if hasattr(tables[0], 'device') else \
+            torch.device("cuda", torch.cuda.current_device())
+        
+        return instance
+
+    @property
+    def key_type(self) -> torch.dtype:
+        return self._key_type
+
+    @property
+    def score_specs(
+        self,
+        score_names: List[str] = None,
+    ) -> List[ScoreSpec]:
+        return self._score_specs
+
+    @property
+    def table_names(
+        self,
+        table_names: List[str] = None,
+    ) -> List[str]:
+        return self._table_names
+
+    @property
+    def table_offsets(self) -> List[int]:
+        """Return the table offsets for global index mapping."""
+        return self._table_offsets
+
+    @property
+    def num_tables(self) -> int:
+        """Return the number of tables."""
+        return len(self._tables)
+
+    @property
+    def score_policy(self) -> ScoreSpec:
+        """Return the first score spec (for single-score compatibility)."""
+        return self._score_specs[0] if self._score_specs else None
+
+    @property
+    def expand_fns(self) -> Optional[List[Optional[Any]]]:
+        """Return the expand functions."""
+        return self._expand_fns
+
+    def get_expand_fn(self, table_idx: int) -> Optional[Any]:
+        """Get the expand function for a specific table."""
+        if self._expand_fns is None:
+            return None
+        return self._expand_fns[table_idx] if table_idx < len(self._expand_fns) else None
+
+    def get_table(self, table_name: str) -> ScoredHashTable:
+        """Get a specific table by name."""
+        idx = self._name_to_idx[table_name]
+        return self._tables[idx]
+
+    def get_table_by_idx(self, table_idx: int) -> ScoredHashTable:
+        """Get a specific table by index."""
+        return self._tables[table_idx]
+
+    def get_table_offset(self, table_idx: int) -> int:
+        """Get the offset for a specific table."""
+        return self._table_offsets[table_idx]
+
+    def local_to_global_index(self, table_idx: int, local_indices: torch.Tensor) -> torch.Tensor:
+        """Convert local indices from a table to global indices."""
+        return local_indices + self._table_offsets[table_idx]
+
+    def global_to_local_index(self, table_idx: int, global_indices: torch.Tensor) -> torch.Tensor:
+        """Convert global indices to local indices for a specific table."""
+        return global_indices - self._table_offsets[table_idx]
+
+    def _partition_by_table(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Partition keys by table_ids.
+        
+        Returns:
+            keys_per_table: List of key tensors, one per table
+            orig_indices_per_table: List of original indices, for reconstructing results
+        """
+        num_tables = len(self._tables)
+        keys_per_table = []
+        orig_indices_per_table = []
+        
+        for i in range(num_tables):
+            mask = table_ids == i
+            keys_per_table.append(keys[mask])
+            orig_indices_per_table.append(torch.where(mask)[0])
+        
+        return keys_per_table, orig_indices_per_table
+
+    def lookup(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: ScoreArg | List[ScoreArg],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Lookup keys across multiple tables.
+        
+        Args:
+            keys: Keys to lookup
+            table_ids: Table ID for each key
+            scores: Score arguments for lookup
+            
+        Returns:
+            founds: Boolean tensor indicating if key was found
+            indices: Global indices for each key (valid only where found=True)
+            scores_out: Output scores (if requested)
+            table_ids_out: Table IDs for each key (same as input)
+        """
+        if isinstance(scores, ScoreArg):
+            scores = [scores]
+        
+        batch = keys.numel()
+        device = keys.device
+        
+        # Initialize output tensors
+        founds = torch.empty(batch, dtype=torch.bool, device=device)
+        indices = torch.empty(batch, dtype=self.index_type, device=device)
+        
+        # Partition keys by table
+        keys_per_table, orig_indices_per_table = self._partition_by_table(keys, table_ids)
+        
+        # Process each table
+        for i, (table, table_keys, orig_indices) in enumerate(
+            zip(self._tables, keys_per_table, orig_indices_per_table)
+        ):
+            if table_keys.numel() == 0:
+                continue
+            
+            # Create per-table output buffers
+            table_founds = torch.empty(table_keys.numel(), dtype=torch.bool, device=device)
+            table_indices = torch.empty(table_keys.numel(), dtype=self.index_type, device=device)
+            
+            # Lookup in this table
+            table.lookup(table_keys, scores, table_founds, table_indices)
+            
+            # Convert local indices to global and store results
+            global_indices = self.local_to_global_index(i, table_indices)
+            founds[orig_indices] = table_founds
+            indices[orig_indices] = global_indices
+        
+        return founds, indices, None, table_ids
+
+    def insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: ScoreArg | List[ScoreArg],
+    ) -> torch.Tensor:
+        """
+        Insert keys into multiple tables.
+        
+        Args:
+            keys: Keys to insert
+            table_ids: Table ID for each key
+            scores: Score arguments for insertion
+            
+        Returns:
+            indices: Global indices where keys were inserted
+        """
+        if isinstance(scores, ScoreArg):
+            scores = [scores]
+        
+        batch = keys.numel()
+        device = keys.device
+        
+        # Initialize output tensor
+        indices = torch.empty(batch, dtype=self.index_type, device=device)
+        
+        # Partition keys by table
+        keys_per_table, orig_indices_per_table = self._partition_by_table(keys, table_ids)
+        
+        # Process each table
+        for i, (table, table_keys, orig_indices) in enumerate(
+            zip(self._tables, keys_per_table, orig_indices_per_table)
+        ):
+            if table_keys.numel() == 0:
+                continue
+            
+            # Create per-table score arguments
+            table_scores = []
+            for score in scores:
+                if score.value is not None:
+                    table_score_value = score.value[orig_indices] if score.value.numel() > 1 else score.value
+                else:
+                    table_score_value = None
+                table_scores.append(ScoreArg(
+                    name=score.name,
+                    value=table_score_value,
+                    policy=score.policy,
+                    is_return=score.is_return,
+                ))
+            
+            # Insert into this table
+            table_indices = torch.empty(table_keys.numel(), dtype=self.index_type, device=device)
+            table.insert(table_keys, table_scores, table_indices)
+            
+            # Convert local indices to global and store results
+            global_indices = self.local_to_global_index(i, table_indices)
+            indices[orig_indices] = global_indices
+        
+        return indices
+
+    def insert_and_evict(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: ScoreArg | List[ScoreArg],
+    ) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """
+        Insert keys and handle evictions across multiple tables.
+        
+        Args:
+            keys: Keys to insert
+            table_ids: Table ID for each key
+            scores: Score arguments for insertion
+            
+        Returns:
+            indices: Global indices where keys were inserted
+            num_evicted: Total number of evicted keys
+            evicted_keys: Evicted keys from all tables
+            evicted_table_ids: Table IDs for evicted keys
+            evicted_indices: Global indices of evicted keys
+            evicted_scores: Scores of evicted keys
+        """
+        if isinstance(scores, ScoreArg):
+            scores = [scores]
+        
+        batch = keys.numel()
+        device = keys.device
+        
+        # Initialize output tensors
+        indices = torch.empty(batch, dtype=self.index_type, device=device)
+        
+        # Collect evicted data from all tables
+        all_evicted_keys = []
+        all_evicted_table_ids = []
+        all_evicted_indices = []
+        all_evicted_scores = [[] for _ in self._score_specs]
+        total_evicted = 0
+        
+        # Partition keys by table
+        keys_per_table, orig_indices_per_table = self._partition_by_table(keys, table_ids)
+        
+        # Process each table
+        for i, (table, table_keys, orig_indices) in enumerate(
+            zip(self._tables, keys_per_table, orig_indices_per_table)
+        ):
+            if table_keys.numel() == 0:
+                continue
+            
+            # Create per-table score arguments
+            table_scores = []
+            for score in scores:
+                if score.value is not None:
+                    table_score_value = score.value[orig_indices] if score.value.numel() > 1 else score.value
+                else:
+                    table_score_value = None
+                table_scores.append(ScoreArg(
+                    name=score.name,
+                    value=table_score_value,
+                    policy=score.policy,
+                    is_return=score.is_return,
+                ))
+            
+            # Insert and evict from this table
+            table_indices = torch.empty(table_keys.numel(), dtype=self.index_type, device=device)
+            num_evicted, evicted_keys, evicted_local_indices, evicted_scores_list = \
+                table.insert_and_evict(table_keys, table_scores, table_indices)
+            
+            # Convert local indices to global and store results
+            global_indices = self.local_to_global_index(i, table_indices)
+            indices[orig_indices] = global_indices
+            
+            # Collect evicted data
+            if num_evicted > 0:
+                all_evicted_keys.append(evicted_keys)
+                all_evicted_table_ids.append(
+                    torch.full((num_evicted,), i, dtype=torch.int64, device=device)
+                )
+                all_evicted_indices.append(self.local_to_global_index(i, evicted_local_indices))
+                for j, evicted_scores in enumerate(evicted_scores_list):
+                    all_evicted_scores[j].append(evicted_scores)
+                total_evicted += num_evicted
+        
+        # Concatenate evicted data
+        if total_evicted > 0:
+            evicted_keys = torch.cat(all_evicted_keys)
+            evicted_table_ids = torch.cat(all_evicted_table_ids)
+            evicted_indices = torch.cat(all_evicted_indices)
+            evicted_scores = [torch.cat(s) for s in all_evicted_scores]
+        else:
+            evicted_keys = torch.empty(0, dtype=self._key_type, device=device)
+            evicted_table_ids = torch.empty(0, dtype=torch.int64, device=device)
+            evicted_indices = torch.empty(0, dtype=self.index_type, device=device)
+            evicted_scores = [torch.empty(0, dtype=spec.dtype, device=device) for spec in self._score_specs]
+        
+        return indices, total_evicted, evicted_keys, evicted_table_ids, evicted_indices, evicted_scores
+
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Erase keys from their respective tables."""
+        # Partition keys by table
+        keys_per_table, _ = self._partition_by_table(keys, table_ids)
+        
+        # Erase from each table
+        for table, table_keys in zip(self._tables, keys_per_table):
+            if table_keys.numel() > 0:
+                table.erase(table_keys)
+
+    def load(
+        self,
+        table_name: str,
+        key_file: str,
+        score_file: Dict[str, str],
+    ) -> None:
+        """Load keys and scores for a specific table."""
+        idx = self._name_to_idx[table_name]
+        self._tables[idx].load(key_file, score_file)
+
+    def dump(
+        self,
+        table_name: str,
+        key_file: str,
+        score_file: Dict[str, str],
+    ) -> None:
+        """Dump keys and scores for a specific table."""
+        idx = self._name_to_idx[table_name]
+        self._tables[idx].dump(key_file, score_file)
+
+    def incremental_dump(
+        self,
+        table_name: str,
+        score_threshold: Dict[str, int],
+        batch_size: int = 65536,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Dump incremental keys and scores for a specific table."""
+        idx = self._name_to_idx[table_name]
+        return self._tables[idx].incremental_dump(score_threshold, batch_size, pg)
+
+    def reset(
+        self,
+        table_name: str,
+    ) -> None:
+        """Reset a specific table."""
+        idx = self._name_to_idx[table_name]
+        self._tables[idx].reset()
+
+    def capacity(self, table_name: str) -> int:
+        """Return the capacity of a specific table."""
+        idx = self._name_to_idx[table_name]
+        return self._tables[idx].capacity()
+
+    def total_capacity(self) -> int:
+        """Return the total capacity across all tables."""
+        return sum(table.capacity() for table in self._tables)
+
+    def size(self, table_name: str) -> int:
+        """Return the size of a specific table."""
+        idx = self._name_to_idx[table_name]
+        return self._tables[idx].size()
+
+    def total_size(self) -> int:
+        """Return the total size across all tables."""
+        return sum(table.size() for table in self._tables)
+
+    def load_factor(self, table_name: str) -> float:
+        """Return the load factor of a specific table."""
+        idx = self._name_to_idx[table_name]
+        return self._tables[idx].load_factor()
+
+    def reserve(
+        self,
+        table_name: str,
+        target_capacity: int,
+    ):
+        """Reserve capacity for a specific table."""
+        idx = self._name_to_idx[table_name]
+        old_capacity = self._tables[idx].capacity()
+        self._tables[idx].reserve(target_capacity)
+        new_capacity = self._tables[idx].capacity()
+        
+        # Update table offsets if capacity changed
+        if new_capacity != old_capacity:
+            capacity_diff = new_capacity - old_capacity
+            for i in range(idx + 1, len(self._table_offsets)):
+                self._table_offsets[i] += capacity_diff
+
+    def memory_usage(self, table_name: str, mem_type=MemoryType.DEVICE) -> int:
+        """Get the memory consumption of a specific table."""
+        idx = self._name_to_idx[table_name]
+        return self._tables[idx].memory_usage(mem_type)
+
+    def total_memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
+        """Get the total memory consumption across all tables."""
+        return sum(table.memory_usage(mem_type) for table in self._tables)
+
+
 def get_scored_table(
     capacity: int,
     bucket_capacity: Optional[int] = None,
@@ -1275,7 +1776,8 @@ def get_scored_table(
 
 def get_grouped_scored_table(
     capacities: List[int],
-    bucket_capacity: Optional[List[int]] = None,
+    table_names: List[str],
+    bucket_capacity: Optional[int] = None,
     key_type: Optional[torch.dtype] = torch.int64,
     score_specs: List[ScoreSpec] = [
         ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
@@ -1285,4 +1787,14 @@ def get_grouped_scored_table(
     reduction_type=ReductionType.LINEAR,
     bucket_load_factor=0.5,  # used when probing_type=ProbingType.CHAINED
 ) -> GroupedScoredHashTable:
-    raise NotImplementedError
+    if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
+        return GroupedLinearBucketTable(
+            capacities=capacities,
+            table_names=table_names,
+            score_specs=score_specs,
+            key_type=key_type,
+            bucket_capacity=bucket_capacity,
+            device=device,
+        )
+    else:
+        raise NotImplementedError
