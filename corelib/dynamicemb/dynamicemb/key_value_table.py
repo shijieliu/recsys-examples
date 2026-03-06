@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -22,6 +23,11 @@ import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+from dynamicemb.extendable_tensor import (
+    DeviceExtendableBuffer,
+    ExtendableBuffer,
+    HostExtendableBuffer,
+)
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -39,7 +45,7 @@ from dynamicemb.types import (
     Storage,
     torch_dtype_to_np_dtype,
 )
-from dynamicemb_extensions import EvictStrategy, flagged_compact
+from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
@@ -79,6 +85,8 @@ def get_score_policy(score_strategy):
         return ScoreSpec(name="customized", policy=ScorePolicy.ASSIGN)
     elif score_strategy == DynamicEmbScoreStrategy.LFU:
         return ScoreSpec(name="frequency", policy=ScorePolicy.ACCUMULATE)
+    elif score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+        return ScoreSpec(name="index", policy=ScorePolicy.ASSIGN)
     else:
         raise RuntimeError("Not supported score strategy.")
 
@@ -91,6 +99,16 @@ def get_uvm_tensor(dim, dtype, device, is_managed=False):
             [dim],
             is_host_mapped=(not is_managed),
         ),
+    )
+
+
+def get_table_ptrs(state: "DynamicEmbTableState") -> torch.Tensor:
+    """Return current data pointers of table buffers from state.tables (ExtendableBuffer).
+    Uses buffer.tensor() so pointers stay valid after ExtendableBuffer.extend()."""
+    return torch.tensor(
+        [b.tensor().data_ptr() for b in state.tables],
+        dtype=torch.int64,
+        device=state.device,
     )
 
 
@@ -108,8 +126,7 @@ class DynamicEmbTableState:
     evict_strategy: EvictStrategy
     key_index_map: Any
     capacity: int
-    tables: List[torch.Tensor]
-    table_ptrs: torch.Tensor
+    tables: List[ExtendableBuffer]
     table_emb_dims: torch.Tensor
     table_value_dims: torch.Tensor
     table_emb_dims_cpu: List[int]
@@ -127,6 +144,8 @@ class DynamicEmbTableState:
     # Overflow region fields (per-table, only set when overflow is enabled)
     overflow_caps: Optional[List[int]] = None
     overflow_offsets: Optional[List[int]] = None
+    # NO_EVICTION: per-table auto-increment index used as insert score (internal only)
+    no_eviction_next_index: Optional[List[int]] = None
 
 
 def create_table_state(
@@ -145,7 +164,23 @@ def create_table_state(
     score_policy = get_score_policy(base_opt.score_strategy)
     evict_strategy = base_opt.evict_strategy.value
 
-    capacities = [opt.init_capacity for opt in options]
+    # NO_EVICTION: key_index_map uses max_load_factor=0.5 to avoid eviction; table uses init_capacity.
+    bucket_capacity = base_opt.bucket_capacity
+    if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+        no_eviction_max_lf = 0.5
+        capacities = []
+        for opt in options:
+            if opt.init_capacity is not None:
+                cap = math.ceil(opt.init_capacity / no_eviction_max_lf)
+                aligned = (
+                    (cap + bucket_capacity - 1) // bucket_capacity
+                ) * bucket_capacity
+                capacities.append(aligned)
+            else:
+                capacities.append(opt.init_capacity)
+    else:
+        capacities = [opt.init_capacity for opt in options]
+
     key_index_map = get_scored_table(
         capacity=capacities,
         bucket_capacity=base_opt.bucket_capacity,
@@ -171,7 +206,21 @@ def create_table_state(
     table_emb_dims = torch.tensor(dims, dtype=torch.int64, device=device)
     table_value_dims = torch.tensor(value_dims, dtype=torch.int64, device=device)
 
-    actual_caps = key_index_map.per_table_capacity_
+    key_index_map_caps = key_index_map.per_table_capacity_
+
+    # Table (embedding) capacity may differ from key_index_map in NO_EVICTION:
+    # key_index_map is larger (by max_load_factor); table uses init_capacity per table.
+    if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+        table_caps = [
+            (
+                opt.init_capacity
+                if opt.init_capacity is not None
+                else key_index_map_caps[i]
+            )
+            for i, opt in enumerate(options)
+        ]
+    else:
+        table_caps = list(key_index_map_caps)
 
     overflow_caps_list: Optional[List[int]] = None
     overflow_offsets_list: Optional[List[int]] = None
@@ -179,21 +228,18 @@ def create_table_state(
     if enable_overflow:
         ovf_cap = key_index_map.overflow_bucket_capacity_
         overflow_caps_list = [ovf_cap] * num_tables
-        overflow_offsets_list = list(actual_caps)
+        overflow_offsets_list = list(key_index_map_caps)
 
-    tables: List[torch.Tensor] = []
-    for i, (cap, vd) in enumerate(zip(actual_caps, value_dims)):
+    tables: List[ExtendableBuffer] = []
+    for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
         total_cap = cap
         if enable_overflow:
             total_cap += overflow_caps_list[i]
         size = total_cap * vd
         if base_opt.local_hbm_for_values == 0:
-            tables.append(get_uvm_tensor(size, dtype=emb_dtype, device=device))
+            tables.append(HostExtendableBuffer(size, emb_dtype, device))
         else:
-            tables.append(torch.zeros(size, dtype=emb_dtype, device=device))
-    table_ptrs = torch.tensor(
-        [t.data_ptr() for t in tables], dtype=torch.int64, device=device
-    )
+            tables.append(DeviceExtendableBuffer(size, emb_dtype, device))
 
     props = torch.cuda.get_device_properties(device_idx)
     threads_in_wave = (
@@ -209,7 +255,6 @@ def create_table_state(
         key_index_map=key_index_map,
         capacity=capacity,
         tables=tables,
-        table_ptrs=table_ptrs,
         table_emb_dims=table_emb_dims,
         table_value_dims=table_value_dims,
         table_emb_dims_cpu=dims,
@@ -226,7 +271,187 @@ def create_table_state(
         training=False,
         overflow_caps=overflow_caps_list,
         overflow_offsets=overflow_offsets_list,
+        no_eviction_next_index=(
+            [0] * num_tables
+            if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+            else None
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Storage expansion (expand before insert when needed)
+# Used in: prefetch HBM direct, cache write-back, generic forward, HybridStorage.load
+# ---------------------------------------------------------------------------
+
+
+def _per_table_new_key_counts(
+    unique_keys: torch.Tensor,
+    unique_table_ids: torch.Tensor,
+    num_tables: int,
+    device: torch.device,
+) -> List[int]:
+    """Return count of keys to insert per table. [table_id] = count."""
+    counts = [0] * num_tables
+    if unique_keys.numel() == 0:
+        return counts
+    for tid in range(num_tables):
+        counts[tid] = (unique_table_ids == tid).sum().item()
+    return counts
+
+
+def _table_capacity_in_rows(state: DynamicEmbTableState, table_id: int) -> int:
+    """Current embedding table row capacity for one table (main region only, excluding overflow)."""
+    vd = state.table_value_dims_cpu[table_id]
+    total_elements = state.tables[table_id].capacity()
+    if state.overflow_caps is not None:
+        total_elements -= state.overflow_caps[table_id] * vd
+    return max(0, total_elements // vd)
+
+
+def _expand_key_index_map_and_tables_2x(
+    state: DynamicEmbTableState,
+    tables_to_expand: List[bool],
+) -> None:
+    """Expand key_index_map and table for the given tables only.
+
+    For tables that need expand: (1) create new key_index_map with 2x per_table_capacity
+    for those tables; (2) extend existing ExtendableBuffer for those tables; (3) for each
+    such table, for each export batch (key, score, src_index): insert that batch into new
+    key_index_map, load values at src_index, collect (dst_index, values), then store each
+    batch's values to dst_index (no key concatenation; load-then-store per batch avoids
+    src/dst overlap). For tables that do not expand, key_index_map for that table is
+    copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
+    capacity, overflow_offsets; state.no_eviction_next_index is not changed (expansion
+    does not change the key set). Mutates state."""
+    base_opt = state.options_list[0]
+    device = state.device
+    enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
+    new_caps = [
+        2 * state.key_index_map.per_table_capacity_[i]
+        if tables_to_expand[i]
+        else state.key_index_map.per_table_capacity_[i]
+        for i in range(state.num_tables)
+    ]
+    new_key_index_map = get_scored_table(
+        capacity=new_caps,
+        bucket_capacity=base_opt.bucket_capacity,
+        key_type=base_opt.index_type,
+        score_specs=[state.score_policy],
+        device=device,
+        enable_overflow=enable_overflow,
+    )
+    for i in range(state.num_tables):
+        if tables_to_expand[i]:
+            state.tables[i].extend(2 * state.tables[i].capacity())
+
+    old_key_index_map = state.key_index_map
+    for table_id in range(state.num_tables):
+        if not tables_to_expand[table_id]:
+            new_key_index_map.copy_table_from(old_key_index_map, table_id)
+            continue
+        dst_values_list: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for (
+            keys,
+            named_scores,
+            indices,
+        ) in old_key_index_map._batched_export_keys_scores(
+            [state.score_policy.name],
+            device,
+            table_id,
+            thresholds=None,
+            batch_size=65536,
+            return_index=True,
+        ):
+            if keys.numel() == 0:
+                continue
+            assert indices is not None, "return_index=True requires indices"
+            src_indices = indices
+            scores_batch = named_scores[state.score_policy.name].to(torch.uint64)
+            score_arg = ScoreArg(
+                name=state.score_policy.name,
+                value=scores_batch,
+                policy=ScorePolicy.ASSIGN,
+            )
+            tid_tensor = torch.full(
+                (keys.numel(),), table_id, dtype=torch.int64, device=device
+            )
+            dst_indices = new_key_index_map.insert(keys, tid_tensor, score_arg)
+            new_key_index_map._ref_counter[dst_indices].copy_(
+                old_key_index_map._ref_counter[src_indices]
+            )
+            values_batch = load_from_flat_single_table(state, src_indices, table_id)
+            dst_values_list.append((dst_indices, values_batch))
+        for dst_indices, values_batch in dst_values_list:
+            store_to_flat_single_table(state, dst_indices, table_id, values_batch)
+
+    state.key_index_map = new_key_index_map
+    state.capacity = new_key_index_map.capacity()
+    if state.overflow_offsets is not None:
+        state.overflow_offsets = list(new_key_index_map.per_table_capacity_)
+
+
+def maybe_expand_storage_before_insert(
+    state: DynamicEmbTableState,
+    num_new_keys_per_table: List[int],
+) -> None:
+    """Decide whether to expand Storage (key_index_map and/or table) before insert; do it if needed.
+
+    Callers must invoke this on the relevant state before insert. It is used in:
+    prefetch HBM direct, cache write-back (DynamicEmbStorage), generic forward
+    (DynamicEmbStorage or HybridStorage._host), and HybridStorage.load (before
+    inserting evicted keys into _host).
+
+    Non-NO_EVICTION: use max_load_factor and max_capacity; only the table(s) that
+    need to expand get their key_index_map per_table_capacity and table buffer
+    doubled (others unchanged).
+
+    NO_EVICTION: key_index_map uses effective max_load_factor=0.5. Expand
+    key_index_map (and table) when (1) table row count does not fit new keys
+    (needed > table_rows), or (2) key_index_map would be full
+    (size + n_new > capacity). _expand_key_index_map_and_tables_2x doubles both
+    for the affected table(s).
+    """
+    from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
+
+    is_no_eviction = (
+        state.options_list[0].score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+    )
+
+    if is_no_eviction:
+        tables_to_expand = [False] * state.num_tables
+        for table_id in range(state.num_tables):
+            n_new = num_new_keys_per_table[table_id]
+            if n_new == 0:
+                continue
+            current_size = state.key_index_map.size(table_id)
+            table_rows = _table_capacity_in_rows(state, table_id)
+            needed = current_size + n_new
+            cap = state.key_index_map.capacity(table_id)
+            if needed > table_rows or needed > cap:
+                tables_to_expand[table_id] = True
+        if any(tables_to_expand):
+            _expand_key_index_map_and_tables_2x(state, tables_to_expand)
+    else:
+        tables_to_expand = [False] * state.num_tables
+        for table_id in range(state.num_tables):
+            n_new = num_new_keys_per_table[table_id]
+            cap = state.key_index_map.per_table_capacity_[table_id]
+            current_size = state.key_index_map.size(table_id)
+            new_total = current_size + n_new
+            opt = state.options_list[table_id]
+            max_lf = opt.max_load_factor
+            max_cap = opt.max_capacity
+            if max_lf <= 0:
+                continue
+            at_max_cap = max_cap is not None and cap >= max_cap
+            if at_max_cap:
+                continue
+            load_after = new_total / cap
+            if load_after > max_lf:
+                tables_to_expand[table_id] = True
+        if any(tables_to_expand):
+            _expand_key_index_map_and_tables_2x(state, tables_to_expand)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +475,7 @@ def load_from_flat(
     output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
     if N > 0:
         _load(
-            state.table_ptrs,
+            get_table_ptrs(state),
             indices,
             table_ids,
             output,
@@ -271,7 +496,7 @@ def store_to_flat(
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_value(
-        state.table_ptrs,
+        get_table_ptrs(state),
         indices,
         table_ids,
         values.to(state.emb_dtype),
@@ -293,7 +518,7 @@ def load_from_flat_single_table(
     output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
     if N > 0:
         _load_contiguous(
-            state.table_ptrs,
+            get_table_ptrs(state),
             indices,
             table_id,
             output,
@@ -318,7 +543,7 @@ def store_to_flat_single_table(
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_contiguous(
-        state.table_ptrs,
+        get_table_ptrs(state),
         indices,
         table_id,
         values.to(state.emb_dtype),
@@ -368,6 +593,52 @@ def get_find_score_arg(
         value=scores,
         policy=state.score_policy.policy,
     )
+
+
+def _get_no_eviction_insert_scores(
+    state: DynamicEmbTableState,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+) -> torch.Tensor:
+    """For NO_EVICTION: fill scores with per-table auto-increment index. Mutates state.no_eviction_next_index."""
+    n = keys.numel()
+    device = keys.device
+    scores = torch.empty(n, dtype=torch.uint64, device=device)
+    table_ids_cpu = table_ids.cpu()
+    for t in range(state.num_tables):
+        mask = table_ids_cpu == t
+        pos = mask.nonzero(as_tuple=False).squeeze(-1)
+        if pos.numel() > 0:
+            start = state.no_eviction_next_index[t]
+            scores[pos] = torch.arange(
+                start, start + pos.numel(), dtype=torch.uint64, device=device
+            )
+            state.no_eviction_next_index[t] = start + pos.numel()
+    return scores
+
+
+def _prepare_insert_score_arg(
+    state: DynamicEmbTableState,
+    scores: Optional[torch.Tensor],
+    num_keys: int,
+    device: torch.device,
+) -> ScoreArg:
+    """Prepare ScoreArg for insert operations.
+
+    Fills default scores when ``state.use_score`` is set but *scores* is None,
+    and resolves the effective score policy (ACCUMULATE -> ASSIGN for inserts).
+    """
+    if state.use_score and scores is None:
+        scores = torch.empty(num_keys, device=device, dtype=torch.uint64)
+        scores.fill_(state.score)
+
+    policy = state.score_policy.policy
+    if policy == ScorePolicy.ACCUMULATE:
+        policy = ScorePolicy.ASSIGN
+    if not state.use_score and scores is not None:
+        policy = ScorePolicy.ASSIGN
+
+    return ScoreArg(name=state.score_policy.name, value=scores, policy=policy)
 
 
 def get_insert_score_arg(
@@ -481,8 +752,10 @@ def _insert_key_values(
     scores: Optional[torch.Tensor] = None,
     preserve_existing: bool = False,
 ) -> None:
-    score_arg = get_insert_score_arg(
-        state, unique_keys.numel(), unique_keys.device, scores, preserve_existing
+    if state.no_eviction_next_index is not None:
+        scores = _get_no_eviction_insert_scores(state, unique_keys, table_ids)
+    score_arg = _prepare_insert_score_arg(
+        state, scores, unique_keys.numel(), unique_keys.device
     )
     indices = state.key_index_map.insert(unique_keys, table_ids, score_arg)
     store_to_flat(state, indices, table_ids, unique_values)
@@ -497,7 +770,19 @@ def _insert_and_evict_keys(
     """Key-only insert_and_evict. Returns (indices, num_evicted, evicted_keys,
     evicted_table_ids, evicted_indices, evicted_scores).
     Caller is responsible for loading evicted values and storing new values."""
-    score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
+    batch = keys.numel()
+
+    if state.no_eviction_next_index is not None:
+        scores = _get_no_eviction_insert_scores(state, keys, table_ids)
+    elif state.use_score and scores is None:
+        scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
+        scores.fill_(state.score)
+
+    score_arg = ScoreArg(
+        name=state.score_policy.name,
+        value=scores,
+        policy=state.score_policy.policy,
+    )
     (
         indices,
         num_evicted,
@@ -859,8 +1144,13 @@ def _load_key_values(
     )
 
     policy = ScorePolicy.ASSIGN
+    tid_tensor = torch.full(
+        (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
+    )
 
-    if scores is None:
+    if state.no_eviction_next_index is not None:
+        scores = _get_no_eviction_insert_scores(state, keys, tid_tensor)
+    elif scores is None:
         assert (
             state.evict_strategy == EvictStrategy.KLru
         ), "scores is None for KLru evict strategy is allowed but will be deprecated in future."
@@ -872,10 +1162,6 @@ def _load_key_values(
         name=state.score_policy.name,
         value=scores,
         policy=policy,
-    )
-
-    tid_tensor = torch.full(
-        (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
     )
     indices = state.key_index_map.insert(keys, tid_tensor, score_arg_insert)
     store_to_flat_single_table(state, indices, table_id, values)
@@ -1109,7 +1395,12 @@ class DynamicEmbStorage(Storage):
         include_optim: bool = True,
         timestamp: int = 0,
     ) -> Optional[int]:
-        return _load_table(
+        if not self._state.use_score:
+            if dist.is_initialized():
+                dist.barrier()
+            self._state.timestamp = device_timestamp()
+
+        result = _load_table(
             self._state,
             table_id,
             meta_json_file_path,
@@ -1120,6 +1411,12 @@ class DynamicEmbStorage(Storage):
             include_optim,
             timestamp=timestamp,
         )
+        if self._state.no_eviction_next_index is not None:
+            for t in range(self._state.num_tables):
+                self._state.no_eviction_next_index[t] = self._state.key_index_map.size(
+                    t
+                )
+        return result
 
     # -- Export --
 
@@ -1339,6 +1636,7 @@ class HybridStorage(Storage):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
     ) -> None:
+        # HBM uses TIMESTAMP: ignore caller scores, use _hbm.score (set by set_score before prefetch)
         (
             indices,
             num_evicted,
@@ -1346,7 +1644,7 @@ class HybridStorage(Storage):
             evicted_table_ids,
             evicted_indices,
             evicted_scores,
-        ) = _insert_and_evict_keys(self._hbm, unique_keys, table_ids, scores)
+        ) = _insert_and_evict_keys(self._hbm, unique_keys, table_ids, scores=None)
 
         evicted_values = load_from_flat(
             self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
@@ -1355,12 +1653,13 @@ class HybridStorage(Storage):
         store_to_flat(self._hbm, indices, table_ids, unique_values)
 
         if num_evicted != 0:
+            # Host uses NO_EVICTION: use internal auto-increment score, do not pass evicted_scores
             _insert_key_values(
                 self._host,
                 evicted_keys,
                 evicted_table_ids,
                 evicted_values,
-                evicted_scores,
+                scores=None,
             )
 
     # -- Dump: write host first, then append HBM --
@@ -1488,13 +1787,33 @@ class HybridStorage(Storage):
             store_to_flat_single_table(self._hbm, ins_indices, table_id, values)
 
             if num_evicted != 0:
+                # Expand host tier if needed before inserting evicted keys (supports NO_EVICTION).
+                num_new_per_table = _per_table_new_key_counts(
+                    evicted_keys,
+                    evicted_table_ids,
+                    self._host.num_tables,
+                    evicted_keys.device,
+                )
+                maybe_expand_storage_before_insert(self._host, num_new_per_table)
+                # When host is NO_EVICTION, insert uses internal no_eviction_next_index;
+                # pass None to make that explicit. Otherwise pass evicted_scores so host
+                # keeps eviction semantics (e.g. LRU).
+                host_scores = (
+                    None
+                    if self._host.no_eviction_next_index is not None
+                    else evicted_scores
+                )
                 _insert_key_values(
                     self._host,
                     evicted_keys,
                     evicted_table_ids,
                     evicted_values,
-                    evicted_scores,
+                    host_scores,
                 )
+
+        if self._host.no_eviction_next_index is not None:
+            for t in range(self._host.num_tables):
+                self._host.no_eviction_next_index[t] = self._host.key_index_map.size(t)
 
         return params.meta_data.get("step_score", None)
 

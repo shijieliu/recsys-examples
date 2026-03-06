@@ -24,11 +24,16 @@ from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
+    HybridStorage,
     Storage,
     _find_keys,
+    _get_no_eviction_insert_scores,
+    _per_table_new_key_counts,
+    _prepare_insert_score_arg,
     eval_lookup,
-    get_insert_score_arg,
+    get_table_ptrs,
     load_from_flat,
+    maybe_expand_storage_before_insert,
     store_to_flat,
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
@@ -153,7 +158,13 @@ class PrefetchState:
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
-    return isinstance(storage, DynamicEmbStorage) and storage._state.tables[0].is_cuda
+    """True if values live in GPU device memory (HBM). Use buffer type, not
+    tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
+    """
+    return (
+        isinstance(storage, DynamicEmbStorage)
+        and storage._state.tables[0].is_device_buffer()
+    )
 
 
 def _apply_admission(
@@ -420,8 +431,14 @@ def _prefetch_cache_path(
                 init_vals,
             )
 
-        # 9. Write back evicted to storage
+        # 9. Write back evicted to storage (expand storage before insert if needed)
+        # Only DynamicEmbStorage uses CACHE mode; HybridStorage does not.
         if num_evicted > 0:
+            if isinstance(storage, DynamicEmbStorage):
+                num_new_per_table = _per_table_new_key_counts(
+                    evicted_keys, evicted_table_ids, storage._state.num_tables, device
+                )
+                maybe_expand_storage_before_insert(storage._state, num_new_per_table)
             storage.insert(
                 evicted_keys, evicted_table_ids, evicted_values, evicted_scores
             )
@@ -531,6 +548,12 @@ def _prefetch_hbm_direct_path(
             admitted_scores = missing_scores
             admitted_unique_positions = missing_indices
 
+        # Expand storage before insert if needed (HBM direct path)
+        num_new_per_table = _per_table_new_key_counts(
+            admitted_keys, admitted_tids, state.num_tables, device
+        )
+        maybe_expand_storage_before_insert(state, num_new_per_table)
+
         # Initialize and insert admitted keys
         if admitted_keys.numel() > 0:
             n_admitted = admitted_keys.numel()
@@ -543,7 +566,13 @@ def _prefetch_hbm_direct_path(
             if val_dim != emb_dim:
                 init_values[:, emb_dim:] = state.initial_optim_state
 
-            score_arg = get_insert_score_arg(state, n_admitted, device, admitted_scores)
+            if state.no_eviction_next_index is not None:
+                admitted_scores = _get_no_eviction_insert_scores(
+                    state, admitted_keys, admitted_tids
+                )
+            score_arg = _prepare_insert_score_arg(
+                state, admitted_scores, n_admitted, device
+            )
             new_indices = state.key_index_map.insert(
                 admitted_keys,
                 admitted_tids,
@@ -878,6 +907,18 @@ def _generic_forward_path(
 
         values_to_insert = unique_values[positions_in_unique]
 
+        # DEFAULT mode: expand before insert (DynamicEmbStorage or HybridStorage._host).
+        if isinstance(storage, DynamicEmbStorage):
+            num_new_per_table = _per_table_new_key_counts(
+                keys_to_insert, table_ids_to_insert, storage._state.num_tables, device
+            )
+            maybe_expand_storage_before_insert(storage._state, num_new_per_table)
+        elif isinstance(storage, HybridStorage):
+            num_new_per_table = _per_table_new_key_counts(
+                keys_to_insert, table_ids_to_insert, storage._host.num_tables, device
+            )
+            maybe_expand_storage_before_insert(storage._host, num_new_per_table)
+
         storage.insert(
             keys_to_insert,
             table_ids_to_insert,
@@ -1073,7 +1114,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     optimizer.fused_update_for_flat_table(
                         unique_grads.to(ctx.emb_dtype),
                         ctx.update_slot_indices,
-                        state.table_ptrs,
+                        get_table_ptrs(state),
                         unique_table_ids,
                         state.table_value_dims,
                         state.table_emb_dims,

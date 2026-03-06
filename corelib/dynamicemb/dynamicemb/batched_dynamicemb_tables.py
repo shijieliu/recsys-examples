@@ -627,6 +627,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     host_option.max_capacity = min(host_option.max_capacity, cap)
                     host_option.init_capacity = min(host_option.init_capacity, cap)
 
+                # NO_EVICTION mode: HBM uses TIMESTAMP, host uses NO_EVICTION
+                if (
+                    self._dynamicemb_options[0].score_strategy
+                    == DynamicEmbScoreStrategy.NO_EVICTION
+                ):
+                    for hbm_option in hbm_options:
+                        hbm_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+
                 self._storage = HybridStorage(
                     hbm_options, host_options, self._optimizer
                 )
@@ -1043,6 +1051,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 option.evict_strategy = DynamicEmbEvictStrategy.LFU
                 self._scores[table_name] = 1
+            elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+                self._scores[table_name] = device_timestamp()
 
     def _update_score(self):
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
@@ -1068,6 +1078,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._scores[table_name] = new_score
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 self._scores[table_name] = 1
+            elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+                self._scores[table_name] = device_timestamp()
 
     def _reduce_table_scores(self, scores: List[int]) -> int:
         if len(scores) == 0:
