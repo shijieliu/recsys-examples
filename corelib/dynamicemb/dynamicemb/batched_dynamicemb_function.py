@@ -1023,6 +1023,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
             ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
 
+            # Recover outstanding count at end of forward so it is decremented
+            # even when backward is not run, avoiding overflow.
+            if prefetch_state.outstanding_keys_ref is not None:
+                prefetch_state.outstanding_keys_ref -= (
+                    prefetch_state.num_prefetched_keys
+                )
+
             return output_embs
 
     @staticmethod
@@ -1100,7 +1107,5 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         preserve_existing=True,
                     )
 
-            if ctx.outstanding_keys_ref is not None:
-                ctx.outstanding_keys_ref -= ctx.num_prefetched_keys
 
             return (None,) * 17
