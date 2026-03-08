@@ -459,12 +459,14 @@ __global__ void table_insert_and_evict_kernel(
     if constexpr (UseOverflow) {
       if (result == InsertResult::Busy && Bucket::is_valid(key)) {
         Bucket ovf_bucket = ovf_table[t_id];
-        Iter ovf_iter = Iter(hashcode % ovf_bucket.capacity());
+        int64_t ovf_bucket_capacity = ovf_bucket.capacity();
+        Iter ovf_iter = Iter(hashcode % ovf_bucket_capacity);
         InsertResult ovf_result = InsertResult::Init;
         KeyType ovf_evict_key = KeyType();
+        int32_t *ovf_counter_table = ovf_counter + t_id * ovf_bucket_capacity;
         overflow_insert_and_evict(
             ovf_bucket, key, ovf_bucket_sizes, t_id,
-            ovf_counter, ovf_output_offsets[t_id],
+            ovf_counter_table, ovf_output_offsets[t_id],
             ovf_iter, &ovf_iter, &ovf_result, &ovf_evict_key);
 
         if (isInsertSuccess(ovf_result)) {
