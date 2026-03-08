@@ -289,7 +289,7 @@ def _prefetch_cache_path(
         # 2. Increment counter for found keys
         found_slots = cache_indices[founds]
         if found_slots.numel() > 0:
-            cache.increment_counter(found_slots)
+            cache.increment_counter(found_slots, unique_table_ids[founds])
 
         missing_mask = ~founds
         h_num_miss, miss_compact_idx, (miss_keys, miss_tids) = flagged_compact(
@@ -427,7 +427,7 @@ def _prefetch_cache_path(
             )
 
         # 10. Counter & slot mapping
-        cache.increment_counter(cache_insert_indices)
+        cache.increment_counter(cache_insert_indices, insert_tids)
         slot_indices[miss_compact_idx[insert_to_miss]] = cache_insert_indices
 
         # 11. Non-admitted keys get slot_indices = -1
@@ -488,7 +488,7 @@ def _prefetch_hbm_direct_path(
         found_mask = indices >= 0
         found_slots = indices[found_mask]
         if found_slots.numel() > 0:
-            storage.increment_counter(found_slots)
+            storage.increment_counter(found_slots, unique_table_ids[found_mask])
 
         if h_num_missing == 0:
             return indices, indices.clone(), None
@@ -553,7 +553,10 @@ def _prefetch_hbm_direct_path(
 
             inserted_mask = new_indices >= 0
             if inserted_mask.any():
-                storage.increment_counter(new_indices[inserted_mask])
+                storage.increment_counter(
+                    new_indices[inserted_mask],
+                    admitted_tids[inserted_mask],
+                )
 
             indices[admitted_unique_positions] = new_indices
 
@@ -1088,10 +1091,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         state.all_dims_vec4,
                         state.emb_dtype,
                     )
+
                     counter_owner = (
                         cache if ctx.storage_mode == StorageMode.CACHE else storage
                     )
-                    counter_owner.decrement_counter(ctx.slot_indices)
+
+                    counter_owner.decrement_counter(
+                        ctx.update_slot_indices, ctx.unique_table_ids
+                    )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
                     optimizer.update_for_padded_buffer(
@@ -1106,6 +1113,5 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         ctx.unique_values,
                         preserve_existing=True,
                     )
-
 
             return (None,) * 17

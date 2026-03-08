@@ -772,16 +772,6 @@ __forceinline__ __device__ void overflow_insert_and_evict(
   *evict_key_out = key;
 }
 
-// ---------------------------------------------------------------------------
-// Counter update kernel: atomically add delta to counter[slot] for each
-// slot_indices entry that falls in [0, capacity).
-// Defined in insert_and_evict.cu.
-// ---------------------------------------------------------------------------
-__global__ void update_counter_kernel(
-    int32_t *__restrict__ counter, int64_t capacity,
-    int64_t const *__restrict__ slot_indices, int64_t n, int32_t delta);
-
-
 template <typename Table, typename ExecFunctor, int TileSize>
 __global__ void table_traverse_kernel(Table table, IndexType begin,
                                       IndexType end, ExecFunctor f) {

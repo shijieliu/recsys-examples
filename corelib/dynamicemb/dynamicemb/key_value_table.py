@@ -898,11 +898,19 @@ class DynamicEmbCache(Cache):
 
     # -- Cache interface --
 
-    def increment_counter(self, slot_indices: torch.Tensor) -> None:
-        self._state.key_index_map.increment_counter(slot_indices)
+    def increment_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._state.key_index_map.increment_counter(slot_indices, table_ids)
 
-    def decrement_counter(self, slot_indices: torch.Tensor) -> None:
-        self._state.key_index_map.decrement_counter(slot_indices)
+    def decrement_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._state.key_index_map.decrement_counter(slot_indices, table_ids)
 
     def lookup(
         self,
@@ -1048,11 +1056,19 @@ class DynamicEmbStorage(Storage):
         values = load_from_flat(self._state, indices, table_ids, copy_mode=copy_mode)
         return (*result[:-1], values)
 
-    def increment_counter(self, slot_indices: torch.Tensor) -> None:
-        self._state.key_index_map.increment_counter(slot_indices)
+    def increment_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._state.key_index_map.increment_counter(slot_indices, table_ids)
 
-    def decrement_counter(self, slot_indices: torch.Tensor) -> None:
-        self._state.key_index_map.decrement_counter(slot_indices)
+    def decrement_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._state.key_index_map.decrement_counter(slot_indices, table_ids)
 
     def insert(
         self,
