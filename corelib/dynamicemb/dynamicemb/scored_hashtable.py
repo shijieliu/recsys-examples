@@ -633,15 +633,14 @@ class LinearBucketTable(ScoredHashTable):
     def increment_counter(
         self,
         slot_indices: torch.Tensor,
-        table_ids: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
     ) -> None:
         """Increment ref-counter at given per-table slot indices.
 
-        table_ids: When num_tables_ > 1, must be provided and aligned with
-        slot_indices (same length). slot_indices are 0-based within each table;
-        table_ids[i] identifies which table slot_indices[i] belongs to, so the
-        kernel can map (table_id, slot) to the flat _ref_counter index. For
-        single table, table_ids can be omitted (treated as table 0).
+        table_ids: Must be provided and aligned with slot_indices (same length).
+        slot_indices are 0-based within each table; table_ids[i] identifies which
+        table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
+        to the flat _ref_counter index.
 
         The kernel uses non-atomic addition: the caller must ensure no two
         (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
@@ -668,15 +667,14 @@ class LinearBucketTable(ScoredHashTable):
     def decrement_counter(
         self,
         slot_indices: torch.Tensor,
-        table_ids: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
     ) -> None:
         """Decrement ref-counter at given per-table slot indices.
 
-        table_ids: When num_tables_ > 1, must be provided and aligned with
-        slot_indices (same length). slot_indices are 0-based within each table;
-        table_ids[i] identifies which table slot_indices[i] belongs to, so the
-        kernel can map (table_id, slot) to the flat _ref_counter index. For
-        single table, table_ids can be omitted (treated as table 0).
+        table_ids: Must be provided and aligned with slot_indices (same length).
+        slot_indices are 0-based within each table; table_ids[i] identifies which
+        table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
+        to the flat _ref_counter index.
 
         The kernel uses non-atomic addition: the caller must ensure no two
         (slot_indices[i], table_ids[i]) pairs in this call map to the same flat

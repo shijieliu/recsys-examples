@@ -901,15 +901,17 @@ class DynamicEmbCache(Cache):
     def increment_counter(
         self,
         slot_indices: torch.Tensor,
-        table_ids: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
     ) -> None:
+        """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.increment_counter(slot_indices, table_ids)
 
     def decrement_counter(
         self,
         slot_indices: torch.Tensor,
-        table_ids: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
     ) -> None:
+        """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.decrement_counter(slot_indices, table_ids)
 
     def lookup(
@@ -1059,15 +1061,17 @@ class DynamicEmbStorage(Storage):
     def increment_counter(
         self,
         slot_indices: torch.Tensor,
-        table_ids: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
     ) -> None:
+        """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.increment_counter(slot_indices, table_ids)
 
     def decrement_counter(
         self,
         slot_indices: torch.Tensor,
-        table_ids: Optional[torch.Tensor] = None,
+        table_ids: torch.Tensor,
     ) -> None:
+        """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.decrement_counter(slot_indices, table_ids)
 
     def insert(
