@@ -50,12 +50,20 @@ def segmented_unique(
     segment_range: torch.Tensor,
     evict_strategy: Optional[EvictStrategy] = None,
     frequency_counts: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+]:
     """
     Perform segmented unique operation on keys with segment_range.
 
-    This function deduplicates keys within each table segment, using the
-    GPU-accelerated segmented_unique_cuda kernel.
+    Uses sort-based deduplication: keys are sorted within each table segment
+    via radix sort, then adjacent-element comparison produces unique keys,
+    reverse indices, and frequencies. No hash tables or spin-waits.
 
     Args:
         keys: Input key tensor (int64 or uint64)
@@ -66,7 +74,7 @@ def segmented_unique(
 
     Returns:
         Tuple of (unique_keys, reverse_indices, unique_keys_table_range,
-                  output_scores)
+                  output_scores, sort_permutation, sorted_reverse_indices)
     """
     with torch.cuda.nvtx.range("segmented_unique"):
         num_keys = keys.size(0)
@@ -75,29 +83,23 @@ def segmented_unique(
 
         if num_keys == 0:
             empty_keys = torch.empty(0, dtype=keys.dtype, device=device)
-            empty_reverse_indices = torch.empty(0, dtype=torch.int64, device=device)
+            empty_long = torch.empty(0, dtype=torch.int64, device=device)
             d_table_range = torch.zeros(
                 num_tables + 1, dtype=torch.int64, device=device
             )
             return (
                 empty_keys,
-                empty_reverse_indices,
+                empty_long,
                 d_table_range,
                 None,
+                empty_long,
+                empty_long,
             )
 
         is_lfu_enabled = (
             evict_strategy == EvictStrategy.KLfu if evict_strategy else False
         )
         need_frequency_output = is_lfu_enabled or frequency_counts is not None
-
-        table_ids = expand_table_ids_cuda(
-            segment_range,
-            None,
-            num_tables,
-            1,
-            num_keys,
-        )
 
         input_frequencies = None
         if frequency_counts is not None:
@@ -111,7 +113,9 @@ def segmented_unique(
             reverse_indices,
             table_offsets,
             freq_counters,
-        ) = segmented_unique_cuda(keys, table_ids, num_tables, input_frequencies)
+            sort_permutation,
+            sorted_reverse_indices,
+        ) = segmented_unique_cuda(keys, segment_range, num_tables, input_frequencies)
 
         total_unique = num_uniques.item()
         unique_keys_out = unique_keys[:total_unique]
@@ -125,6 +129,8 @@ def segmented_unique(
             reverse_indices,
             table_offsets,
             output_scores,
+            sort_permutation,
+            sorted_reverse_indices,
         )
 
 
@@ -150,6 +156,8 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+    sort_permutation: torch.Tensor = None  # type: ignore[assignment]
+    sorted_reverse_indices: torch.Tensor = None  # type: ignore[assignment]
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -611,6 +619,8 @@ def dynamicemb_prefetch(
             reverse_indices,
             unique_indices_table_range,
             lfu_accumulated_frequency,
+            sort_permutation,
+            sorted_reverse_indices,
         ) = segmented_unique(
             indices,
             indices_table_range,
@@ -701,6 +711,8 @@ def dynamicemb_prefetch(
             non_admitted_positions=non_admitted_positions,
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
+            sort_permutation=sort_permutation,
+            sorted_reverse_indices=sorted_reverse_indices,
         )
 
 
@@ -764,6 +776,8 @@ def dynamicemb_eval_forward(
             reverse_indices,
             unique_indices_table_range,
             lfu_accumulated_frequency,
+            _sort_perm,
+            _sorted_rev_idx,
         ) = segmented_unique(
             indices,
             indices_table_range,
@@ -1025,6 +1039,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.unique_values = unique_values
             ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
             ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
+            ctx.sort_permutation = prefetch_state.sort_permutation
+            ctx.sorted_reverse_indices = prefetch_state.sorted_reverse_indices
 
             # Recover outstanding count at end of forward so it is decremented
             # even when backward is not run, avoiding overflow.
@@ -1055,6 +1071,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     ctx.unique_keys.numel(),
                     ctx.batch_size,
                     out_dim,
+                    ctx.sorted_reverse_indices,
+                    ctx.sort_permutation,
                     ctx.offsets,
                     ctx.D_offsets,
                     ctx.combiner,
@@ -1067,6 +1085,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     ctx.unique_keys.numel(),
                     ctx.batch_size,
                     ctx.emb_dim,
+                    ctx.sorted_reverse_indices,
+                    ctx.sort_permutation,
                 )
 
             optimizer.step()

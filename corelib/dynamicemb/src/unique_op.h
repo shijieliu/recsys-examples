@@ -26,41 +26,52 @@ namespace dyn_emb {
 /**
  * @brief Segmented unique operation that deduplicates keys per table.
  *
- * This function performs unique operation on keys partitioned by table_ids.
- * Keys are deduplicated within each table independently, allowing the same key
- * to appear in different tables. Uses compound hashing on (key, table_id) pairs
- * with a single shared hash table for memory efficiency.
+ * Sorts keys within each table segment using CUB DeviceSegmentedRadixSort,
+ * then uses adjacent-element comparison + scan to produce unique keys,
+ * reverse_indices, frequencies, and table offsets. No hash tables, no atomics
+ * for dedup, no spin-waits. Sorted output benefits downstream kernels.
+ *
+ * Also returns sort_permutation and sorted_reverse_indices so the backward
+ * pass can skip its internal radix sort.
  *
  * NOTE: This function is fully asynchronous with no GPU-CPU synchronization.
  *
  * @param keys Input keys tensor (int64 or uint64)
- * @param table_ids Table ID for each key (int64, same length as keys,
- *                  must be in ascending order)
+ * @param segment_range Per-table boundary offsets (int64, size = num_tables+1).
+ *                      segment_range[t] is the start index of table t's keys.
  * @param num_tables Total number of tables
  * @param input_frequencies Controls frequency counting behavior:
- *                          - Undefined/empty tensor with numel()==0: Enable
- *                            frequency counting with each occurrence counted as
- * 1
- *                          - Tensor with numel()==num_keys: Use provided
- *                            frequencies for weighted counting
- *                          - Pass None from Python to disable frequency
- * counting entirely (output freq_counters will be empty)
+ *                          - Undefined tensor: disable frequency counting
+ *                          - Empty tensor (numel==0): count each key as 1
+ *                          - Tensor with numel==num_keys: use provided weights
  *
- * @return Tuple of (num_uniques, unique_keys, output_indices, table_offsets,
- *         freq_counters)
- *         - num_uniques: Tensor of size 1 containing total unique count
- *           (view of table_offsets[num_tables])
- *         - unique_keys: Compacted unique keys with size=num_keys (same as
- *           input). Only first num_uniques elements are valid.
- *         - output_indices: Index mapping (input idx -> global unique idx)
- *         - table_offsets: Tensor of size (num_tables + 1) with cumulative
- *           counts.
- *         - freq_counters: Frequency counts per unique key. Empty if frequency
- *           counting is disabled (input_frequencies was None).
+ * @return Tuple of 7 tensors:
+ *         - num_uniques: size-1 tensor (view of table_offsets[num_tables])
+ *         - unique_keys: compacted unique keys (size=num_keys, first
+ *           num_uniques valid)
+ *         - reverse_indices: input idx -> global unique idx (size=num_keys)
+ *         - table_offsets: cumulative unique counts (size=num_tables+1)
+ *         - freq_counters: per-unique-key frequency (empty if disabled)
+ *         - sort_permutation: sorted position -> original position
+ *           (size=num_keys). For backward reuse.
+ *         - sorted_reverse_indices: unique index per sorted position
+ *           (size=num_keys). For backward reuse.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor>
+segmented_unique_cuda(at::Tensor keys, at::Tensor segment_range,
+                      int64_t num_tables,
+                      at::Tensor input_frequencies = at::Tensor());
+
+/**
+ * @brief OLD hash-based segmented unique (kept for A/B debugging).
+ *
+ * Takes per-element table_ids (not segment_range). Returns 5 tensors.
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
-                      at::Tensor input_frequencies = at::Tensor());
+segmented_unique_hashtable_cuda(at::Tensor keys, at::Tensor table_ids,
+                                int64_t num_tables,
+                                at::Tensor input_frequencies = at::Tensor());
 
 /**
  * @brief Expand table IDs from offsets.

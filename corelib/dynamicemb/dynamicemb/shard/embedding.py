@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import torch
 from dynamicemb_extensions import (
     compute_dedup_lengths_cuda,
-    expand_table_ids_cuda,
+    get_table_range,
     segmented_unique_cuda,
 )
 from torch.autograd.profiler import record_function
@@ -210,14 +210,8 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     features_by_shards.append(dedup_features)
                     continue
 
-                # Generate table_ids from jagged offsets (fully on GPU, no sync)
-                table_ids = expand_table_ids_cuda(
-                    offsets,
-                    d_table_offset,
-                    table_num,
-                    local_batchsize,
-                    num_elements,
-                )
+                # Per-table key bounds in flat indices (size num_tables + 1)
+                segment_range = get_table_range(offsets, d_table_offset)
 
                 # Prepare input_frequencies tensor to control frequency counting
                 input_frequencies = None
@@ -233,9 +227,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     reverse_idx,
                     table_offsets,
                     freq_counters,
+                    _,
+                    _,
                 ) = segmented_unique_cuda(
                     indices,
-                    table_ids,
+                    segment_range,
                     table_num,
                     input_frequencies,
                 )

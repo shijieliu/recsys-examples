@@ -132,16 +132,24 @@ void gather_embedding_pooled(
       src_type, dst_type, offset_type, stream, d_D_offsets);
 }
 
-// Generate permutation-aware gather_ids from CSR offsets.
+// Generate gather_ids from CSR offsets, writing directly into sorted order
+// using sort_permutation from the forward pass.
+//
 // grads is [B*F, D] batch-first (row r → b=r/F, f=r%F).
-// Each thread processes one slot (bucket) s; slot s owns indices
+// Each thread processes one slot (bucket) s; slot s owns original positions
 // [offsets[s], offsets[s+1]).  slot s has f=s/B, b=s%B.
-// gather_ids[j] = b*F + f  — the row in [B*F, D] that LocalReduce reads.
+//
+// For each original position j in that range, we look up where j ended up
+// after sorting: sorted_pos = inv_perm[j].  Then we write:
+//   sorted_gather_ids[sorted_pos] = b*F + f
+//
+// inv_perm is the inverse of sort_permutation (sort_perm maps sorted→original,
+// inv_perm maps original→sorted).
 template <typename offset_t, typename id_t>
-__global__ void
-generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
-                                  id_t *__restrict__ gather_ids, int num_slots,
-                                  int B, int F) {
+__global__ void generate_sorted_gather_ids_pooled_kernel(
+    const offset_t *__restrict__ offsets,
+    const int64_t *__restrict__ inv_perm,
+    id_t *__restrict__ sorted_gather_ids, int num_slots, int B, int F) {
   for (int s = blockIdx.x * blockDim.x + threadIdx.x; s < num_slots;
        s += gridDim.x * blockDim.x) {
     int f = s / B;
@@ -151,54 +159,57 @@ generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
     offset_t start = offsets[s];
     offset_t end = offsets[s + 1];
     for (offset_t j = start; j < end; ++j) {
-      gather_ids[j] = val;
+      sorted_gather_ids[inv_perm[j]] = val;
     }
+  }
+}
+
+// Invert a permutation: inv_perm[perm[i]] = i.
+__global__ void invert_permutation_kernel(const int64_t *__restrict__ perm,
+                                          int64_t *__restrict__ inv_perm,
+                                          int64_t n) {
+  for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    inv_perm[perm[i]] = i;
   }
 }
 
 at::Tensor
 reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
              int batch_size, int64_t out_dim,
+             at::Tensor sorted_reverse_indices, at::Tensor sort_permutation,
              const std::optional<at::Tensor> &offsets = std::nullopt,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
              int combiner = -1, int total_D = 0) {
-  // When D_offsets is provided (multi-dim pooling):
-  //   grads is [B, total_D].  Permutation-aware gather_ids are generated,
-  //   sorted with reverse_indices, then a multi-dim variant of LocalReduce
-  //   reads directly from grads using D_offsets to compute per-feature source
-  //   offsets and widths.  MEAN scaling is fused in the stage-1 kernel.
-  //   No padded intermediate buffer is needed.
-  //
-  // When offsets is provided without D_offsets (uniform-dim pooling):
-  //   grads is [B*F, D] batch-first (free reshape from [B, total_D]).
-  //   1. For MEAN, an in-place kernel scales each row by 1/pool_size.
-  //   2. Permutation-aware gather_ids are generated via binary search so that
-  //      LocalReduce reads from the correct batch-first rows directly — no
-  //      intermediate permuted tensor is allocated.
-  //
-  // When offsets is absent (sequence mode), gather_ids = arange(num_keys)
-  //   and LocalReduce gathers directly from grads.
 
   int64_t num_keys = reverse_indices.size(0);
 
-  if (!reverse_indices.is_cuda() || !grads.is_cuda()) {
-    throw std::runtime_error("All argument tensors should be on device");
-  }
+  TORCH_CHECK(reverse_indices.is_cuda() && grads.is_cuda(),
+              "All argument tensors should be on device");
+  TORCH_CHECK(sorted_reverse_indices.is_cuda() && sort_permutation.is_cuda(),
+              "sorted_reverse_indices and sort_permutation must be on device");
 
   auto device_ = reverse_indices.device();
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto id_stype = reverse_indices.dtype().toScalarType();
   auto id_dtype = scalartype_to_datatype(id_stype);
 
-  bool multi_dim = D_offsets.has_value() && offsets.has_value();
-
   at::Tensor unique_grads = at::empty({num_unique, out_dim}, grads.options());
 
   if (num_keys == 0 || batch_size == 0)
     return unique_grads;
-  // --- Generate gather_ids ---
-  at::Tensor gather_ids;
+
+  constexpr int kBlockSize = 256;
+  auto &device_prop = DeviceProp::getDeviceProp();
+  const int max_grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / kBlockSize);
+
+  at::Tensor sorted_gather_ids;
+
   if (offsets.has_value()) {
+    // Pooling path: generate gather_ids directly in sorted order by
+    // writing through the inverse permutation, fusing what was previously
+    // generate_gather_ids + index_select into a single kernel.
     auto &offs = offsets.value();
     int num_slots = static_cast<int>(offs.numel() - 1);
     TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
@@ -208,63 +219,41 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
     auto offset_type =
         scalartype_to_datatype(convertTypeMetaToScalarType(offs.dtype()));
 
-    constexpr int kBlockSize = 256;
-    auto &device_prop = DeviceProp::getDeviceProp();
-    const int max_grid_size =
-        device_prop.num_sms * (device_prop.max_thread_per_sm / kBlockSize);
+    // Compute inverse permutation: inv_perm[sort_perm[i]] = i.
+    // sort_permutation maps sorted→original; inv_perm maps original→sorted.
+    at::Tensor inv_perm =
+        at::empty({num_keys}, sort_permutation.options());
+    int perm_grid = static_cast<int>(
+        std::min(((int64_t)num_keys + kBlockSize - 1) / kBlockSize,
+                 (int64_t)max_grid_size));
+    invert_permutation_kernel<<<perm_grid, kBlockSize, 0, stream>>>(
+        sort_permutation.data_ptr<int64_t>(), inv_perm.data_ptr<int64_t>(),
+        num_keys);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Generate permutation-aware gather_ids — one thread per slot (bucket).
-    gather_ids = at::empty({num_keys}, reverse_indices.options());
+    sorted_gather_ids = at::empty({num_keys}, reverse_indices.options());
     int slot_grid = static_cast<int>(
         std::min(((int64_t)num_slots + kBlockSize - 1) / kBlockSize,
                  (int64_t)max_grid_size));
 
     DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
       DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
-        generate_gather_ids_pooled_kernel<offset_t, id_t>
+        generate_sorted_gather_ids_pooled_kernel<offset_t, id_t>
             <<<slot_grid, kBlockSize, 0, stream>>>(
                 reinterpret_cast<const offset_t *>(offs.data_ptr()),
-                reinterpret_cast<id_t *>(gather_ids.data_ptr()), num_slots,
-                batch_size, num_features);
+                inv_perm.data_ptr<int64_t>(),
+                reinterpret_cast<id_t *>(sorted_gather_ids.data_ptr()),
+                num_slots, batch_size, num_features);
       });
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
-    gather_ids = at::arange(num_keys, reverse_indices.options());
+    // Non-pooling: gather_ids would be arange(N), so
+    // sorted_gather_ids[j] = arange[sort_perm[j]] = sort_perm[j].
+    sorted_gather_ids = sort_permutation;
   }
 
-  // --- Sort (reverse_indices, gather_ids) by reverse_indices ---
-  auto sorted_reverse_indices = at::empty_like(reverse_indices);
-  auto sorted_gather_ids = at::empty_like(gather_ids);
-
-  int end_bit =
-      (num_unique > 1)
-          ? (64 - __builtin_clzll(static_cast<uint64_t>(num_unique - 1)))
-          : 1;
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
-    size_t temp_storage_bytes = 0;
-    cub::DeviceRadixSort::SortPairs(
-        nullptr, temp_storage_bytes,
-        reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
-        reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
-        reinterpret_cast<id_t *>(gather_ids.data_ptr()),
-        reinterpret_cast<id_t *>(sorted_gather_ids.data_ptr()), num_keys, 0,
-        end_bit, stream);
-    auto temp_storage =
-        at::empty({static_cast<int64_t>(temp_storage_bytes)},
-                  at::TensorOptions().dtype(at::kByte).device(device_));
-    cub::DeviceRadixSort::SortPairs(
-        temp_storage.data_ptr(), temp_storage_bytes,
-        reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
-        reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
-        reinterpret_cast<id_t *>(gather_ids.data_ptr()),
-        reinterpret_cast<id_t *>(sorted_gather_ids.data_ptr()), num_keys, 0,
-        end_bit, stream);
-  });
-
   // --- LocalReduce ---
-  // MEAN scaling is fused inside the reduce kernel for both uniform and
-  // multi-dim modes, so no separate scaling pass is needed.
   LocalReduce localReduceOp(device_, num_keys, out_dim, id_dtype,
                             DataType::Float32);
 
@@ -847,6 +836,7 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
+        py::arg("sorted_reverse_indices"), py::arg("sort_permutation"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
         py::arg("combiner") = -1, py::arg("total_D") = 0);
 
