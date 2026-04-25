@@ -259,6 +259,16 @@ class DynamicEmbTableOptions:
         Counter for tracking the number of keys that have been admitted to the embedding table.
         If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
         Default is None (no counter is used).
+    hier_a2a_max_features : Optional[int], optional
+        Maximum total feature values (embedding lookups) per batch for this table.
+        This is the worst-case sum of sequence lengths across all samples in a batch
+        for this table -- i.e., sum(lengths) for the table in one forward pass.
+        Users know this from their data pipeline: it's typically
+        batch_size * max_seq_len for the table, or a known upper bound from
+        data preprocessing / truncation.
+        Used to size hierarchical all2all buffers. If None on ANY table,
+        hierarchical all2all is disabled and falls back to baseline NCCL all2all.
+        Example: table with max_seq_len=50, batch_size=4096 -> hier_a2a_max_features=204800
     Notes
     -----
     The ``DynamicEmb_APIs.md`` file in the ``dynamicemb`` package mirrors this class and related planner
@@ -295,6 +305,7 @@ class DynamicEmbTableOptions:
     index_type: Optional[torch.dtype] = None
     admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Any] = None
+    hier_a2a_max_features: Optional[int] = None
 
     def __post_init__(self):
         assert (

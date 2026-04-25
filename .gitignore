@@ -44,3 +44,5 @@ results/
 .docs/
 .SKILLS/
 .cursor/
+DeepEP/
+**/_build_tmp/*

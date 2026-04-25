@@ -103,6 +103,49 @@ def get_version():
     return version, sha
 
 
+def _find_nccl():
+    """Discover NCCL include/lib paths for GIN support."""
+    nccl_home = os.environ.get("NCCL_HOME", None)
+    nccl_include = None
+    nccl_lib = None
+
+    if nccl_home:
+        nccl_include = os.path.join(nccl_home, "include")
+        nccl_lib = os.path.join(nccl_home, "lib")
+    else:
+        # Try common locations
+        for candidate in ["/usr/local/nccl", "/usr/local", "/usr"]:
+            header = os.path.join(candidate, "include", "nccl.h")
+            if os.path.isfile(header):
+                nccl_include = os.path.join(candidate, "include")
+                nccl_lib = os.path.join(candidate, "lib")
+                break
+
+    return nccl_include, nccl_lib
+
+
+def _check_nccl_gin_support(nccl_include):
+    """Check if NCCL headers support GIN (>= 2.29)."""
+    if nccl_include is None:
+        return False
+    nccl_header = os.path.join(nccl_include, "nccl.h")
+    if not os.path.isfile(nccl_header):
+        return False
+    try:
+        with open(nccl_header, "r") as f:
+            content = f.read()
+        # Look for NCCL_VERSION_CODE or GIN-related symbols
+        if "NCCL_VERSION_CODE" in content and "ncclDevComm" in content:
+            return True
+        # Also check for nccl_device.h which is GIN-specific
+        device_header = os.path.join(nccl_include, "nccl_device.h")
+        if os.path.isfile(device_header):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def get_extensions():
     extra_link_args = [
         "-Wl,--no-as-needed",
@@ -120,7 +163,7 @@ def get_extensions():
             "-gencode",
             "arch=compute_80,code=sm_80",
             "-gencode",
-            "arch=compute_90,code=sm_90",
+            "arch=compute_90a,code=sm_90a",
             "-w",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -129,6 +172,29 @@ def get_extensions():
             "-DDEMB_USE_PYBIND11",
         ],
     }
+
+    include_dirs = [
+        root_path / "src",
+    ]
+
+    # NCCL GIN support (conditional)
+    nccl_include, nccl_lib = _find_nccl()
+    use_gin = os.environ.get("DEMB_USE_GIN", "auto")
+
+    if use_gin == "0":
+        # Explicitly disabled
+        pass
+    elif _check_nccl_gin_support(nccl_include) or use_gin == "1":
+        extra_compile_args["cxx"].append("-DDEMB_USE_GIN")
+        extra_compile_args["nvcc"].append("-DDEMB_USE_GIN")
+        extra_link_args.append("-lnccl")
+        if nccl_include:
+            include_dirs.append(nccl_include)
+        if nccl_lib:
+            extra_link_args.append(f"-L{nccl_lib}")
+        print(f"[setup.py] NCCL GIN support enabled (NCCL include: {nccl_include})")
+    else:
+        print("[setup.py] NCCL GIN support disabled (NCCL >= 2.29 not found)")
 
     cuda_sources = find_source_files(
         os.path.join(root_path, "src"),
@@ -140,9 +206,6 @@ def get_extensions():
         ],
     )
 
-    include_dirs = [
-        root_path / "src",
-    ]
     cuda_sources = [str(path) for path in cuda_sources]
     include_dirs = [str(path) for path in include_dirs]
 

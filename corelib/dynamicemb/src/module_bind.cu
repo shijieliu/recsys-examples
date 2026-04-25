@@ -17,6 +17,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <pybind11/pybind11.h>
 
+#include "hier_all2all.h"
+
 namespace py = pybind11;
 
 void bind_dyn_emb_op(py::module &m);
@@ -41,4 +43,5 @@ PYBIND11_MODULE(dynamicemb_extensions, m) {
   bind_utils(m);
   bind_table_operation(m);
   bind_vmm_op(m);
+  hier_a2a::bind_hier_all2all_op(m);
 }

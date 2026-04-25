@@ -53,7 +53,11 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbeddingBag,
 )
 from ..input_dist import RwSparseFeaturesDist
-from ..output_dist import RwPooledEmbeddingDist, RwSequenceEmbeddingDist
+from ..output_dist import (
+    HierarchicalSequenceEmbeddingDist,
+    RwPooledEmbeddingDist,
+    RwSequenceEmbeddingDist,
+)
 
 
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
@@ -161,16 +165,70 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             device=device if device is not None else self._device,
         )
 
+    def _compute_max_rows_per_rank(self) -> Optional[int]:
+        """Sum per-table hier_a2a_max_features to get global max_rows_per_rank."""
+        total = 0
+        for si in self._sharding_infos:
+            fused_params = si.fused_params
+            if fused_params is None:
+                return None
+            opts = fused_params.get("dynamicemb_options")
+            if opts is None or opts.hier_a2a_max_features is None:
+                return None  # any table missing config -> cannot size buffers
+            total += opts.hier_a2a_max_features
+        return total
+
+    def _use_hierarchical(self) -> bool:
+        """Check if hierarchical all2all should be used."""
+        # Quantized communication not supported
+        if self.qcomm_codecs_registry is not None:
+            return False
+        return True
+
+    def _get_embedding_dim(self) -> Optional[int]:
+        """Get the uniform embedding dimension across all tables.
+
+        Returns None if tables have different embedding dimensions.
+        """
+        dims = set()
+        for config in self._grouped_embedding_configs:
+            for table in config.embedding_tables:
+                dims.add(table.local_cols)
+        if len(dims) == 1:
+            return dims.pop()
+        return None
+
     def create_output_dist(
         self,
         device: Optional[torch.device] = None,
     ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
+        dev = device if device is not None else self._device
+        max_rows = self._compute_max_rows_per_rank()
+        D = self._get_embedding_dim()
+
+        if (
+            max_rows is not None
+            and max_rows > 0
+            and D is not None
+            and self._use_hierarchical()
+        ):
+            return HierarchicalSequenceEmbeddingDist(
+                # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
+                #  `Optional[ProcessGroup]`.
+                self._pg,
+                self._get_num_features(),
+                max_rows,
+                D,
+                dev,
+            )
+
+        # Baseline fallback
         return RwSequenceEmbeddingDist(
             # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             self._pg,
             self._get_num_features(),
-            device if device is not None else self._device,
+            dev,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
         )
 
