@@ -152,11 +152,13 @@ def run_one(D, F, B, max_seq_len, warmup, iters, dtype, rank, W, device):
     )
 
     def baseline_fwd():
+        # Match output_dist.py convention: pass splits WITHOUT swapping.
+        # torchrec and hier use the same split semantics.
         awaitable = torchrec_dist(
             local_embs=output_embs,
             lengths=lengths,
-            input_splits=output_splits,
-            output_splits=input_splits,
+            input_splits=input_splits,
+            output_splits=output_splits,
             sparse_features_recat=sparse_features_recat,
             unbucketize_permute_tensor=unbucketize_permute,
             batch_size_per_rank=batch_size_per_rank,
@@ -287,8 +289,8 @@ def main():
         awaitable = torchrec_dist(
             local_embs=output_embs,
             lengths=lengths,
-            input_splits=output_splits,
-            output_splits=input_splits,
+            input_splits=input_splits,
+            output_splits=output_splits,
             sparse_features_recat=sparse_features_recat,
             unbucketize_permute_tensor=unbucketize_permute,
             batch_size_per_rank=batch_size_per_rank,
