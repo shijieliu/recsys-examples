@@ -119,7 +119,7 @@ def run_test(label, rank, W, device, D=128, F=100, B=32, max_seq_len=50,
     )
     baseline_result = awaitable.wait()
 
-    # Hier
+    # Hier (fused path)
     total_feats = sum(features_per_rank)
     max_rows = max_seq_len * total_feats
     manager = HierAll2AllManager(
@@ -130,9 +130,7 @@ def run_test(label, rank, W, device, D=128, F=100, B=32, max_seq_len=50,
         device=device,
         dtype=dtype,
     )
-    # Clear scatter_map cache to force rebuild with current recat
     manager._scatter_map_cache.clear()
-
     hier_result = manager.forward(
         output_embs=output_embs,
         lengths_after_input_dist=lengths,
@@ -144,22 +142,46 @@ def run_test(label, rank, W, device, D=128, F=100, B=32, max_seq_len=50,
     )
     torch.cuda.synchronize()
 
+    # Also test reference path (no fused kernel) by setting env
+    os.environ["HIER_A2A_FUSED"] = "0"
+    manager2 = HierAll2AllManager(
+        pg=dist.group.WORLD,
+        num_features=total_feats,
+        max_rows_per_rank=max_rows,
+        D=D,
+        device=device,
+        dtype=dtype,
+    )
+    ref_result = manager2.forward(
+        output_embs=output_embs,
+        lengths_after_input_dist=lengths,
+        input_splits=input_splits,
+        output_splits=output_splits,
+        sparse_features_recat=sparse_features_recat,
+        unbucketize_permute=unbucketize_permute,
+        batch_size_per_rank=bspr,
+    )
+    os.environ["HIER_A2A_FUSED"] = "1"
+    torch.cuda.synchronize()
+
     diff = (baseline_result.float() - hier_result.float()).abs().max().item()
+    ref_diff = (baseline_result.float() - ref_result.float()).abs().max().item()
+    hier_vs_ref = (hier_result.float() - ref_result.float()).abs().max().item()
     status = "OK" if diff <= 0.01 else "MISMATCH"
 
-    # Additional diagnostics: check if results contain same set of rows
     b_sorted = baseline_result.float().sort(dim=0).values
     h_sorted = hier_result.float().sort(dim=0).values
     sorted_diff = (b_sorted - h_sorted).abs().max().item()
     sorted_status = "same_set" if sorted_diff <= 0.01 else "diff_set"
 
     if rank == 0:
-        print(f"  {label:50s}: diff={diff:.4f} ({status})  "
-              f"sorted_diff={sorted_diff:.4f} ({sorted_status})  "
-              f"shapes: base={baseline_result.shape} hier={hier_result.shape}  "
-              f"fallback={manager.fallback}")
+        print(f"  {label:50s}:", flush=True)
+        print(f"    fused_vs_torchrec={diff:.4f} ({status})  "
+              f"sorted={sorted_diff:.4f} ({sorted_status})", flush=True)
+        print(f"    ref_vs_torchrec={ref_diff:.4f}  "
+              f"fused_vs_ref={hier_vs_ref:.4f}", flush=True)
 
-    del manager, torchrec_dist
+    del manager, manager2, torchrec_dist
     torch.cuda.empty_cache()
 
 
