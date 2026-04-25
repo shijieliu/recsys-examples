@@ -372,8 +372,10 @@ class HierAll2AllManager:
         relay_region_bytes = L * max_rows * D * elem
         # relay counts pad: L * N * 4 bytes, 128-byte aligned
         relay_counts_pad_bytes = self._align_to(128, L * N * 4)
-        # signal pad: L * 4 bytes, 128-byte aligned
-        signal_pad_bytes = self._align_to(128, L * 4)
+        # signal pad: L * K_STAGES * 4 bytes, 128-byte aligned
+        # K_STAGES=2 matches kProgressStages in hier_all2all_kernel.cuh
+        self._signal_stages = 2
+        signal_pad_bytes = self._align_to(128, L * self._signal_stages * 4)
 
         total_bytes = (
             lr_slots_bytes + relay_region_bytes + relay_counts_pad_bytes + signal_pad_bytes
@@ -626,7 +628,9 @@ class HierAll2AllManager:
             slot_ptrs.append(slot_ptr)
 
             if lr != my_lr:
-                sig_ptr = peer_buf_ptr + self._signal_pad_offset + my_lr * 4
+                # Point to base of my K-entry signal block in peer's signal pad
+                K = self._signal_stages
+                sig_ptr = peer_buf_ptr + self._signal_pad_offset + my_lr * K * 4
                 sig_ptrs.append(sig_ptr)
             else:
                 sig_ptrs.append(0)  # no signal for self
@@ -664,13 +668,16 @@ class HierAll2AllManager:
         W = topo.world_size
         F = self._num_features
 
-        # feature_recat: invert the sparse_features_recat permutation
+        # feature_recat: match torchrec permute_1D semantics.
+        # Forward: sparse_features_recat[i] = original feature index at
+        #   position i in the recat layout (same as torchrec's permute_1D).
+        # Backward: inverse permutation undoes the forward recat.
         if direction == "fwd":
+            feature_recat = sparse_features_recat.to(torch.int64)
+        else:
             feature_recat = torch.argsort(
                 sparse_features_recat.to(torch.int64)
             )
-        else:
-            feature_recat = sparse_features_recat.to(torch.int64)
 
         # Prefix sums (all on GPU)
         lengths_i64 = lengths_after_input_dist.to(torch.int64)
@@ -728,6 +735,93 @@ class HierAll2AllManager:
         self._scatter_map_cache[cache_key] = scatter_map
         return scatter_map
 
+    def _build_gather_map(
+        self,
+        unbucketize_permute: torch.Tensor,
+        output_splits: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build or retrieve cached per-peer gather map for parallel gather."""
+        cache_key = ("gather_map", unbucketize_permute.data_ptr())
+        if cache_key in self._scatter_map_cache:
+            return self._scatter_map_cache[cache_key]
+
+        output_splits_t = torch.tensor(
+            output_splits, dtype=torch.int64, device=self._device
+        )
+        gather_ipc_indices, gather_out_indices, gather_peer_offsets = \
+            dynamicemb_extensions.hier_a2a.build_gather_map(
+                unbucketize_permute,
+                output_splits_t,
+                self._rank_to_local_dev,
+                self._max_rows_per_rank,
+                self._topology.local_world_size,
+            )
+        result = (gather_ipc_indices, gather_out_indices, gather_peer_offsets, None)
+        self._scatter_map_cache[cache_key] = result
+        return result
+
+    def _forward_two_phase(
+        self,
+        output_embs: torch.Tensor,
+        lengths_after_input_dist: torch.Tensor,
+        input_splits: List[int],
+        output_splits: List[int],
+        sparse_features_recat: torch.Tensor,
+        unbucketize_permute: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Forward using two-phase kernels (outcast-only + gather-only).
+
+        Phase 1: outcast kernel with ALL 8 warps doing cp.async pipeline.
+        Phase 2: gather kernel with per-peer parallel gather using pre-computed map.
+        Both kernels launched sequentially on the same stream.
+        Requires pre-computed gather map (unbucketize_permute must be available).
+        """
+        self._iter_id += 1
+        total_send = sum(input_splits)
+        total_recv = sum(output_splits)
+
+        # 1. Build scatter map (cached)
+        scatter_map = self._build_scatter_map_from_context(
+            lengths_after_input_dist,
+            input_splits,
+            sparse_features_recat,
+            total_send,
+            total_send,
+            direction="fwd",
+        )
+
+        # 2. Build gather map (cached)
+        gather_ipc, gather_out, gather_peer_off = self._build_gather_map(
+            unbucketize_permute, output_splits
+        )
+
+        # 3. Pre-allocate output buffer (reused across iterations)
+        needed = total_recv * self._D
+        if not hasattr(self, "_output_buf") or self._output_buf is None or self._output_buf.numel() < needed:
+            self._output_buf = torch.empty(
+                needed, dtype=self._dtype, device=self._device
+            )
+
+        return dynamicemb_extensions.hier_a2a.fwd_two_phase(
+            output_embs.contiguous(),
+            scatter_map.peer_gather_indices,
+            scatter_map.peer_offsets,
+            gather_ipc,
+            gather_out,
+            gather_peer_off,
+            self._peer_slot_ptrs_dev,
+            self._peer_sig_ptrs_dev,
+            self._ipc_raw_ptr,
+            self._signal_pad_ptr,
+            self._topology.my_local_rank,
+            self._topology.local_world_size,
+            total_recv,
+            self._D,
+            self._device_flag,
+            self._iter_id,
+            self._output_buf,
+        )
+
     def _forward_fused(
         self,
         output_embs: torch.Tensor,
@@ -774,6 +868,16 @@ class HierAll2AllManager:
                 needed, dtype=self._dtype, device=self._device
             )
 
+        # Build pre-computed gather map for per-peer parallel gather
+        gather_ipc = None
+        gather_out = None
+        gather_peer_off = None
+        gather_stage_splits = None
+        if unbucketize_permute is not None and unbucketize_permute.numel() > 0:
+            gather_ipc, gather_out, gather_peer_off, _ = \
+                self._build_gather_map(unbucketize_permute, output_splits)
+            # gather_stage_splits = None: kernel computes boundary from peer_offsets
+
         return dynamicemb_extensions.hier_a2a.fwd_pipelined(
             output_embs.contiguous(),
             scatter_map.peer_gather_indices,
@@ -793,6 +897,10 @@ class HierAll2AllManager:
             self._device_flag,
             self._iter_id,
             self._output_buf,
+            gather_ipc,
+            gather_out,
+            gather_peer_off,
+            gather_stage_splits,
         )
 
     def forward(
@@ -835,6 +943,24 @@ class HierAll2AllManager:
             and self._peer_slot_ptrs_dev is not None
             and os.environ.get("HIER_A2A_FUSED", "1") == "1"
         ):
+            # Two-phase path: outcast-only + gather-only kernels.
+            # Selected when HIER_A2A_TWO_PHASE=1 and gather map is available
+            # (unbucketize_permute is non-None and non-empty).
+            use_two_phase = (
+                os.environ.get("HIER_A2A_TWO_PHASE", "0") == "1"
+                and unbucketize_permute is not None
+                and unbucketize_permute.numel() > 0
+                and hasattr(dynamicemb_extensions.hier_a2a, "fwd_two_phase")
+            )
+            if use_two_phase:
+                return self._forward_two_phase(
+                    output_embs,
+                    lengths_after_input_dist,
+                    input_splits,
+                    output_splits,
+                    sparse_features_recat,
+                    unbucketize_permute,
+                )
             return self._forward_fused(
                 output_embs,
                 lengths_after_input_dist,
