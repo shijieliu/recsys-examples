@@ -66,6 +66,33 @@ import os
 import sys
 from typing import Dict, List, Optional
 
+
+def _isolate_emulated_node_devices() -> None:
+    """Give each emulated node distinct GPUs with node-local device indices."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--node-size", type=int)
+    args, _ = parser.parse_known_args()
+    local_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if args.node_size is None or args.node_size >= local_size:
+        return
+    if args.node_size <= 0 or local_size % args.node_size:
+        raise ValueError("--node-size must divide the number of local workers")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = visible.split(",") if visible else list(map(str, range(local_size)))
+    if len(devices) < local_size:
+        raise ValueError("Each local worker needs a distinct visible GPU")
+    start = local_rank // args.node_size * args.node_size
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+        devices[start : start + args.node_size]
+    )
+    os.environ["LOCAL_RANK"] = str(local_rank % args.node_size)
+
+
+# CUDA visibility must be set before importing torch or loading the extension.
+if __name__ == "__main__":
+    _isolate_emulated_node_devices()
+
 import torch
 import torch.distributed as dist
 import torchrec
@@ -526,11 +553,6 @@ def _set_node_size(ranks_per_node: int) -> None:
     # node size rather than a replacement, so a stale value would widen what we
     # just narrowed.
     os.environ.pop("TORCHREC_RESOLVED_POD_SIZE", None)
-    if ranks_per_node < world_size:
-        # Emulated nodes share GPUs (see main), and NCCL refuses that unless
-        # asked. Slower, and correct, which is the trade this whole emulation
-        # is: one box standing in for several.
-        os.environ["NCCL_MULTI_RANK_GPU_ENABLE"] = "1"
     seen = get_local_size(world_size)
     assert seen == ranks_per_node, (
         f"asked for nodes of {ranks_per_node}, TorchRec reads {seen}. Without "
@@ -570,16 +592,18 @@ def main(argv) -> None:
     # The device index is node-local: TorchRec's `placement` builds
     # `rank:{r}/cuda:{r % local_size}`, which on a real two-node job is the
     # rank's own GPU because its LOCAL_RANK restarts at 0 on the second node.
-    # Emulating nodes on one box breaks that -- rank 1 with nodes of 1 would sit
-    # on cuda:1 while its shard metadata says cuda:0, and ShardedTensor rejects
-    # the pair. So the emulation maps ranks onto devices the same way, which
-    # means the nodes share GPUs: two ranks on cuda:0 rather than one each.
-    # That costs memory and proves nothing less -- what is under test is the
-    # shard geometry and the two collectives, not which die they run on.
+    # Each emulated node sees a disjoint slice of the physical GPUs, selected
+    # before CUDA initialization. Its node-local index therefore matches the
+    # shard metadata while every rank still owns a distinct physical device.
     node_size = args.node_size or world_size
     device_index = rank % node_size
     torch.cuda.set_device(device_index)
     device = torch.device(f"cuda:{device_index}")
+    print(
+        f"[rank{rank}] visible GPUs: {os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}; "
+        f"node-local device: {device_index}",
+        flush=True,
+    )
 
     local_size = get_local_size()
     if rank == 0:
