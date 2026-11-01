@@ -31,7 +31,7 @@ Trace::Trace(int device) {
 }
 
 // The earliest stamps start at UINT64_MAX, the rest at 0.
-size_t Trace::start_out(bool forward, OutCall &call, cudaStream_t stream) {
+bool Trace::start_out(bool forward, OutCall &call, cudaStream_t stream) {
   if constexpr (kTrace) {
     const int direction = forward ? 0 : 1;
     const int64_t at = direction * kTraceRing + launches_[direction] % kTraceRing;
@@ -40,9 +40,9 @@ size_t Trace::start_out(bool forward, OutCall &call, cudaStream_t stream) {
     HIER_CUDA_CHECK(cudaMemsetAsync(row + kNumEarliest, 0,
                                     (kTraceWords - kNumEarliest) * sizeof(int64_t), stream));
     call.trace = (unsigned long long *)row;
-    return kTraceSmWords * sizeof(unsigned long long);
+    return true;
   }
-  return 0;
+  return false;
 }
 
 void Trace::launched(bool forward) {

@@ -167,15 +167,15 @@ CASES = [
         world_sizes=(1, 8, 32, 256),
     ),
     Case(
-        "64 features",
-        batch_size=256,
+        "300 features",
+        batch_size=64,
         max_len=8,
-        tables=tuple(feature // 2 for feature in range(64)),
+        tables=tuple(feature // 2 for feature in range(300)),
         rules=tuple(
-            (ROUNDROBIN, HASH_ROUNDROBIN, CONTINUOUS)[table % 3] for table in range(32)
+            (ROUNDROBIN, HASH_ROUNDROBIN, CONTINUOUS)[table % 3] for table in range(150)
         ),
-        hash_sizes=tuple(1000 + 37 * table for table in range(32)),
-        world_sizes=(8, 129, 256),
+        hash_sizes=tuple(1000 + 37 * table for table in range(150)),
+        world_sizes=(8, 129, 1024),
     ),
 ]
 
@@ -562,6 +562,9 @@ NODE_CASES = [
     NodeCase("2 nodes, exact fit", 2, 4, node=1, lookup_slack=0, remote_slack=0),
     NodeCase("2 nodes, remote_keys overflow", 2, 4, remote_slack=-1),
     NodeCase("2 nodes, lookup_keys overflow", 2, 4, node=1, lookup_slack=-1),
+    NodeCase("one node of 40, 70 features", 1, 40, num_features=70, max_len=3),
+    NodeCase("2 nodes of 36, 70 features", 2, 36, num_features=70, node=1, max_len=3),
+    NodeCase("40 nodes of 2", 40, 2, num_features=3, node=33),
 ]
 
 
@@ -610,7 +613,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     ]
     valid = [batch.valid for batch in batches]
     cell_start = [part["cell_start"].tolist() for part in parts]
-    # what node_count_exchange gives every rank of the node
+    # every rank's count vector, [requester][words]
     node_counts = torch.stack(
         [
             count_vector(part["row_cell"].cpu(), valid[local_rank], case)
@@ -623,6 +626,23 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     )  # [requester][owner][feature]
     own_cells = same_counts.permute(1, 2, 0).reshape(local_size, -1)
     own_total, remote_total = own_cells.sum(1), remote_counts.sum(0)
+
+    def exchanged(local_rank: int) -> List[torch.Tensor]:
+        """What node_count_exchange gives a rank: the count vectors' sum over
+        the node and over the ranks before it, and each requester's counts
+        for it (its remote part, then each feature of its own part)."""
+        own_columns = node_counts[:, local_size + local_rank * num_features :][
+            :, :num_features
+        ]
+        mine = torch.cat(
+            [remote_counts[:, local_rank : local_rank + 1], own_columns], 1
+        )
+        return [
+            node_counts.sum(0).cuda(),
+            node_counts[:local_rank].sum(0).cuda(),
+            mine.contiguous().view(-1).cuda(),
+        ]
+
     need_lookup, need_remote = int(own_total.max()), int(remote_total.max())
     lookup_keys = need_lookup + case.lookup_slack
     remote_keys = need_remote + case.remote_slack if num_nodes > 1 else 0
@@ -632,7 +652,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         part = parts[local_rank]
         out = planner(
             hier_output_dist_node_layout,
-            node_counts.cuda(),
+            *exchanged(local_rank),
             part["cell_start"],
             part["block_start"],
             part["row_cell"],
@@ -654,12 +674,13 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
             for local_rank, layout in enumerate(layouts)
         ),
         "own_cells": all(
-            torch.equal(layout["own_cells"], own_cells)
+            torch.equal(layout["own_cells"], own_cells[local_rank])
             and torch.equal(
-                layout["own_starts"], torch.cumsum(own_cells, 1) - own_cells
+                layout["own_starts"],
+                torch.cumsum(own_cells[local_rank], 0) - own_cells[local_rank],
             )
             and torch.equal(layout["own_total"], own_total)
-            for layout in layouts
+            for local_rank, layout in enumerate(layouts)
         ),
         "needs": all(
             int(layout["need_lookup"]) == need_lookup

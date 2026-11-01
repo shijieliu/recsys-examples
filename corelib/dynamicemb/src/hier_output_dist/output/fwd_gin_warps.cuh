@@ -41,9 +41,11 @@ namespace hier_output_dist {
 
 namespace fwd {
 
-// The proxy's relay in the forward (across nodes; a warp of CTA 0, a lane
-// per owner node). It grants the rail owners rounds 0 and 1 of proxy_rows if
-// the previous out kernel has not (the first forward). Then:
+// The proxy's relay in the forward (across nodes; a warp of CTA 0, whose
+// lanes take the owner nodes, and the requesters of the node, in turn: lane l
+// those numbered l, l + 32, ...). It grants the rail owners rounds 0 and 1 of
+// proxy_rows if the previous out kernel has not (the first forward). Then it
+// polls, waiting for no single one:
 //   - it publishes the rows each owner node puts into proxy_rows as they
 //     land, in landed_rows[owner_node], where the node's requesters read it.
 //     They land in the order of that node's node-unique keys, round after
@@ -53,157 +55,164 @@ namespace fwd {
 //     one);
 //   - with more than one round (so at least three, rounds_for), it grants
 //     round next + 2 into the half of proxy_rows round `next` took, once
-//     every requester of the node (a lane each) has pulled its rows of round
-//     `next` and of every round before. A requester's done word of a round's
-//     parity is a running total of what it pulled of those rounds, so the
-//     rounds so far are in once it has grown by its rows of them
-//     (push_start) since the forward began. A requester pulls nothing before
-//     the relay has published some rows, so the words read first (before any
-//     lane publishes) are what they held when the forward began. And no
-//     requester pulls a row of round next + 2 before it is granted, so until
-//     then a word grows by rounds up to `next` alone.
+//     every requester of the node has pulled its rows of round `next` and of
+//     every round before. A requester's done word of a round's parity is a
+//     running total of what it pulled of those rounds, so the rounds so far
+//     are in once it has grown by its rows of them (push_start) since the
+//     forward began (relay_want keeps what it waits for). A requester pulls
+//     nothing before the relay has published some rows, so the words read
+//     first (before any lane publishes) are what they held when the forward
+//     began. And no requester pulls a row of round next + 2 before it is
+//     granted, so until then a word grows by rounds up to `next` alone.
+// What it keeps of an owner node between polls is in this rank's words: the
+// rows it published (landed_rows, tagged with this out_seq) and fwd_tot.
 struct ProxyRelay {
   // Every lane of the relay warp.
   __device__ static void run(const OutArgs &args);
 };
 
 __device__ void ProxyRelay::run(const OutArgs &args) {
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes,
-            local_size = args.topo.local_size, owner_node = lane;
-  const bool live = owner_node < num_nodes && owner_node != args.topo.node;
+  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
+            local_size = args.topo.local_size;
   const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
   ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(args.dev);
   const Credits credits(cred, rail);
   const OutTimeline timeline(args);
-  if (live)
-    credits.raise(owner_node, sig_grant(args.topo.node), grant_of(args.ch.seq, 2),
-                  mine.grant_sent(owner_node));
-  const int64_t num_uniq = live ? args.plan.meta[args.meta_at.uniq_out + owner_node] : 0;
-  const uint64_t base = live ? *mine.fwd_tot(owner_node) : 0;  // its fwd_rows signal then
+  auto grant = [&](int rounds) {  // rounds [0, rounds) to every rail owner of the lane
+    for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
+      if (owner_node != node)
+        credits.raise(owner_node, sig_grant(node), grant_of(args.ch.seq, rounds),
+                      mine.grant_sent(owner_node));
+  };
+  grant(2);
+  const int64_t *uniq_out = args.plan.meta + args.meta_at.uniq_out;
   const int num_rounds = (int)args.plan.meta[args.meta_at.misc + kMiscRounds];
-  // requester `lane`'s round starts in its push order here
-  const int32_t *start = (const int32_t *)(args.plan.meta + args.meta_at.push_start) +
-                         lane * (args.win.rounds_cap + 1);
-  // requester `lane`'s done words once the rounds so far are in
-  uint64_t want[2] = {0, 0};
-  if (num_rounds > 1 && lane < local_size) {
-    want[0] = ld_acquire_sys(mine.done(lane, 0));
-    want[1] = ld_acquire_sys(mine.done(lane, 1));
-  }
+  // where each requester's rows of each round start in its push order here
+  const int32_t *push_start = (const int32_t *)(args.plan.meta + args.meta_at.push_start);
+  auto round_rows = [&](int requester, int rnd) {
+    const int32_t *start = push_start + requester * (args.win.rounds_cap + 1);
+    return (uint64_t)(start[rnd + 1] - start[rnd]);
+  };
+  if (num_rounds > 1)
+    for (int requester = lane; requester < local_size; requester += 32)
+      for (int half = 0; half < 2; ++half)
+        mine.relay_want(requester)[half] = ld_acquire_sys(mine.done(requester, half));
   __syncwarp();
-  int next = 0;                    // rounds every requester has pulled
-  int64_t seen = -1, counted = 0;  // rows seen landed, and those the timeline has (tracing)
-  bool landed = !live;             // every row of the owner node has landed
+  int next = 0;  // rounds every requester has pulled
   Spin spin(args.timeout_ns);
   for (;;) {
-    bool moved = false;
-    // the rows of the lane's owner node that landed, when that changed
-    if (!landed) {
-      const int64_t got = min((int64_t)(rows.readSignal(sig_rows(owner_node)) - base), num_uniq);
+    bool moved = false, landed = true;  // every row of the lane's owner nodes has landed
+    // the rows of each owner node that landed, when that changed
+    for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
+      if (owner_node == node) continue;
+      const int64_t num_uniq = uniq_out[owner_node];
+      const uint64_t word = *mine.landed_rows(owner_node);
+      const int64_t seen =
+          LandedRows::tag(word) == args.ch.seq ? (int64_t)LandedRows::payload(word) : -1;
+      if (seen == num_uniq) continue;
+      const int64_t got = min(
+          (int64_t)(rows.readSignal(sig_rows(owner_node)) - *mine.fwd_tot(owner_node)), num_uniq);
       if (got != seen) {
-        seen = got;
         LandedRows::publish(mine.landed_rows(owner_node), args.ch.seq, got);
         moved = true;
-        if (timeline.on() && got > counted) {
+        const int64_t counted = max(seen, (int64_t)0);  // what the timeline has
+        if (timeline.on() && got > counted)
           timeline.landed((unsigned long long)(got - counted), counted == 0);
-          counted = got;
-        }
       }
-      landed = got == num_uniq;
+      landed = landed && got == num_uniq;
     }
     // the rounds whose halves every requester has pulled
     while (next + 2 < num_rounds) {
       const int half = next & 1;
       bool in = true;
-      uint64_t need = 0;
-      if (lane < local_size) {
-        need = want[half] + (uint64_t)(start[next + 1] - start[next]);
-        in = ld_acquire_sys(mine.done(lane, half)) >= need;
-      }
+      for (int requester = lane; requester < local_size; requester += 32)
+        in = in && ld_acquire_sys(mine.done(requester, half)) >=
+                       mine.relay_want(requester)[half] + round_rows(requester, next);
       if (!__all_sync(kFull, in)) break;
-      want[half] = need;
+      for (int requester = lane; requester < local_size; requester += 32)
+        mine.relay_want(requester)[half] += round_rows(requester, next);
       ++next;
-      if (live)
-        credits.raise(owner_node, sig_grant(args.topo.node), grant_of(args.ch.seq, next + 2),
-                      mine.grant_sent(owner_node));
+      grant(next + 2);
       moved = true;
     }
     if (__all_sync(kFull, landed)) break;
     // the warp polls again at once while any lane moved
     if (!__any_sync(kFull, moved))
-      spin.pause("rows of an owner node", owner_node, num_uniq, args.topo.rank);
+      spin.pause("rows of the owner nodes", next, lane, args.topo.rank);
   }
-  if (live) *mine.fwd_tot(owner_node) = base + num_uniq;
+  for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
+    if (owner_node != node) *mine.fwd_tot(owner_node) += (uint64_t)uniq_out[owner_node];
   __syncwarp();
   if (lane == 0) timeline.stamp_latest(kTraceLanded);
   credits.flush_warp();  // the grants
 }
 
-// The owner's issuer in the forward (across nodes; a warp of CTA 0, a lane per
-// rail proxy, so one QP each). Each lane puts the rows of lookup_rows the
-// proxy's node asks for (the forward put list: per round, a segment per
-// feature), round by round once the proxy granted it, in puts of at most
-// chunk_rows rows, each adding its rows to the proxy's fwd_rows signal; then
-// the warp flushes. The lookup wrote lookup_rows before the kernel: one
-// system fence, then puts that make no release of their own. No node barrier
-// is needed first.
-class OwnerIssuer {
- public:
+// The owner's issuer in the forward (across nodes; a warp of CTA 0, whose
+// lanes take the rail proxies in turn, so one QP each). For each proxy node
+// it puts the rows of lookup_rows the node asks for (the forward put list:
+// its segments, round by round, each in one IB chunk and one feature cell),
+// a round once the proxy granted it, each segment in one put that adds its
+// rows to the proxy's fwd_rows signal. It polls the proxy nodes in turn and
+// waits for no single one; its place in each one's segments is in this
+// rank's put_at words. Then the warp flushes. The lookup wrote lookup_rows
+// before the kernel: one system fence, then puts that make no release of
+// their own. No node barrier is needed first.
+struct OwnerIssuer {
   // Every lane of the issuer warp.
   __device__ static void run(const OutArgs &args);
-
- private:
-  // Before the first put of round rnd to the rail proxy on proxy_node: waits
-  // until that proxy granted the round.
-  __device__ __forceinline__ static void wait_grant(const OutArgs &args, const ncclGin &cred,
-                                                    int proxy_node, int rnd) {
-    Spin spin(args.timeout_ns);
-    const uint64_t want = grant_of(args.ch.seq, rnd + 1);
-    while (cred.readSignal(sig_grant(proxy_node)) < want)
-      spin.pause("grant of proxy_rows", proxy_node, rnd, args.topo.rank);
-  }
 };
 
 __device__ void OwnerIssuer::run(const OutArgs &args) {
   const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
-            num_features = args.num_features;
+            rounds_cap = args.win.rounds_cap;
   ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
+  const ncclTeam rail = ncclTeamRail(args.dev);
   const OutTimeline timeline(args);
-  bool posted = false;  // this lane put rows
-  const int proxy_node = lane;
-  if (proxy_node < num_nodes && proxy_node != node) {
-    const ncclTeam rail = ncclTeamRail(args.dev);
-    const int64_t *meta = args.plan.meta;
-    const int num_rounds = (int)meta[args.meta_at.slice_in + 2 * proxy_node + 1];
-    const PutSeg *fwd_put_list = (const PutSeg *)(meta + args.meta_at.fwd_put_list) +
-                                 (int64_t)proxy_node * args.win.rounds_cap * num_features;
-    const ncclWindow_t win = args.win.handle[kLookupRows];
-    const uint64_t lookup_base = args.win.off[kLookupRows], proxy_base = args.win.off[kProxyRows];
-    const int64_t row_bytes = args.row_bytes;
-    const RowPut put{rows, rail, win, proxy_base, lookup_base, row_bytes, sig_rows(node)};
-    bool first = true;
-    put.fence();
-    for (int rnd = 0; rnd < num_rounds; ++rnd) {
-      bool granted = false;
-      for (int feature = 0; feature < num_features; ++feature) {
-        const PutSeg seg = fwd_put_list[rnd * num_features + feature];
-        for (int offset = 0; offset < seg.rows; offset += args.chunk_rows) {
-          if (!granted) {
-            wait_grant(args, cred, proxy_node, rnd);
-            granted = true;
-          }
-          const int put_rows = min(args.chunk_rows, seg.rows - offset);
-          if (first) timeline.stamp_earliest(kTraceFirstPut);
-          first = false;
-          put.put(proxy_node, seg.dst + offset, seg.src + offset, put_rows, false, 0);
-          if (timeline.on()) timeline.posted((unsigned long long)put_rows);
-        }
-      }
-    }
-    if (!first) timeline.stamp_latest(kTraceLastPut);
-    posted = !first;
+  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  // the segments of each (proxy node, round)
+  const int32_t *put_start = (const int32_t *)(args.plan.meta + args.meta_at.fwd_put_start);
+  const RowPut put{rows,
+                   rail,
+                   args.win.handle[kLookupRows],
+                   args.win.off[kProxyRows],
+                   args.win.off[kLookupRows],
+                   args.row_bytes,
+                   sig_rows(node)};
+  for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
+    mine.put_at(proxy_node)[0] = put_start[proxy_node * (rounds_cap + 1)];
+    mine.put_at(proxy_node)[1] = 0;
   }
+  put.fence();
+  bool posted = false;  // this lane put rows
+  Spin spin(args.timeout_ns);
+  for (;;) {
+    bool moved = false, left = false;  // segments of the lane's proxy nodes are left
+    for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
+      if (proxy_node == node) continue;
+      const int32_t *start = put_start + proxy_node * (rounds_cap + 1);
+      int64_t *at = mine.put_at(proxy_node);
+      int64_t seg = at[0];
+      int rnd = (int)at[1];
+      const int64_t end = start[rounds_cap];
+      for (; seg < end; ++seg) {
+        while (seg >= start[rnd + 1]) ++rnd;  // the segment's round
+        if (cred.readSignal(sig_grant(proxy_node)) < grant_of(args.ch.seq, rnd + 1)) break;
+        const PutSeg segment = args.plan.put_list[seg];
+        if (!posted) timeline.stamp_earliest(kTraceFirstPut);
+        posted = true;
+        put.put(proxy_node, segment.dst, segment.src, segment.rows, false, 0);
+        if (timeline.on()) timeline.posted((unsigned long long)segment.rows);
+        moved = true;
+      }
+      at[0] = seg;
+      at[1] = rnd;
+      left = left || seg < end;
+    }
+    if (!__any_sync(kFull, left)) break;
+    if (!__any_sync(kFull, moved)) spin.pause("grant of proxy_rows", lane, 0, args.topo.rank);
+  }
+  if (posted) timeline.stamp_latest(kTraceLastPut);
   __syncwarp();
   rows.flush(ncclCoopWarp{});
   // the puts have completed

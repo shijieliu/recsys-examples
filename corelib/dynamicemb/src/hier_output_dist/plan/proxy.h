@@ -48,11 +48,12 @@ namespace hier_output_dist {
 struct ProxyInput {
   at::Tensor keys;             // int64 [remote_keys]: the remote part of node_keys
   at::Tensor weights;          // fp32 [remote_keys]: their weights, or undefined
-  at::Tensor cells;            // int16 [remote_keys]: owner node * num_features + feature of
+  at::Tensor cells;            // int32 [remote_keys]: owner node * num_features + feature of
                                // each (remote_cells)
   at::Tensor requester_start;  // int64 [local_size + 1]: each requester's occurrences
   at::Tensor skip;             // bool 0-dim: the node skips the call (it pushed nothing)
-  at::Tensor tables;           // int32 [num_features]: the table of each feature
+  at::Tensor tables;           // int32 [num_features]: the table of each feature, numbered
+                               // densely (dense_tables)
 };
 
 // The windows the proxy writes (views of this rank's regions).
@@ -116,6 +117,17 @@ struct ProxyRounds {
 ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_start,
                                    const ProxyWindows &windows, const PlanSizes &sizes);
 
+// The push key, by which one stable sort gives each requester's push order:
+// from its low bits up, a heavy key's index or, for a key with a row each,
+// its IB chunk in its piece * num_nodes + its owner node; whether the key is
+// heavy; the round; and the requester (local_size: past the valid
+// occurrences). Each field is as wide as its largest value needs.
+struct PushKey {
+  int heavy_shift, round_shift, requester_shift;  // where each field above the first starts
+  int bits;                                       // the whole key
+};
+PushKey push_key_of(const PlanSizes &sizes);
+
 // What the call keeps of the proxy.
 struct ProxyPlan {
   at::Tensor num_rounds;        // int64 0-dim
@@ -133,10 +145,9 @@ struct ProxyPlan {
   at::Tensor reducer_entries;   // int64 [remote_keys]: a slot and the flag of the push task
                                 // that fills it (formats.h)
 };
-// Step 3: each requester's push order (one stable sort of a
-// 60-bit key: requester, round, heavy, then (IB chunk, owner node) or the
-// key), its push tables, and the reducer list. Writes remote_map word 2 and
-// the proxy header's push tables.
+// Step 3: each requester's push order (one stable sort of the push key),
+// its push tables, and the reducer list. Writes remote_map word 2 and the
+// proxy header's push tables.
 ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor &requester_start,
                            const ProxyWindows &windows, const PlanSizes &sizes);
 

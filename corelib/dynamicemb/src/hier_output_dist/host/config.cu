@@ -16,26 +16,28 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 #include <c10/util/StringUtil.h>
 
-#include <algorithm>
 #include <stdexcept>
 
 #include "hier_output_dist/common/constants.h"
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/host/config.h"
 #include "hier_output_dist/host/layout.h"
+#include "hier_output_dist/plan/proxy.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
 std::string unsupported(int world_size, int local_size, int num_features, int64_t row_bytes) {
-  if (world_size < 1 || local_size < 1 || local_size > kMaxLocalRanks || num_features < 1 ||
-      num_features > kMaxFeatures || world_size / local_size > kMaxNodes)
-    return c10::str("it supports at most ", kMaxLocalRanks, " GPUs per node, ", kMaxNodes,
-                    " nodes and ", kMaxFeatures, " features per sharding, got ", local_size, ", ",
-                    world_size / std::max(local_size, 1), " and ", num_features);
+  if (world_size < 1 || local_size < 1 || num_features < 1)
+    return c10::str("it needs ranks and features, got ", world_size, " ranks, ", local_size,
+                    " GPUs per node and ", num_features, " features");
   if (world_size % local_size != 0)
     return c10::str("the sharding's ", world_size, " ranks are not whole nodes of ", local_size,
                     " GPUs");
+  // The planner numbers the cells (owner, feature) of a call with int32.
+  if ((int64_t)world_size * num_features >= kMaxEntries)
+    return c10::str("it numbers the (rank, feature) pairs with int32, and ", world_size,
+                    " ranks times ", num_features, " features are too many");
   // The out kernels move rows as 16-byte vectors.
   if (row_bytes <= 0 || row_bytes % 16 != 0)
     return c10::str("it moves rows of the lookup output as 16-byte vectors, and these are ",
@@ -60,10 +62,6 @@ void check_capacity(const char *name, int64_t value) {
 void Config::validate() const {
   const std::string why = unsupported(world_size, local_size, num_features(), row_bytes());
   if (!why.empty()) invalid(why);
-  // The proxy's identity tags hold a table in 6 bits.
-  for (int table : feature_tables)
-    if (table < 0 || table >= kMaxFeatures)
-      invalid("a table per feature, numbered in [0, ", kMaxFeatures, "), got ", table);
   if (dtype != at::kFloat && dtype != at::kBFloat16 && dtype != at::kHalf)
     invalid("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
   check_capacity("lookup_keys", capacities.lookup_keys);
@@ -83,6 +81,11 @@ void Config::validate() const {
               " keys of other nodes' owners a proxy may deduplicate in ", rounds,
               " rounds, more than the ", kMaxRounds,
               " a call can take; raise DYNAMICEMB_GIN_PROXY_MB");
+    const int bits = push_key_of(Layout(*this).plan_sizes()).bits;
+    if (bits > 63)
+      invalid("the proxy sorts its push order by a key of ", bits,
+              " bits (its fields: the GPUs of a node, the rounds, and the keys and IB chunks of ",
+              "remote_keys), more than 63; lower remote_keys");
   }
   if (!(timeout_s > 0)) invalid("the timeout must be positive, got ", timeout_s);
   if (ctas < 0 || reduce_ctas < 1)

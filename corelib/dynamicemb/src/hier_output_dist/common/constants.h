@@ -15,18 +15,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // Constants of the hierarchical dist that host and device code share: CTA
-// sizes, the static limits that size the kernels' shared-memory tables, the
-// rows of a task and the task queues; and ceil_div.
+// sizes, the rows of a task, the rounds a call may take and the task queues;
+// and ceil_div.
 #pragma once
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
-constexpr int kThreads = 512;      // threads per CTA
-constexpr int kMaxLocalRanks = 8;  // GPUs per node (sizes the per-peer smem tables)
-constexpr int kMaxNodes = 32;      // nodes
-constexpr int kMaxFeatures = 64;   // features per sharding (sizes the per-feature smem tables)
-constexpr int kMaxRanks = kMaxNodes * kMaxLocalRanks;
+constexpr int kThreads = 512;  // threads per CTA
 // Index dedup's heavy rows (more original rows than kHeavy) and the heavy
 // groups take sub-tasks of kHeavy rows. A node-unique key of more than kHeavy
 // occurrences is heavy, so a key takes at most kHeavy rows of proxy_rows

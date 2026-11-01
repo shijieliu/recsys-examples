@@ -24,7 +24,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// A stable sort of `keys` (int16, int32 or int64, contiguous) by their bits
+// A stable sort of `keys` (int32 or int64, contiguous) by their bits
 // [0, end_bit), which carries `values` (int32, one per key), on the current
 // stream: the sorted keys, and the values in their order. With end_bit below
 // the keys' width the keys must not be negative.

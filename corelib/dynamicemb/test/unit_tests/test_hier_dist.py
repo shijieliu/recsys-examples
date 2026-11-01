@@ -358,6 +358,15 @@ CASES = [
         max_len=16,
         key_range=200_000,
     ),
+    # many features: 80, two per table
+    Case(
+        "fp32 dedup, 80 features",
+        dedup=True,
+        tables=tuple((f"f{2 * table}", f"f{2 * table + 1}") for table in range(40)),
+        num_embeddings=1 << 16,
+        batch=64,
+        max_len=4,
+    ),
 ]
 
 

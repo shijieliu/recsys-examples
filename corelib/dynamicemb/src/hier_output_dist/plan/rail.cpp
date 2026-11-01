@@ -27,13 +27,11 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options) {
   return nodes + nodes.ge(topo.node);
 }
 
-at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_cells,
-                         const at::Tensor &num_rounds, const at::Tensor &cell_uniq,
-                         const PlanSizes &sizes) {
-  const at::Tensor node_totals = own_cells.select(0, sizes.topo.local_rank)
-                                     .view({sizes.num_features, sizes.topo.local_size})
-                                     .sum({1});
-  return at::cat({need_remote.view({1}), num_rounds.view({1}), cell_uniq, node_totals});
+at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &num_rounds,
+                         const at::Tensor &own_total, const at::Tensor &uniq_out,
+                         const at::Tensor &cell_uniq) {
+  return at::cat({need_remote.view({1}), num_rounds.view({1}), own_total.view({1}), uniq_out,
+                  cell_uniq.view({-1})});
 }
 
 RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
@@ -42,44 +40,38 @@ RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
                 local_size = sizes.topo.local_size, num_features = sizes.num_features,
                 num_sources = sizes.topo.num_sources;
   RailLayout rail;
-  const at::Tensor source_rounds = messages.select(1, 1);  // [source node]
-  // keys of each source node's proxy for each owner node and feature, and
-  // the keys each owner's node sends it per feature
-  const at::Tensor counts =
-      messages.narrow(1, 2, num_nodes * num_features).view({num_nodes, num_nodes, num_features});
-  const at::Tensor owner_totals = messages.narrow(1, 2 + num_nodes * num_features, num_features);
-  const at::Tensor total = owner_totals + counts.sum({0});  // [owner node][feature]
-  const at::Tensor pair_keys = counts.sum({2});             // [source node][owner node]
-  const at::Tensor recv = total.sum({1});                   // [owner node]
+  // per source node: its rounds, its node-unique keys for each owner node,
+  // and its keys of each feature for this owner
+  const at::Tensor source_rounds = messages.select(1, 1);
+  const at::Tensor uniq = messages.narrow(1, 3, num_nodes);  // [source node][owner node]
+  rail.cells_in = messages.narrow(1, 3 + num_nodes, num_features);
+  const at::Tensor recv = messages.select(1, 2) + uniq.sum({0});  // [owner node]
   // a slice: the source's round pieces, then its records; none to its own node
   const at::Tensor slice_bytes =
-      (source_rounds.view({num_nodes, 1}) * 16 + pair_keys * sizes.record_bytes).fill_diagonal_(0);
-  // As proxy: where its slice and its cells start at each owner. An owner's
-  // KJT holds per feature its node's keys, then the other nodes' in order.
+      (source_rounds.view({num_nodes, 1}) * 16 + uniq * sizes.record_bytes).fill_diagonal_(0);
+  // As proxy: where its slice starts at each owner.
   rail.put_dst = slice_bytes.narrow(0, 0, node).sum({0});
   rail.put_bytes = slice_bytes.select(0, node);
   rail.put_skip = recv.gt(sizes.lookup_keys);
   rail.put_skip.narrow(0, node, 1).fill_(true);
-  rail.rail_cell_start =
-      total.cumsum(1) - total + owner_totals + counts.narrow(0, 0, node).sum({0});
-  // as owner: its KJT, cell (feature, source) feature-major
-  rail.rail_lengths = counts.select(1, node).index_select(0, other_nodes).t();
-  rail.kjt_lengths =
-      at::cat({own_cells.select(0, sizes.topo.local_rank).view({num_features, local_size}),
-               rail.rail_lengths},
-              1)
-          .reshape({-1});
+  // As owner: its KJT, cell (feature, source) feature-major, its node's keys
+  // then the other nodes' in order; and where each other node's cells start.
+  rail.kjt_lengths = at::cat({own_cells.view({num_features, local_size}),
+                              rail.cells_in.index_select(0, other_nodes).t()},
+                             1)
+                         .reshape({-1});
   rail.kjt_offsets = exclusive_ends(rail.kjt_lengths);
   rail.num_recv = recv.select(0, node);
-  rail.length_per_key = total.select(0, node);
+  rail.length_per_key = rail.kjt_lengths.view({num_features, num_sources}).sum({1});
   const at::Tensor into_me = slice_bytes.select(1, node);
   rail.slice_in = at::stack({into_me.cumsum(0) - into_me, source_rounds}, 1);
-  rail.uniq_in = pair_keys.select(1, node);
-  rail.my_cell_starts = rail.kjt_offsets.narrow(0, 0, num_features * num_sources)
-                            .view({num_features, num_sources})
-                            .narrow(1, 0, local_size)
-                            .t()
-                            .contiguous();
+  rail.uniq_in = uniq.select(1, node);
+  const at::Tensor cell_offsets =
+      rail.kjt_offsets.narrow(0, 0, num_features * num_sources).view({num_features, num_sources});
+  rail.my_cell_starts = cell_offsets.narrow(1, 0, local_size).t().contiguous();
+  rail.cell_stage =
+      at::zeros({num_nodes, num_features}, messages.options())
+          .index_copy_(0, other_nodes, cell_offsets.narrow(1, local_size, num_nodes - 1).t());
   rail.needs = at::stack({recv.max(), messages.select(1, 0).max(), source_rounds.max()});
   return rail;
 }
@@ -101,43 +93,19 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
   const auto long_options = rail_keys.options().dtype(at::kLong);
   const auto int_options = rail_keys.options().dtype(at::kInt);
   OwnerTables tables;
-  // each other node's slice in rail_keys: its rounds, where it starts (bytes),
-  // and where its keys of each feature start among them
-  const at::Tensor source_rounds = rail.slice_in.select(1, 1).index_select(0, other_nodes);
-  const at::Tensor slice_start = rail.slice_in.select(1, 0).index_select(0, other_nodes);
-  // [num_features][num_nodes - 1]
-  const at::Tensor cell_first = rail.rail_lengths.cumsum(0) - rail.rail_lengths;
-  // The forward put list: the keys of each other node's round piece in each
-  // of its cells, from the owner's KJT to the proxy's rows.
+  // each source node's slice in rail_keys: where it starts (bytes) and its
+  // rounds (its own node sends none); its round pieces come first
+  const at::Tensor slice_start = rail.slice_in.select(1, 0);
+  tables.fwd_rounds = rail.slice_in.select(1, 1).clone();
+  tables.fwd_rounds.narrow(0, sizes.topo.node, 1).zero_();
   {
     const at::Tensor rail_ints = rail_keys.view(at::kInt);
-    const at::Tensor piece_word = (slice_start.div(4, "floor").view({num_nodes - 1, 1}) +
-                                   4 * at::arange(rounds_cap, long_options).view({1, rounds_cap}))
-                                      .clamp(0, rail_ints.numel() - 4);
-    auto piece_field = [&](int field) {  // [num_nodes - 1][rounds_cap][1]
-      return rail_ints.take(piece_word + field).to(at::kLong).unsqueeze(2);
-    };
-    const at::Tensor source_lo = piece_field(0), source_hi = piece_field(1),
-                     source_off = piece_field(2);
-    const at::Tensor cell_lo = cell_first.t().reshape({num_nodes - 1, 1, num_features});
-    const at::Tensor cell_hi =
-        cell_lo + rail.rail_lengths.t().reshape({num_nodes - 1, 1, num_features});
-    const at::Tensor lo = at::maximum(cell_lo, source_lo), hi = at::minimum(cell_hi, source_hi);
-    const at::Tensor kept =
-        lo.lt(hi).logical_and_(at::arange(rounds_cap, long_options)
-                                   .view({1, rounds_cap, 1})
-                                   .lt(source_rounds.view({num_nodes - 1, 1, 1})));
-    const at::Tensor rail_offsets = rail.kjt_offsets.narrow(0, 0, num_features * num_sources)
-                                        .view({num_features, num_sources})
-                                        .narrow(1, local_size, num_nodes - 1)
-                                        .t()
-                                        .reshape({num_nodes - 1, 1, num_features});
-    const at::Tensor segments = at::stack({rail_offsets + lo - cell_lo, source_off + lo - source_lo,
-                                           hi - lo, at::zeros_like(lo)},
-                                          3)
-                                    .mul_(kept.unsqueeze(3));
-    tables.fwd_put_list = at::zeros({num_nodes, rounds_cap, num_features, 4}, int_options)
-                              .index_copy_(0, other_nodes, segments.to(at::kInt));
+    const at::Tensor round = at::arange(rounds_cap, long_options).view({rounds_cap, 1, 1});
+    const at::Tensor piece_word = (slice_start.div(4, "floor").view({1, num_nodes, 1}) + 4 * round +
+                                   at::arange(3, long_options))
+                                      .clamp_(0, rail_ints.numel() - 1);
+    tables.fwd_pieces = at::where(round.lt(tables.fwd_rounds.view({1, num_nodes, 1})),
+                                  rail_ints.take(piece_word).to(at::kLong), 0);
   }
   // The KJT's keys at positions [0, lookup_keys), in slices of 2^22 with int32
   // indices: its own node's cells from the own part of node_keys, the other
@@ -145,9 +113,15 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
   constexpr int64_t kSlice = int64_t{1} << 22;
   const at::Tensor cell_offsets =
       rail.kjt_offsets.narrow(0, 0, num_features * num_sources).to(at::kInt);
-  const at::Tensor own_cell_start = own_starts.select(0, sizes.topo.local_rank).to(at::kInt);
-  const at::Tensor first_record = (slice_start + source_rounds * 16).div_(8, "floor");
-  const at::Tensor cell_first_key = cell_first.reshape({-1}).to(at::kInt);
+  const at::Tensor own_cell_start = own_starts.to(at::kInt);
+  const at::Tensor other_slice_start = slice_start.index_select(0, other_nodes);
+  const at::Tensor first_record =
+      (other_slice_start + tables.fwd_rounds.index_select(0, other_nodes) * 16).div_(8, "floor");
+  // where each other node's keys of each feature start among its records,
+  // [num_features][num_nodes - 1]
+  const at::Tensor rail_lengths = rail.cells_in.index_select(0, other_nodes).t();
+  const at::Tensor cell_first_key =
+      (rail_lengths.cumsum(0) - rail_lengths).reshape({-1}).to(at::kInt);
   tables.kjt_values = at::empty({lookup_keys}, long_options);
   if (record_bytes == 16)
     tables.kjt_weights = at::empty({lookup_keys}, long_options.dtype(at::kFloat));

@@ -16,6 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 #include "hier_output_dist/plan/proxy.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -27,7 +28,7 @@ namespace hier_output_dist {
 
 ProxyKeys proxy_keys(const ProxyInput &input, const PlanSizes &sizes, bool node_dedup) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
-                num_features = sizes.num_features;
+                num_features = sizes.num_features, num_tables = sizes.num_tables;
   const auto int_options = input.keys.options().dtype(at::kInt);
   ProxyKeys keys;
   const at::Tensor occurrence = at::arange(entries, int_options);
@@ -38,14 +39,15 @@ ProxyKeys proxy_keys(const ProxyInput &input, const PlanSizes &sizes, bool node_
   // then stably by (owner node, table), the invalid ones last.
   at::Tensor owner_node, feature_at, new_identity;
   {
-    const at::Tensor tag = at::where(keys.valid, input.cells.to(at::kInt), 0);
+    const at::Tensor tag = at::where(keys.valid, input.cells, 0);
     owner_node = tag.div(num_features, "floor").clamp_max(num_nodes - 1);
     const at::Tensor feature = tag.remainder(num_features);
     auto [key_sorted, by_key] = sort_pairs(input.keys, occurrence, 64);
     const at::Tensor identity_tag =
-        at::where(keys.valid, owner_node * 64 + input.tables.index_select(0, feature), 2048)
-            .to(at::kShort);
-    auto [tag_sorted, by_tag] = sort_pairs(identity_tag.index_select(0, by_key), occurrence, 12);
+        at::where(keys.valid, owner_node * num_tables + input.tables.index_select(0, feature),
+                  num_nodes * num_tables);
+    auto [tag_sorted, by_tag] = sort_pairs(identity_tag.index_select(0, by_key), occurrence,
+                                           bits_for(num_nodes * num_tables + 1));
     keys.order = by_key.index_select(0, by_tag);
     feature_at = feature.index_select(0, keys.order);
     if (node_dedup) {
@@ -74,10 +76,10 @@ ProxyKeys proxy_keys(const ProxyInput &input, const PlanSizes &sizes, bool node_
     const at::Tensor first_position = identity_start.narrow(0, 0, entries).clamp_max(entries - 1);
     const at::Tensor first_occurrence = keys.order.index_select(0, first_position);
     const at::Tensor smallest_feature =
-        sort_pairs(identity_of.to(at::kLong).mul_(64).add_(feature_at), occurrence,
-                   bits_for(entries * 64))
+        sort_pairs(identity_of.to(at::kLong).mul_(num_features).add_(feature_at), occurrence,
+                   bits_for(entries * num_features))
             .first.index_select(0, first_position)
-            .bitwise_and(63);
+            .remainder(num_features);
     feature_at.reset();
     identity_cell =
         at::where(occurrence.lt(keys.num_keys),
@@ -274,17 +276,27 @@ ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   return rounds;
 }
 
+PushKey push_key_of(const PlanSizes &sizes) {
+  // a piece holds at most remote_keys keys: at most this many IB chunks
+  const int64_t chunks = sizes.remote_keys / sizes.chunk_rows + 1;
+  PushKey key;
+  key.heavy_shift = std::max(bits_for(sizes.remote_keys), bits_for(chunks * sizes.topo.num_nodes));
+  key.round_shift = key.heavy_shift + 1;
+  key.requester_shift = key.round_shift + bits_for(sizes.rounds_cap + 1);
+  key.bits = key.requester_shift + bits_for(sizes.topo.local_size + 1);
+  return key;
+}
+
 ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor &requester_start,
                            const ProxyWindows &windows, const PlanSizes &sizes) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 local_size = sizes.topo.local_size, rounds_cap = sizes.rounds_cap;
   const auto long_options = keys.order.options().dtype(at::kLong);
   const auto int_options = keys.order.options().dtype(at::kInt);
-  // The push order: one stable sort of the occurrences by their requester
-  // (bits 56-58), round (36-55) and heavy bit (35), then a heavy key's index
-  // or the IB chunk and owner node of a key with a row each (chunk << 5 |
-  // owner node); the invalid ones after requester local_size - 1. What only
-  // the push key needs goes before the sort.
+  const PushKey layout = push_key_of(sizes);
+  // The push order: one stable sort of the occurrences by their push key;
+  // the invalid ones after requester local_size - 1. What only the push key
+  // needs goes before the sort.
   at::Tensor push_key_sorted, push_order;
   {
     at::Tensor push_key;
@@ -292,43 +304,43 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor 
       const at::Tensor key =
           at::empty({entries}, int_options).index_copy_(0, keys.order.to(at::kLong), keys.key_at);
       const at::Tensor heavy = keys.key_heavy.index_select(0, key);
-      push_key = rounds.requester_of.to(at::kLong).bitwise_left_shift_(56);
-      push_key.bitwise_or_(
-          rounds.key_round.index_select(0, key).to(at::kLong).bitwise_left_shift_(36));
-      push_key.bitwise_or_(heavy.to(at::kLong).bitwise_left_shift_(35));
-      at::Tensor low = keys.key_uniq.index_select(0, key);
+      push_key = rounds.requester_of.to(at::kLong).bitwise_left_shift_(layout.requester_shift);
+      push_key.bitwise_or_(rounds.key_round.index_select(0, key).to(at::kLong).bitwise_left_shift_(
+          layout.round_shift));
+      push_key.bitwise_or_(heavy.to(at::kLong).bitwise_left_shift_(layout.heavy_shift));
+      at::Tensor low = keys.key_uniq.index_select(0, key).to(at::kLong);
       low.sub_(rounds.key_lo.index_select(0, key)).div_(sizes.chunk_rows, "floor");
-      low.bitwise_left_shift_(5).bitwise_or_(keys.key_node.index_select(0, key));
-      push_key.bitwise_or_(at::where(heavy, key, low));
+      low.mul_(num_nodes).add_(keys.key_node.index_select(0, key));
+      push_key.bitwise_or_(at::where(heavy, key.to(at::kLong), low));
     }
     keys.key_at.reset();
     keys.key_uniq.reset();
     keys.key_node.reset();
     rounds.key_lo.reset();
     rounds.requester_of.reset();
-    push_key = at::where(keys.valid, push_key, local_size << 56);
+    push_key = at::where(keys.valid, push_key, local_size << layout.requester_shift);
     std::tie(push_key_sorted, push_order) =
-        sort_pairs(push_key, at::arange(entries, int_options), 60);
+        sort_pairs(push_key, at::arange(entries, int_options), layout.bits);
   }
   // The push tables, per requester and round: its first position, its first
   // heavy position, its first push-task flag, and its first heavy group (a
   // group: the positions of one requester, round and heavy key).
   const at::Tensor round_key = at::arange(local_size, long_options)
                                    .view({local_size, 1})
-                                   .bitwise_left_shift(56)
+                                   .bitwise_left_shift(layout.requester_shift)
                                    .bitwise_or(at::arange(rounds_cap + 1, long_options)
                                                    .view({1, rounds_cap + 1})
-                                                   .bitwise_left_shift(36));
+                                                   .bitwise_left_shift(layout.round_shift));
   const at::Tensor start_at =
       at::searchsorted(push_key_sorted, round_key.view({-1})).view({local_size, rounds_cap + 1});
   const at::Tensor requester_first = requester_start.narrow(0, 0, local_size).view({local_size, 1});
   const at::Tensor start = start_at - requester_first;
   const at::Tensor heavy_start =
-      at::searchsorted(push_key_sorted, (round_key + (int64_t{1} << 35)).view({-1}))
+      at::searchsorted(push_key_sorted, (round_key + (int64_t{1} << layout.heavy_shift)).view({-1}))
           .view({local_size, rounds_cap + 1}) -
       requester_first;
   const at::Tensor groups_before = exclusive_ends(
-      push_key_sorted.bitwise_right_shift(35)
+      push_key_sorted.bitwise_right_shift(layout.heavy_shift)
           .bitwise_and_(1)
           .eq(1)
           .logical_and_(keys.valid)
@@ -360,16 +372,19 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor 
   {
     const at::Tensor push_order64 = push_order.to(at::kLong);
     push_order.reset();
-    const at::Tensor requester =
-        push_key_sorted.bitwise_right_shift(56).clamp_max_(local_size).to(at::kInt);
+    const at::Tensor requester = push_key_sorted.bitwise_right_shift(layout.requester_shift)
+                                     .clamp_max_(local_size)
+                                     .to(at::kInt);
     const at::Tensor position =
         at::arange(entries, int_options) - requester_start.to(at::kInt).index_select(0, requester);
     windows.remote_map.select(0, 2).index_copy_(0, push_order64, position);
     const at::Tensor table =
         requester.clamp_max(local_size - 1)
             .mul_(rounds_cap + 1)
-            .add_(push_key_sorted.bitwise_right_shift(36).bitwise_and_(0xFFFFF).clamp_max_(
-                rounds_cap));
+            .add_(
+                push_key_sorted.bitwise_right_shift(layout.round_shift)
+                    .bitwise_and_((int64_t{1} << (layout.requester_shift - layout.round_shift)) - 1)
+                    .clamp_max_(rounds_cap));
     occurrence_flag =
         at::empty({entries}, int_options)
             .index_copy_(0, push_order64,
@@ -413,11 +428,12 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor 
     {
       at::Tensor group_position, present;
       {
-        const at::Tensor group_key = requester.to(at::kLong)
-                                         .bitwise_left_shift_(56)
-                                         .bitwise_or_(round.to(at::kLong).bitwise_left_shift_(36))
-                                         .bitwise_or_(int64_t{1} << 35)
-                                         .bitwise_or_(entry_key);
+        const at::Tensor group_key =
+            requester.to(at::kLong)
+                .bitwise_left_shift_(layout.requester_shift)
+                .bitwise_or_(round.to(at::kLong).bitwise_left_shift_(layout.round_shift))
+                .bitwise_or_(int64_t{1} << layout.heavy_shift)
+                .bitwise_or_(entry_key);
         group_position = at::searchsorted(push_key_sorted, group_key, /*out_int32=*/true)
                              .clamp_max_(entries - 1);
         present = push_key_sorted.index_select(0, group_position).eq(group_key);

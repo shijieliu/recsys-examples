@@ -47,7 +47,7 @@ enum WinId : int { kWinCtrl = 0, kWinKeys, kWinRows, kNumWins };
 //                 then [feature][position]. A remote occurrence is named by
 //                 its index occ in the remote part.
 //   node_weights  (keys) their weights, when the requester KJT carries them
-//   remote_cells  (keys, num_nodes > 1) per remote occurrence, int16: its
+//   remote_cells  (keys, num_nodes > 1) per remote occurrence, int32: its
 //                 owner node * num_features + feature
 //   remote_map    (keys, num_nodes > 1) per remote occurrence occ, three int32
 //                 arrays of remote_keys: its key's row in proxy_rows (bit 31:
@@ -63,6 +63,12 @@ enum WinId : int { kWinCtrl = 0, kWinKeys, kWinRows, kNumWins };
 //   rail_keys     (keys, num_nodes > 1) the key records the rail proxies put,
 //                 one slice per source node in node order, each its round
 //                 pieces, then its records in uniq order
+//   cell_stage    (keys, num_nodes > 1) int64 [num_nodes][num_features]: as
+//                 owner, where the cells (feature, source node) of each rail
+//                 proxy's node start in its KJT, what it puts to that proxy
+//   rail_cells    (keys, num_nodes > 1) int64 [num_nodes][num_features]: as
+//                 proxy, where its node's cells start in each rail owner's
+//                 KJT, as the owner put them
 //   lookup_rows   (rows) the owner's lookup output, row i for its KJT's key i;
 //                 the backward writes the gradient of that output over it
 //   proxy_rows    (rows, num_nodes > 1) the proxy's rows: the rows of the
@@ -79,6 +85,8 @@ enum Region : int {
   kProxyHdr,
   kKeyStage,
   kRailKeys,
+  kCellStage,
+  kRailCells,
   kLookupRows,
   kProxyRows,
   kPushFlags,

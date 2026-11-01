@@ -21,10 +21,12 @@ requester's tables (``hier_output_dist_requester_tables``).
 The test plays every rank of an N-node job: each rank's part 1 (its rows by
 owner and feature, and past the valid ones index dedup's bound), its node
 layout (``hier_output_dist_node_layout``), and between the steps what the
-comm kernels do: the pushes into node_keys, the count messages of each rail,
-the key records each proxy puts into its owners' rail_keys, the needs and
-cell starts each node exchanges (the requester binding gathers the proxies'
-words itself). The windows hold garbage before the call. The checks:
+comm kernels do: the node's summed counts, the pushes into node_keys, the
+count messages of each rail, the key records each proxy puts into its owners'
+rail_keys and the cell starts each owner puts into its proxies' rail_cells,
+the needs and cell starts each node exchanges (the requester binding gathers
+the proxies' words itself). The windows hold garbage before the call. The
+checks:
 
 * each proxy against a plain reference of the planner's rules: its
   node-unique keys (identities (owner node, table, key), cells by smallest
@@ -38,10 +40,11 @@ words itself). The windows hold garbage before the call. The checks:
   slots at its proxies), push order, push tables, heavy groups, sub-tasks and
   task starts; and per node a backward with integer gradients through the
   requesters' push tasks and the proxies' reducer lists;
-* the rail: each proxy's slices and cells start where its owners' offsets
-  say; each owner's KJT and forward put list; each proxy's backward put list
-  against a plain loop over its pieces and chunks; the needs, the same on
-  every rank.
+* the rail: each proxy's slices start where its owners' offsets say, and
+  each owner sends each proxy its KJT's offsets of that node's cells; each
+  owner's KJT; each rank's put lists (as proxy and as owner) against a plain
+  loop over the pieces, IB chunks and cells; the needs, the same on every
+  rank.
 
 Calls that do not fit check the needs alone (and that no access was out of
 range). Every planner call runs under ``torch.cuda.set_sync_debug_mode
@@ -121,6 +124,10 @@ class Case:
     @property
     def num_features(self) -> int:
         return len(self.tables)
+
+    @property
+    def num_tables(self) -> int:
+        return max(self.tables) + 1
 
     @property
     def world_size(self) -> int:
@@ -298,6 +305,39 @@ CASES = [
         lookup_slack=1 << 22,
         seeds=1,
     ),
+    Case(
+        "70 features, 3 nodes of 4, several rounds",
+        num_nodes=3,
+        local_size=4,
+        tables=tuple(feature // 3 for feature in range(70)),
+        max_block=12,
+        key_range=4000,
+        hot=0.05,
+        num_proxy_rows=2560,
+        chunk_rows=64,
+        seeds=1,
+    ),
+    Case(
+        "36 nodes of 1",
+        num_nodes=36,
+        local_size=1,
+        tables=(0, 1),
+        max_block=6,
+        key_range=100,
+        hot=0.2,
+        num_proxy_rows=45 * 1280,
+        seeds=1,
+    ),
+    Case(
+        "2 nodes of 34",
+        num_nodes=2,
+        local_size=34,
+        tables=(0, 0),
+        max_block=2,
+        key_range=30,
+        hot=0.3,
+        seeds=1,
+    ),
 ]
 
 
@@ -366,7 +406,7 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
     rounds_cap = rounds_for(remote_keys, case.num_proxy_rows)
     windows = dict(
         node_keys=garbage(lookup_keys + remote_keys, torch.int64, generator),
-        remote_cells=garbage(remote_keys, torch.int16, generator),
+        remote_cells=garbage(remote_keys, torch.int32, generator),
         remote_map=garbage(3 * remote_keys, torch.int32, generator),
         key_stage=garbage(
             (num_nodes - 1) * rounds_cap * 2 + remote_keys * case.record_bytes // 8 + 2,
@@ -383,6 +423,7 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
             torch.int64,
             generator,
         ),
+        rail_cells=garbage(num_nodes * case.num_features, torch.int64, generator),
     )
     if case.weights:
         windows["node_weights"] = garbage(
@@ -686,43 +727,53 @@ def merge_rank_cells(case: Case, occurrences: List) -> Dict:
     return {cell: sorted(records) for cell, records in cells.items()}
 
 
-def put_list_reference(case: Case, table, cell_uniq, rail_cell_start, node, num_rounds):
-    """The backward put list by a plain loop: per piece
-    (round-major, then owner node) its IB chunks, per chunk a segment for
-    each feature cell it overlaps."""
-    num_nodes, num_features, chunk_rows = (
-        case.num_nodes,
-        case.num_features,
-        case.chunk_rows,
-    )
-    segments, starts, chunk0, chunks = [], [], [], 0
-    for rnd in range(num_rounds):
-        for owner_node in range(num_nodes):
-            lo, hi, off, _ = table[rnd][owner_node]
-            cell_ends = list(
-                accumulate([0] + cell_uniq[owner_node * num_features :][:num_features])
+def segments_reference(case: Case, pieces, rounds, cells, cell_rows, rounds_cap: int):
+    """The put lists by a plain loop, over 2 * num_nodes nodes: the backward
+    list's owner nodes, then the forward list's proxy nodes. Each node's keys,
+    round by round, its piece cut every chunk_rows keys and at its feature
+    cells; chunks numbered piece by piece, round-major. pieces[rnd][node] =
+    (lo, hi, row of lo in proxy_rows), rounds[node]: its rounds,
+    cells[node][feature]: its keys of each feature, cell_rows[node][feature]:
+    the owner's KJT row of each cell's first key. Returns the segments [src,
+    dst, rows, chunk], the first segment of each (node, round), [node]
+    [rounds_cap + 1], and the chunks."""
+    nodes, chunk_rows = 2 * case.num_nodes, case.chunk_rows
+    first_chunk, chunks = {}, 0
+    for rnd in range(rounds_cap):
+        for node in range(nodes):
+            lo, hi, _ = pieces[rnd][node]
+            first_chunk[rnd, node] = chunks
+            if rnd < rounds[node]:
+                chunks += -(-(hi - lo) // chunk_rows)
+    segments, starts = [], []
+    for node in range(nodes):
+        cell_ends = list(accumulate([0] + list(cells[node])))
+        node_starts = []
+        for rnd in range(rounds_cap):
+            node_starts.append(len(segments))
+            if rnd >= rounds[node]:
+                continue
+            lo, hi, row = pieces[rnd][node]
+            cuts = sorted(
+                set(
+                    [lo, hi]
+                    + list(range(lo, hi, chunk_rows))
+                    + [end for end in cell_ends if lo < end < hi]
+                )
             )
-            starts.append(len(segments))
-            chunk0.append(chunks)
-            for nth in range(-(-(hi - lo) // chunk_rows)):
-                first = lo + nth * chunk_rows
-                last = min(hi, first + chunk_rows)
-                for feature in range(num_features):
-                    segment_lo = max(first, cell_ends[feature])
-                    segment_hi = min(last, cell_ends[feature + 1])
-                    if segment_lo < segment_hi:
-                        segments.append(
-                            [
-                                off + segment_lo - lo,
-                                rail_cell_start[owner_node][feature]
-                                + segment_lo
-                                - cell_ends[feature],
-                                segment_hi - segment_lo,
-                                chunks,
-                            ]
-                        )
-                chunks += 1
-    return segments, starts + [len(segments)], chunk0, chunks
+            for first, last in zip(cuts, cuts[1:]):
+                feature = bisect_right(cell_ends, first) - 1
+                piece_row = row + first - lo
+                cell_row = cell_rows[node][feature] + first - cell_ends[feature]
+                chunk = first_chunk[rnd, node] + (first - lo) // chunk_rows
+                segments.append(
+                    [cell_row, piece_row, last - first, chunk]
+                    if node >= case.num_nodes
+                    else [piece_row, cell_row, last - first, chunk]
+                )
+        node_starts.append(len(segments))
+        starts.append(node_starts)
+    return segments, starts, chunks
 
 
 # ── the call ─────────────────────────────────────────────────────────────────
@@ -748,6 +799,7 @@ def run_call(
     )
     world_size = case.world_size
     tables = torch.tensor(case.tables, dtype=torch.int32, device="cuda")
+    common = 3 + num_nodes  # a count message's common part (msg_common)
 
     def sizes(rank: int) -> Dict[str, int]:
         return dict(
@@ -756,6 +808,7 @@ def run_call(
             node=rank // local_size,
             local_rank=rank % local_size,
             num_features=num_features,
+            num_tables=case.num_tables,
             lookup_keys=lookup_keys,
             remote_keys=remote_keys,
             num_proxy_rows=case.num_proxy_rows,
@@ -766,25 +819,32 @@ def run_call(
 
     layouts, windows = [], []
     for rank, part in enumerate(ranks):
-        node = rank // local_size
-        # node_count_exchange: the counts of every rank of the node
-        node_counts = torch.stack(
+        node, local_rank = divmod(rank, local_size)
+        # node_count_exchange: the count vectors' sum over the node and over
+        # the ranks before this one, and each requester's counts for it
+        vectors = torch.stack(
             [
                 count_vector(case, ranks[node * local_size + requester], node)
                 for requester in range(local_size)
             ]
-        ).cuda()
+        )
+        own_columns = vectors[:, local_size + local_rank * num_features :][
+            :, :num_features
+        ]
+        mine = torch.cat([vectors[:, local_rank : local_rank + 1], own_columns], 1)
         layouts.append(
             planner(
                 hier_output_dist_node_layout,
-                node_counts,
+                vectors.sum(0).cuda(),
+                vectors[:local_rank].sum(0).cuda(),
+                mine.contiguous().view(-1).cuda(),
                 part["cell_start"],
                 part["block_start"],
                 part["row_cell"],
                 num_nodes,
                 local_size,
                 node,
-                rank % local_size,
+                local_rank,
                 num_features,
                 lookup_keys,
                 remote_keys,
@@ -809,7 +869,7 @@ def run_call(
             window["remote_cells"][destination[remote] - lookup_keys] = (
                 (owner[remote] // local_size) * num_features
                 + cell[remote] % num_features
-            ).short()
+            ).int()
     proxies = []
     for rank, window in enumerate(windows):
         layout = layouts[rank]
@@ -823,7 +883,7 @@ def run_call(
                 layout["skip"],
                 tables,
                 layout["need_remote"],
-                layout["own_cells"],
+                layout["own_total"][rank % local_size : rank % local_size + 1],
                 window["remote_map"],
                 window["key_stage"],
                 window["proxy_hdr"],
@@ -831,31 +891,36 @@ def run_call(
                 sizes(rank),
             )
         )
-    # rail_count_exchange: the messages of each rank's rail
-    messages = [
-        torch.stack(
-            [
-                proxies[node * local_size + rail_rank]["message"]
-                for node in range(num_nodes)
-            ]
-        )
-        for rail_rank in range(local_size)
-    ]
 
-    def rail_tables(rank: int, **owner) -> Dict:
+    # rail_count_exchange: each rank gets from the rail peer on each node its
+    # common part and its part for this rank's node
+    def messages_of(rank: int) -> torch.Tensor:
+        node, rail_rank = divmod(rank, local_size)
+        rows = []
+        for source in range(num_nodes):
+            message = proxies[source * local_size + rail_rank]["message"]
+            first = common + node * num_features
+            rows.append(
+                torch.cat([message[:common], message[first : first + num_features]])
+            )
+        return torch.stack(rows)
+
+    def rail_tables(rank: int, **later) -> Dict:
         return planner(
             hier_output_dist_rail_tables,
-            messages[rank % local_size],
+            messages_of(rank),
             layouts[rank]["own_cells"],
             layouts[rank]["own_starts"],
             proxies[rank]["round_table"],
+            proxies[rank]["num_rounds"].view(1),
             proxies[rank]["cell_uniq"],
             sizes=sizes(rank),
-            **owner,
+            **later,
         )
 
     rails = [rail_tables(rank) for rank in range(world_size)]
-    # rail_key_exchange: each proxy's slice for each owner of its rail
+    # rail_key_exchange: each proxy's slice for each owner of its rail, and
+    # each owner's cell starts for each proxy of its rail
     problems = []
     for rank, rail in enumerate(rails):
         node, rail_rank = divmod(rank, local_size)
@@ -867,15 +932,22 @@ def run_call(
                 rail["put_bytes"].tolist(),
             )
         ):
+            if owner_node == node:
+                continue
+            owner = owner_node * local_size + rail_rank
+            windows[rank]["rail_cells"].view(num_nodes, num_features)[
+                owner_node
+            ] = rails[owner]["cell_stage"][node]
             if skip:
                 continue
-            rail_keys = windows[owner_node * local_size + rail_rank]["rail_keys"]
+            rail_keys = windows[owner]["rail_keys"]
             if dst + size > 8 * rail_keys.numel():
                 problems.append("a put past rail_keys")
                 continue
             source = windows[rank]["key_stage"][put_src[owner_node] // 8 :]
             rail_keys[dst // 8 : (dst + size) // 8] = source[: size // 8]
-    # node_status_exchange, then the owners' tables and the requesters'
+    # node_status_exchange, then the owners' tables, the proxies' put lists
+    # and the requesters' tables
     publish = torch.stack([rail["publish"] for rail in rails]).view(
         num_nodes, local_size, -1
     )
@@ -885,6 +957,7 @@ def run_call(
         owners.append(
             rail_tables(
                 rank,
+                rail_cells=window["rail_cells"],
                 rail_keys=window["rail_keys"],
                 node_keys=window["node_keys"][:lookup_keys],
                 node_weights=window["node_weights"][:lookup_keys]
@@ -1246,8 +1319,8 @@ def check_rail(
     lookup_keys: int,
 ):
     """What a rank as proxy computed of its rail's owners against what they
-    computed: where its slice and its cells start there, its
-    puts; and its own cell starts as owner."""
+    computed: where its slice starts there and its puts; what each owner
+    sends it of where its cells start; and its own cell starts as owner."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1267,11 +1340,11 @@ def check_rail(
             continue
         column = node if node < owner_node else node - 1
         offsets, slice_in = owner["kjt_offsets"].tolist(), owner["slice_in"].tolist()
-        if mine["rail_cell_start"][owner_node] != [
+        if owner["cell_stage"].tolist()[node] != [
             offsets[feature * num_sources + local_size + column]
             for feature in range(num_features)
         ]:
-            problems.append("rail_cell_start != the owner's KJT offsets")
+            problems.append("cell_stage != the owner's KJT offsets")
         if mine["put_dst"][owner_node] != slice_in[node][0]:
             problems.append("put_dst != the owner's slice_in")
         uniq = ref["uniq_off"][owner_node + 1] - ref["uniq_off"][owner_node]
@@ -1290,15 +1363,17 @@ def check_rail(
         for source in range(local_size)
     ]:
         problems.append("my_cell_starts")
+    if mine["cell_stage"][node] != [0] * num_features:
+        problems.append("cell_stage of its own node")
     return problems
 
 
 def check_owner(
     case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict, rounds_cap: int
 ):
-    """An owner's KJT and forward put list: per feature its node's keys, each
-    requester's in its order, then each other node's node-unique keys of its
-    rail's proxy there, in key order."""
+    """An owner's KJT: per feature its node's keys, each requester's in its
+    order, then each other node's node-unique keys of its rail's proxy there,
+    in key order."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1351,59 +1426,80 @@ def check_owner(
     expect("kjt_values", out["kjt_values"][:num_recv].tolist(), keys)
     if case.record_bytes == 16:
         expect("kjt_weights", out["kjt_weights"][:num_recv].tolist(), weights)
-    # the forward put list: each other node's round piece in each cell
-    put = [
-        [[[0, 0, 0, 0] for _ in range(num_features)] for _ in range(rounds_cap)]
-        for _ in range(num_nodes)
-    ]
-    for column, other_node in enumerate(others):
-        ref = refs[(other_node, rail)]
-        cell_first = 0
-        for feature in range(num_features):
-            count = ref["cell_uniq"][node * num_features + feature]
-            for rnd in range(ref["num_rounds"]):
-                lo, hi, off, _ = ref["round_table"][rnd][node]
-                first, last = max(lo, cell_first), min(hi, cell_first + count)
-                if first < last:
-                    put[other_node][rnd][feature] = [
-                        offsets[feature * num_sources + local_size + column]
-                        + first
-                        - cell_first,
-                        off + first - lo,
-                        last - first,
-                        0,
-                    ]
-            cell_first += count
-    expect("forward put list", out["fwd_put_list"].tolist(), put)
     return problems
 
 
-def check_put_list(case: Case, rank: int, ref: Dict, out: Dict, rounds_cap: int):
-    """A proxy's backward put list, chunks and reducer task starts against
-    a plain loop."""
-    num_nodes = case.num_nodes
-    node = rank // case.local_size
-    num_rounds = ref["num_rounds"]
-    segments, starts, chunk0, chunks = put_list_reference(
-        case,
-        ref["round_table"],
-        ref["cell_uniq"],
-        out["rail_cell_start"].tolist(),
-        node,
-        num_rounds,
+def check_put_lists(
+    case: Case, rank: int, refs: Dict, out: Dict, rail_cells, rounds_cap: int
+):
+    """A rank's put lists, as proxy the backward's and as owner the
+    forward's, its chunks and its reducer task starts, against a plain
+    loop."""
+    num_nodes, local_size, num_features = (
+        case.num_nodes,
+        case.local_size,
+        case.num_features,
+    )
+    num_sources = local_size + num_nodes - 1
+    node, rail = divmod(rank, local_size)
+    ref = refs[(node, rail)]
+    offsets = out["kjt_offsets"].tolist()
+    # the backward's owner nodes: this proxy's pieces and cells, at the rows
+    # its owners sent; then the forward's proxy nodes: each source node's
+    # pieces for this owner, at its cells in this owner's KJT
+    pieces = [[(0, 0, 0)] * (2 * num_nodes) for _ in range(rounds_cap)]
+    rounds = [ref["num_rounds"]] * num_nodes + [0] * num_nodes
+    cells = [
+        ref["cell_uniq"][owner_node * num_features :][:num_features]
+        for owner_node in range(num_nodes)
+    ]
+    cell_rows = list(rail_cells)
+    for rnd in range(ref["num_rounds"]):
+        for owner_node in range(num_nodes):
+            pieces[rnd][owner_node] = tuple(ref["round_table"][rnd][owner_node][:3])
+    for source in range(num_nodes):
+        if source == node:
+            cells.append([0] * num_features)
+            cell_rows.append([0] * num_features)
+            continue
+        source_ref = refs[(source, rail)]
+        column = source if source < node else source - 1
+        rounds[num_nodes + source] = source_ref["num_rounds"]
+        for rnd in range(source_ref["num_rounds"]):
+            pieces[rnd][num_nodes + source] = tuple(
+                source_ref["round_table"][rnd][node][:3]
+            )
+        cells.append(source_ref["cell_uniq"][node * num_features :][:num_features])
+        cell_rows.append(
+            [
+                offsets[feature * num_sources + local_size + column]
+                for feature in range(num_features)
+            ]
+        )
+    segments, starts, chunks = segments_reference(
+        case, pieces, rounds, cells, cell_rows, rounds_cap
     )
     problems = []
     if int(out["num_chunks"]) != chunks:
         problems.append("chunks")
-    if out["bwd_put_list"][: len(segments)].tolist() != segments:
-        problems.append("backward put list")
-    put_start = out["bwd_put_start"].tolist()
-    if put_start[: num_rounds * num_nodes] + put_start[-1:] != starts:
+    if out["put_list"][: len(segments)].tolist() != segments:
+        problems.append("put list")
+    if out["bwd_put_start"].tolist() != starts[:num_nodes]:
         problems.append("backward put starts")
+    if out["fwd_put_start"].tolist() != starts[num_nodes:]:
+        problems.append("forward put starts")
+    chunk0, at = [], 0
+    for rnd in range(rounds_cap):
+        for piece_node in range(2 * num_nodes):
+            lo, hi, _ = pieces[rnd][piece_node]
+            if piece_node < num_nodes:
+                chunk0.append(at)
+            if rnd < rounds[piece_node]:
+                at += -(-(hi - lo) // case.chunk_rows)
     table = out["round_table"].tolist()
     if [
         table[rnd][owner_node][3]
-        for rnd in range(num_rounds)
+        for rnd in range(rounds_cap)
         for owner_node in range(num_nodes)
     ] != chunk0:
         problems.append("round table chunks")
@@ -1547,20 +1643,26 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     )
     checks["put lists"] = sum(
         (
-            check_put_list(
-                case, rank, refs[divmod(rank, local_size)], rails[rank], rounds_cap
+            check_put_lists(
+                case,
+                rank,
+                refs,
+                owners[rank],
+                call["windows"][rank]["rail_cells"]
+                .view(num_nodes, num_features)
+                .tolist(),
+                rounds_cap,
             )
             for rank in range(world_size)
         ),
         [],
     )
-    # the owner tables' call computed the rail's tables again (the put list
-    # past its segments holds what at::empty gave)
+    # the owner tables' call computed the rail's tables again
     checks["again"] = [
         name
         for rank in range(world_size)
         for name, tensor in rails[rank].items()
-        if name != "bwd_put_list" and not torch.equal(owners[rank][name], tensor)
+        if not torch.equal(owners[rank][name], tensor)
     ]
     if case.job is same_parity_job:
         # requester 0's two rows at proxy 0: rounds 0 and 2, one partial slot

@@ -38,11 +38,11 @@ namespace hier_output_dist {
 // window is registered (the control words: sequence numbers start at 0; the
 // push-task flags: tags start at 0). Every other region is written before it
 // is read, so it is never initialized.
-constexpr WinId kRegionWin[kNumRegions] = {kWinCtrl, kWinKeys, kWinKeys, kWinKeys,
-                                           kWinKeys, kWinKeys, kWinKeys, kWinKeys,
+constexpr WinId kRegionWin[kNumRegions] = {kWinCtrl, kWinKeys, kWinKeys, kWinKeys, kWinKeys,
+                                           kWinKeys, kWinKeys, kWinKeys, kWinKeys, kWinKeys,
                                            kWinRows, kWinRows, kWinRows};
-constexpr bool kRegionZero[kNumRegions] = {true,  false, false, false, false, false,
-                                           false, false, false, false, true};
+constexpr bool kRegionZero[kNumRegions] = {true,  false, false, false, false, false, false,
+                                           false, false, false, false, false, true};
 // Each region starts at a multiple of this inside its window.
 constexpr uint64_t kRegionAlign = 4096;
 
@@ -51,6 +51,7 @@ struct Layout {
 
   Topo topo;
   int num_features;
+  int num_tables;  // the features' tables, numbered densely (dense_tables)
   int64_t row_bytes;
   int partial_rows;  // rows of proxy_rows a requester's fp32 partial row takes
   int chunk_rows;    // rows of an IB chunk (2 MiB), a multiple of kTaskRows
@@ -85,6 +86,9 @@ int partial_rows_for(int64_t dim, int64_t row_bytes);
 
 // The control words' layout of an op of these ranks and features.
 Ctrl ctrl_layout(int local_size, int num_nodes, int num_features);
+// The table of each feature, numbered from 0 in the order the tables first
+// appear: equal tables keep equal numbers.
+std::vector<int> dense_tables(const std::vector<int> &feature_tables);
 // A call's small tables (Meta) by name, in field order.
 std::vector<std::pair<std::string, int64_t>> meta_fields(const Meta &meta_at);
 // The names of the regions (Region order) and of the windows (WinId order).

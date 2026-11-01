@@ -71,21 +71,21 @@ namespace hier_output_dist {
 
 namespace bwd {
 
-// Across nodes, the end of a backward waits (warp 0 of the last CTA, one lane
-// per rail peer) for the gradient rows the proxy on that node puts into this
-// owner's lookup_rows: its bwd_rows signal against the running total
-// (bwd_tot).
+// Across nodes, the end of a backward waits (warp 0 of the last CTA, its
+// lanes taking the rail peers in turn) for the gradient rows the proxy on
+// each other node puts into this owner's lookup_rows: its bwd_rows signal
+// against the running total (bwd_tot).
 __device__ __forceinline__ void wait_rail_rows_warp(const OutArgs &args, const CtrlWords &mine) {
-  const int peer_node = threadIdx.x & 31;
-  if (peer_node < args.topo.num_nodes && peer_node != args.topo.node) {
-    ncclGin rows(args.dev, kCtxBwd);
-    const uint64_t base = *mine.bwd_tot(peer_node),
-                   want = base + (uint64_t)args.plan.meta[args.meta_at.uniq_in + peer_node];
-    // Tracing: CTA 0 is the last CTA when its watcher stopped before every
-    // row had landed; another one comes after it saw them all
-    // (LandingWatcher).
-    if (OutTimeline(args).on() && blockIdx.x == 0)
-      LandingWatcher::rest(args, peer_node, base, want - base);
+  const int lane = threadIdx.x & 31;
+  // Tracing: CTA 0 is the last CTA when its watcher stopped before every
+  // row had landed; another one comes after it saw them all
+  // (LandingWatcher).
+  if (OutTimeline(args).on() && blockIdx.x == 0) LandingWatcher::rest(args, lane);
+  ncclGin rows(args.dev, kCtxBwd);
+  for (int peer_node = lane; peer_node < args.topo.num_nodes; peer_node += 32) {
+    if (peer_node == args.topo.node) continue;
+    const uint64_t want =
+        *mine.bwd_tot(peer_node) + (uint64_t)args.plan.meta[args.meta_at.uniq_in + peer_node];
     Spin spin(args.timeout_ns);
     while (rows.readSignal(sig_rows(peer_node)) < want)
       spin.pause("gradient rows of a proxy node", peer_node, (long long)want, args.topo.rank);
@@ -109,7 +109,8 @@ __device__ __forceinline__ void exit(const OutArgs &args) {
     TaskQueue::reset_all(args);
     for (int peer = 0; peer < args.topo.local_size; ++peer) pushed.tell(peer, me);
   }
-  if (tid < args.topo.local_size) pushed.wait(me, tid, "gradient rows pushed");
+  for (int peer = tid; peer < args.topo.local_size; peer += blockDim.x)
+    pushed.wait(me, peer, "gradient rows pushed");
   if (args.topo.num_nodes > 1 && (tid >> 5) == 0) wait_rail_rows_warp(args, mine);
   if (timeline.on()) {
     __syncthreads();
@@ -123,14 +124,12 @@ __device__ __forceinline__ void exit(const OutArgs &args) {
 // proxy's issuer and, in a build with kTrace, the warp before it watches
 // this rank's landings; both skip the entry barrier. Across nodes the last
 // CTAs reduce (bwd::ProxyReducer). Every other warp requests
-// (bwd_requester.cuh): it copies the call's tables, zeroes the counters this
-// kernel counts from 0 (before this rank publishes its out_seq), passes the
-// entry barrier and takes its tasks. Every CTA then arrives, and the last
-// one ends the backward for this rank (bwd::exit).
+// (bwd_requester.cuh): it zeroes the counters this kernel counts from 0
+// (before this rank publishes its out_seq), passes the entry barrier and
+// takes its tasks. Every CTA then arrives, and the last one ends the
+// backward for this rank (bwd::exit).
 template <typename RowT>
 __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(OutArgs args) {
-  __shared__ OutTables tables;
-  __shared__ ReduceTables red;
   const OutPlan &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int local_size = args.topo.local_size, num_nodes = args.topo.num_nodes,
@@ -148,9 +147,11 @@ __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(OutArgs args) {
       bwd::LandingWatcher::run(args);
   } else if (num_nodes > 1 && blockIdx.x >= gridDim.x - args.reducers) {
     pass_entry_barrier(args, kThreads);
-    bwd::ProxyReducer<RowT>::run(args, red, lane);
+    bwd::ProxyReducer<RowT>::run(args, lane);
   } else {
-    tables.load(args);
+    const OutTables tables(args);
+    // half_seen starts at 0; the entry barrier's sync publishes it
+    for (int proxy = tid; proxy < local_size; proxy += workers) *tables.half_seen(proxy) = 0;
     int64_t groups = 0;  // this rank's heavy groups, at all its proxies
     if (num_nodes > 1) {
       const ReqEntry *req = (const ReqEntry *)(meta + args.meta_at.push_tables);
@@ -170,7 +171,7 @@ __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(OutArgs args) {
       cta_sync(workers);
     }
     pass_entry_barrier(args, workers);
-    const int64_t *node_block_start = tables.block_start + node * local_size;
+    const int64_t *node_block_start = plan.block_start + node * local_size;
     const int64_t *bwd_task_starts = meta + args.meta_at.bwd_task_starts;
     // Every heavy row's sub-task has a slot before the remote tasks (across
     // nodes), which those of rows to other nodes take, and one among the row

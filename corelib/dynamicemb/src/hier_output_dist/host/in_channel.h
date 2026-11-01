@@ -66,13 +66,14 @@ class InChannel {
   // This rank's regions the steps read and write, as tensors without an
   // allocator (the windows outlive them): the own part of node_keys (and
   // node_weights), and across nodes its remote part, the cell tags, the
-  // proxy's windows and rail_keys.
+  // proxy's windows, rail_keys, cell_stage and rail_cells.
   at::Tensor own_keys_, own_weights_;
   at::Tensor remote_keys_, remote_weights_, remote_cells_;
   ProxyWindows proxy_windows_;
-  at::Tensor rail_keys_;
-  // Constants of the op across nodes: the table of each feature, the other
-  // nodes, and the words of the proxy headers this requester reads.
+  at::Tensor rail_keys_, cell_stage_, rail_cells_;
+  // Constants of the op across nodes: the table of each feature (numbered
+  // densely), the other nodes, and the words of the proxy headers this
+  // requester reads.
   at::Tensor tables_, other_nodes_;
   PeerWords header_gather_;
 };

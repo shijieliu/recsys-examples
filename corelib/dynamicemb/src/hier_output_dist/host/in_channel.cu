@@ -54,7 +54,7 @@ InChannel::InChannel(const Config &config, const Layout &layout, const ChannelSt
                 rounds_cap = sizes_.rounds_cap, record_bytes = sizes_.record_bytes;
   remote_keys_ = node_keys.narrow(0, lookup_keys, remote_keys);
   if (config.weights) remote_weights_ = node_weights.narrow(0, lookup_keys, remote_keys);
-  remote_cells_ = region(kRemoteCells, {remote_keys}, at::kShort);
+  remote_cells_ = region(kRemoteCells, {remote_keys}, at::kInt);
   const int64_t piece_words = (num_nodes - 1) * rounds_cap * 2;  // 16 bytes a round piece
   proxy_windows_ = ProxyWindows{
       region(kRemoteMap, {3, remote_keys}, at::kInt),
@@ -62,7 +62,9 @@ InChannel::InChannel(const Config &config, const Layout &layout, const ChannelSt
       region(kProxyHdr, {4 + 4 * rounds_cap * num_nodes + 4 * local_size * (rounds_cap + 1)},
              at::kInt)};
   rail_keys_ = region(kRailKeys, {lookup_keys * record_bytes / 8 + piece_words}, at::kLong);
-  tables_ = at::tensor(config.feature_tables, at::kInt).to(options);
+  cell_stage_ = region(kCellStage, {num_nodes, sizes_.num_features}, at::kLong);
+  rail_cells_ = region(kRailCells, {num_nodes, sizes_.num_features}, at::kLong);
+  tables_ = at::tensor(dense_tables(config.feature_tables), at::kInt).to(options);
   other_nodes_ = other_nodes_of(sizes_.topo, options);
   header_gather_ = header_gather(sizes_, options);
 }
@@ -95,11 +97,12 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
   plan.meta_ = at::zeros({channel_.meta_at.words}, long_options);
   // The node: every rank's counts (and the node barrier), the layout of the
   // node's keys, and this rank's keys pushed to their targets.
-  const at::Tensor node_counts = launch_node_count_exchange(
+  const auto [totals, before, mine] = launch_node_count_exchange(
       channel_, seq, node_count_vector(plan.cell_start_, topo, num_features));
   step_done(kStepCounts);
-  const NodeLayout node = node_layout(node_counts, plan.cell_start_, plan.block_start_, topo,
-                                      num_features, lookup_keys, remote_keys);
+  const NodeLayout node =
+      node_layout(NodeCounts{totals, before, mine}, plan.cell_start_, plan.block_start_, topo,
+                  num_features, lookup_keys, remote_keys);
   step_done(kStepLayout);
   launch_node_key_push(channel_, plan.keys_, plan.key_weights_, plan.row_cell_,
                        node.destination_base, node.rows_to_push, lookup_keys);
@@ -134,14 +137,17 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
     const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(rounds),
                                              node.requester_start, proxy_windows_, sizes_);
     step_done(kStepPushOrder);
-    // The rail: every rank's count message, the layout of the rail, and the
-    // proxies' key records into the owners' rail_keys.
+    // The rail: the count messages, the layout of the rail, then the
+    // proxies' key records into the owners' rail_keys and the owners' cell
+    // starts into the proxies' rail_cells.
     const at::Tensor message =
-        count_message(node.need_remote, node.own_cells, proxy.num_rounds, proxy.cell_uniq, sizes_);
+        count_message(node.need_remote, proxy.num_rounds, node.own_total.select(0, topo.local_rank),
+                      proxy.uniq_out, proxy.cell_uniq);
     step_done(kStepMessage);
     const at::Tensor messages = launch_rail_count_exchange(channel_, seq, message);
     step_done(kStepRailCounts);
     const RailLayout rail = rail_layout(messages, node.own_cells, other_nodes_, sizes_);
+    cell_stage_.copy_(rail.cell_stage);
     step_done(kStepRailLayout);
     launch_rail_key_exchange(channel_, seq, proxy.stage_slice, rail.put_dst, rail.put_bytes,
                              rail.put_skip);
@@ -168,11 +174,13 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
     const OwnerTables owner = owner_tables(rail, node.own_starts, own_keys_, own_weights_,
                                            rail_keys_, other_nodes_, sizes_);
     step_done(kStepOwner);
-    const PutList list =
-        proxy_put_list(proxy.round_table, proxy.cell_uniq, rail.rail_cell_start, sizes_);
+    const PutLists lists =
+        put_lists(proxy.round_table, proxy.num_rounds, proxy.cell_uniq, rail_cells_,
+                  owner.fwd_pieces, owner.fwd_rounds, rail.cells_in, rail.cell_stage, sizes_);
     step_done(kStepPutList);
-    // What the out kernels read: the requester's maps, the proxy's lists
-    // (the ready counters zeroed by the kernels), the owner's KJT, and Meta.
+    // What the out kernels read: the requester's maps, the proxy's reducer
+    // list, the put lists (the ready counters zeroed by the kernels), the
+    // owner's KJT, and Meta.
     plan.src_ = requester.src;
     plan.dst_ = requester.dst;
     plan.push_order_ = requester.push_order;
@@ -181,8 +189,10 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
     plan.group_of_sub_ = requester.group_of_sub;
     plan.reducer_start_ = proxy.reducer_start;
     plan.reducer_entries_ = proxy.reducer_entries;
-    plan.bwd_put_list_ = list.bwd_put_list;
-    plan.ready_ = at::empty({std::max(chunk_bound(sizes_), local_size)}, long_options);
+    plan.put_list_ = lists.list;
+    plan.ready_ = at::empty(
+        {std::max(chunk_bound(remote_keys, sizes_) + chunk_bound(lookup_keys, sizes_), local_size)},
+        long_options);
     plan.kjt_values_ = owner.kjt_values;
     plan.kjt_weights_ = owner.kjt_weights;
     plan.kjt_lengths_ = rail.kjt_lengths;
@@ -200,18 +210,19 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
     meta_words(meta, field.bwd_task_starts, 2 * rounds_cap + 1).copy_(requester.bwd_task_starts);
     meta_words(meta, field.slice_in, 2 * num_nodes).copy_(rail.slice_in.view({-1}));
     meta_words(meta, field.uniq_in, num_nodes).copy_(rail.uniq_in);
-    meta_int32(meta, field.fwd_put_list, num_nodes * rounds_cap * num_features * 4)
-        .copy_(owner.fwd_put_list.view({-1}));
+    meta_int32(meta, field.fwd_put_start, num_nodes * (rounds_cap + 1))
+        .copy_(lists.fwd_start.view({-1}));
     meta_int32(meta, field.uniq_off, num_nodes + 1).copy_(proxy.uniq_off);
     meta_words(meta, field.uniq_out, num_nodes).copy_(proxy.uniq_out);
     meta_int32(meta, field.round_table, rounds_cap * num_nodes * 4)
-        .copy_(list.round_table.view({-1}));
-    meta_int32(meta, field.bwd_put_start, rounds_cap * num_nodes + 1).copy_(list.bwd_put_start);
+        .copy_(lists.round_table.view({-1}));
+    meta_int32(meta, field.bwd_put_start, num_nodes * (rounds_cap + 1))
+        .copy_(lists.bwd_start.view({-1}));
     meta_int32(meta, field.push_start, local_size * (rounds_cap + 1))
         .copy_(proxy.push_start.view({-1}));
-    meta_words(meta, field.reduce_task_starts, rounds_cap + 1).copy_(list.reduce_task_starts);
+    meta_words(meta, field.reduce_task_starts, rounds_cap + 1).copy_(lists.reduce_task_starts);
     meta_words(meta, field.misc, kNumMisc)
-        .copy_(at::stack({proxy.num_rounds, list.num_chunks, proxy.occurrence_count}));
+        .copy_(at::stack({proxy.num_rounds, lists.num_chunks, proxy.occurrence_count}));
     num_recv = rail.num_recv;
     length_per_key = rail.length_per_key;
     group_subs = requester.group_subs;

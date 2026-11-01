@@ -16,10 +16,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The rail's part of a call across nodes (the in channel's side stream). A
 // rank's rail is the ranks with its local rank, one on each node. Each rank
-// sends its rail a count message; from the messages every rank of the rail
-// computes the same layout: as proxy where its key records land at each
-// owner, as owner its KJT. Then the needs and cell starts a rank publishes to
-// its node, and the owner's tables: its forward put list and its KJT's keys.
+// sends each rail peer a count message; from the messages it gets, a rank
+// computes as proxy where its key records land at each owner, and as owner
+// its KJT and where each proxy's cells start in it, which it sends back to
+// that proxy. Then the needs and cell starts a rank publishes to its node,
+// and the owner's tables: its KJT's keys and what its forward put list sends.
 // ATen ops; nothing waits for the device.
 //
 // An owner's KJT has num_sources = local_size + num_nodes - 1 cells per
@@ -41,27 +42,27 @@ namespace hier_output_dist {
 // the op.
 at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options);
 
-// The count message this rank sends its rail (int64 [2 + (num_nodes + 1) *
-// num_features]): its node's largest remote part (need_remote), its rounds
-// and its node-unique keys per (owner node, feature) as proxy (num_rounds,
-// cell_uniq), and per feature the keys its node sends it as owner (from the
-// node layout's own_cells).
-at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_cells,
-                         const at::Tensor &num_rounds, const at::Tensor &cell_uniq,
-                         const PlanSizes &sizes);
+// The count messages this rank sends its rail (int64 [msg_out_words],
+// common/ctrl.h): the common part, its node's largest remote part
+// (need_remote), its rounds as proxy (num_rounds), the keys of its own node
+// it looks up as owner (own_total, its own part) and its node-unique keys per
+// owner node (uniq_out); then for each node its node-unique keys of each
+// feature there (cell_uniq, [owner node][feature]).
+at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &num_rounds,
+                         const at::Tensor &own_total, const at::Tensor &uniq_out,
+                         const at::Tensor &cell_uniq);
 
-// The rail's layout, from the rail's messages (int64 [num_nodes][message]),
-// the same on every rank of the rail. Each slice a proxy puts holds its round
-// pieces (16 bytes each), then its records (record_bytes each).
+// The rail's layout, from the messages this rank got (int64 [num_nodes]
+// [msg_len], its own too) and its own part's cells (the node layout's
+// own_cells). Each slice a proxy puts holds its round pieces (16 bytes each),
+// then its records (record_bytes each).
 struct RailLayout {
   // as proxy, to each owner of the rail (its slice in key_stage is the proxy's stage_slice)
-  at::Tensor put_dst;          // int64 [num_nodes]: where its slice lands in the owner's
-                               // rail_keys (bytes)
-  at::Tensor put_bytes;        // int64 [num_nodes]
-  at::Tensor put_skip;         // bool [num_nodes]: no put (the owner overflows lookup_keys,
-                               // or it is on this node)
-  at::Tensor rail_cell_start;  // int64 [num_nodes][num_features]: where its cell (feature,
-                               // this node) starts in each owner's KJT
+  at::Tensor put_dst;    // int64 [num_nodes]: where its slice lands in the owner's rail_keys
+                         // (bytes)
+  at::Tensor put_bytes;  // int64 [num_nodes]
+  at::Tensor put_skip;   // bool [num_nodes]: no put of keys (the owner overflows
+                         // lookup_keys, or it is on this node)
   // as owner
   at::Tensor kjt_lengths;     // int64 [num_features * num_sources]: cell (feature, source)
   at::Tensor kjt_offsets;     // int64 [num_features * num_sources + 1]
@@ -70,7 +71,11 @@ struct RailLayout {
   at::Tensor slice_in;        // int64 [num_nodes][2]: each source node's slice in its
                               // rail_keys: byte offset, rounds
   at::Tensor uniq_in;         // int64 [num_nodes]: the node-unique keys of each source node
-  at::Tensor rail_lengths;    // int64 [num_features][num_nodes - 1]: the other nodes' cells
+  at::Tensor cells_in;        // int64 [num_nodes][num_features]: of each source node, per
+                              // feature (its own node: 0)
+  at::Tensor cell_stage;      // int64 [num_nodes][num_features]: where the cells of each
+                              // source node start in its KJT, what it sends the node's proxy
+                              // (its own node: 0)
   at::Tensor my_cell_starts;  // int64 [local_size][num_features]: where each requester of
                               // its node's cell (feature, requester) starts in its KJT
   at::Tensor needs;           // int64 [3]: the most the rail needs of lookup_keys and
@@ -92,12 +97,14 @@ at::Tensor agreed_needs(const at::Tensor &peer_needs);
 // part of its node_keys (node_keys, node_weights: views of [lookup_keys];
 // node_weights undefined when the keys carry none).
 struct OwnerTables {
-  at::Tensor fwd_put_list;  // int32 [num_nodes][rounds_cap][num_features][4]: PutSeg {src
-                            // row in its KJT, dst row in the proxy's proxy_rows, rows, 0} of
-                            // each source node's round pieces in each cell (rows 0: none)
-  at::Tensor kjt_values;    // int64 [lookup_keys]: the first num_recv are its KJT's keys
-  at::Tensor kjt_weights;   // fp32 [lookup_keys], or undefined (8-byte records): their
-                            // weights, 1 for its own node's keys when they carry none
+  at::Tensor kjt_values;   // int64 [lookup_keys]: the first num_recv are its KJT's keys
+  at::Tensor kjt_weights;  // fp32 [lookup_keys], or undefined (8-byte records): their
+                           // weights, 1 for its own node's keys when they carry none
+  at::Tensor fwd_pieces;   // int64 [rounds_cap][num_nodes][3]: what its forward put list
+                           // sends, each source node's round pieces (lo, hi, the row of lo
+                           // in the proxy's proxy_rows), first in its slice; zeros past its
+                           // rounds
+  at::Tensor fwd_rounds;   // int64 [num_nodes]: each source node's rounds (its own node: 0)
 };
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
                          const at::Tensor &node_keys, const at::Tensor &node_weights,

@@ -98,14 +98,16 @@ std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Te
 }
 
 // One rank of a node: its count vector (node_count_vector), and its node
-// layout (node_layout) on the given node_counts, as node_count_exchange
-// would give them, by name (requester_start and need_remote across nodes).
-// On one node, with the owner's node_keys (and node_weights) after every
-// requester pushed, also its KJT and src (one_node_owner).
+// layout (node_layout) on the node's counts (totals, before, mine) as
+// node_count_exchange would give them, by name (requester_start and
+// need_remote across nodes). On one node, with the owner's node_keys (and
+// node_weights) after every requester pushed, also its KJT and src
+// (one_node_owner).
 std::map<std::string, at::Tensor> node_layout_test(
-    at::Tensor node_counts, at::Tensor cell_start, at::Tensor block_start, at::Tensor row_cell,
-    int64_t num_nodes, int64_t local_size, int64_t node, int64_t local_rank, int64_t num_features,
-    int64_t lookup_keys, int64_t remote_keys, c10::optional<at::Tensor> node_keys,
+    at::Tensor totals, at::Tensor before, at::Tensor mine, at::Tensor cell_start,
+    at::Tensor block_start, at::Tensor row_cell, int64_t num_nodes, int64_t local_size,
+    int64_t node, int64_t local_rank, int64_t num_features, int64_t lookup_keys,
+    int64_t remote_keys, c10::optional<at::Tensor> node_keys,
     c10::optional<at::Tensor> node_weights) {
   c10::cuda::CUDAGuard guard(cell_start.device());
   const int world_size = (int)(num_nodes * local_size);
@@ -116,8 +118,13 @@ std::map<std::string, at::Tensor> node_layout_test(
                   (int)(node * local_size + local_rank),
                   (int)local_rank,
                   (int)node};
-  const NodeLayout layout = node_layout(node_counts, cell_start, block_start, topo, num_features,
-                                        lookup_keys, remote_keys);
+  const int64_t words = local_size * (num_features + 1);
+  TORCH_CHECK(is_cuda_array(totals, at::kLong, words) && is_cuda_array(before, at::kLong, words) &&
+                  is_cuda_array(mine, at::kLong, words),
+              "hier_output_dist: node_layout's counts");
+  const NodeLayout layout =
+      node_layout(NodeCounts{totals, before, mine.view({local_size, num_features + 1})}, cell_start,
+                  block_start, topo, num_features, lookup_keys, remote_keys);
   std::map<std::string, at::Tensor> named{
       {"count_vector", node_count_vector(cell_start, topo, num_features)},
       {"own_cells", layout.own_cells},
@@ -155,8 +162,9 @@ std::map<std::string, int64_t> op_meta_offsets(const HierOutputDist &op) {
 }
 
 // The sizes of a call across nodes (PlanSizes) by name: num_nodes,
-// local_size, node, local_rank, num_features, lookup_keys, remote_keys,
-// num_proxy_rows, partial_rows, chunk_rows, record_bytes; rounds_cap follows.
+// local_size, node, local_rank, num_features, num_tables, lookup_keys,
+// remote_keys, num_proxy_rows, partial_rows, chunk_rows, record_bytes;
+// rounds_cap follows.
 PlanSizes plan_sizes(const std::map<std::string, int64_t> &named) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
             node = (int)named.at("node"), local_rank = (int)named.at("local_rank");
@@ -165,6 +173,7 @@ PlanSizes plan_sizes(const std::map<std::string, int64_t> &named) {
       Topo{num_nodes * local_size,         local_size, num_nodes, local_size + num_nodes - 1,
            node * local_size + local_rank, local_rank, node};
   sizes.num_features = named.at("num_features");
+  sizes.num_tables = named.at("num_tables");
   sizes.lookup_keys = named.at("lookup_keys");
   sizes.remote_keys = named.at("remote_keys");
   sizes.num_proxy_rows = named.at("num_proxy_rows");
@@ -173,13 +182,14 @@ PlanSizes plan_sizes(const std::map<std::string, int64_t> &named) {
   sizes.chunk_rows = named.at("chunk_rows");
   sizes.record_bytes = named.at("record_bytes");
   TORCH_CHECK(
-      num_nodes >= 2 && num_nodes <= kMaxNodes && local_size >= 1 && local_size <= kMaxLocalRanks &&
-          node >= 0 && node < num_nodes && local_rank >= 0 && local_rank < local_size &&
-          sizes.num_features >= 1 && sizes.num_features <= kMaxFeatures && sizes.lookup_keys >= 1 &&
+      num_nodes >= 2 && local_size >= 1 && node >= 0 && node < num_nodes && local_rank >= 0 &&
+          local_rank < local_size && sizes.num_features >= 1 &&
+          num_nodes * local_size * sizes.num_features < INT32_MAX && sizes.num_tables >= 1 &&
+          sizes.num_tables <= sizes.num_features && sizes.lookup_keys >= 1 &&
           sizes.lookup_keys < INT32_MAX && sizes.remote_keys >= 1 &&
           sizes.remote_keys < INT32_MAX && sizes.num_proxy_rows >= min_proxy_rows_for(num_nodes) &&
           sizes.partial_rows >= 1 && sizes.chunk_rows % kTaskRows == 0 && sizes.chunk_rows > 0 &&
-          (sizes.record_bytes == 8 || sizes.record_bytes == 16),
+          (sizes.record_bytes == 8 || sizes.record_bytes == 16) && push_key_of(sizes).bits <= 63,
       "hier_output_dist: the sizes of a call across nodes");
   return sizes;
 }
@@ -188,14 +198,14 @@ PlanSizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // proxy_rounds_and_slots, proxy_push_order) on its remote part (keys,
 // weights, cells: what node_keys, node_weights and remote_cells hold past
 // lookup_keys) and what the node layout says of it (requester_start, skip,
-// need_remote, own_cells), and its count message (count_message), by name.
-// It writes remote_map, key_stage and proxy_hdr as the steps write its
-// windows. Also the node-unique key of each occurrence (key_of_occurrence),
-// for the test's reference.
+// need_remote, own_total: its own part), and its count messages
+// (count_message), by name. It writes remote_map, key_stage and proxy_hdr as
+// the steps write its windows. Also the node-unique key of each occurrence
+// (key_of_occurrence), for the test's reference.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor keys, c10::optional<at::Tensor> weights, at::Tensor cells,
     at::Tensor requester_start, at::Tensor skip, at::Tensor tables, at::Tensor need_remote,
-    at::Tensor own_cells, at::Tensor remote_map, at::Tensor key_stage, at::Tensor proxy_hdr,
+    at::Tensor own_total, at::Tensor remote_map, at::Tensor key_stage, at::Tensor proxy_hdr,
     bool node_dedup, std::map<std::string, int64_t> named_sizes) {
   c10::cuda::CUDAGuard guard(keys.device());
   const PlanSizes sizes = plan_sizes(named_sizes);
@@ -205,11 +215,10 @@ std::map<std::string, at::Tensor> proxy_plan_test(
   TORCH_CHECK(
       is_cuda_array(keys, at::kLong, entries) &&
           (!weights.has_value() || is_cuda_array(*weights, at::kFloat, entries)) &&
-          is_cuda_array(cells, at::kShort, entries) &&
+          is_cuda_array(cells, at::kInt, entries) &&
           is_cuda_array(requester_start, at::kLong, local_size + 1) &&
           is_cuda_array(skip, at::kBool, 1) && is_cuda_array(tables, at::kInt, num_features) &&
-          is_cuda_array(need_remote, at::kLong, 1) &&
-          is_cuda_array(own_cells, at::kLong, local_size * num_features * local_size) &&
+          is_cuda_array(need_remote, at::kLong, 1) && is_cuda_array(own_total, at::kLong, 1) &&
           is_cuda_array(remote_map, at::kInt, 3 * entries) &&
           is_cuda_array(key_stage, at::kLong,
                         (num_nodes - 1) * rounds_cap * 2 + entries * sizes.record_bytes / 8 + 2) &&
@@ -239,22 +248,24 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"push_start", plan.push_start},
           {"reducer_start", plan.reducer_start},
           {"reducer_entries", plan.reducer_entries},
-          {"message", count_message(need_remote.reshape({}),
-                                    own_cells.view({local_size, num_features * local_size}),
-                                    plan.num_rounds, plan.cell_uniq, sizes)},
+          {"message", count_message(need_remote.reshape({}), plan.num_rounds, own_total.reshape({}),
+                                    plan.uniq_out, plan.cell_uniq)},
           {"key_of_occurrence", key_of_occurrence}};
 }
 
-// One rank's rail steps of a call on its rail's count messages (int64
-// [num_nodes][message], as rail_count_exchange gives them), by name: the
-// rail layout (rail_layout), what the rank publishes to its node
-// (status_publish), and as proxy its backward put list (proxy_put_list, on
-// its round_table and cell_uniq). Given its rail_keys (int64) and the own part
-// of its node_keys (and node_weights) once the rail's proxies and its node's
-// requesters put their keys, also its owner tables (owner_tables).
+// One rank's rail steps of a call on the count messages it got (int64
+// [num_nodes][msg_len], as rail_count_exchange gives them), by name: the
+// rail layout (rail_layout) and what the rank publishes to its node
+// (status_publish). Given its rail_keys (int64) and the own part of its
+// node_keys (and node_weights) once the rail's proxies and its node's
+// requesters put their keys, and where its cells start at its rail's owners
+// (rail_cells, int64 [num_nodes][num_features], as the owners put their
+// cell_stage rows), also its owner tables (owner_tables) and the put lists
+// (put_lists, on its round_table, num_rounds and cell_uniq as proxy).
 std::map<std::string, at::Tensor> rail_tables_test(
     at::Tensor messages, at::Tensor own_cells, at::Tensor own_starts, at::Tensor round_table,
-    at::Tensor cell_uniq, c10::optional<at::Tensor> rail_keys, c10::optional<at::Tensor> node_keys,
+    at::Tensor num_rounds, at::Tensor cell_uniq, c10::optional<at::Tensor> rail_cells,
+    c10::optional<at::Tensor> rail_keys, c10::optional<at::Tensor> node_keys,
     c10::optional<at::Tensor> node_weights, std::map<std::string, int64_t> named_sizes) {
   c10::cuda::CUDAGuard guard(messages.device());
   const PlanSizes sizes = plan_sizes(named_sizes);
@@ -263,11 +274,14 @@ std::map<std::string, at::Tensor> rail_tables_test(
                 lookup_keys = sizes.lookup_keys;
   const int64_t own_columns = num_features * local_size;
   TORCH_CHECK(
-      is_cuda_array(messages, at::kLong, num_nodes * (2 + (num_nodes + 1) * num_features)) &&
-          is_cuda_array(own_cells, at::kLong, local_size * own_columns) &&
-          is_cuda_array(own_starts, at::kLong, local_size * own_columns) &&
+      is_cuda_array(messages, at::kLong, num_nodes * msg_len(num_nodes, num_features)) &&
+          is_cuda_array(own_cells, at::kLong, own_columns) &&
+          is_cuda_array(own_starts, at::kLong, own_columns) &&
           is_cuda_array(round_table, at::kInt, rounds_cap * num_nodes * 4) &&
+          is_cuda_array(num_rounds, at::kLong, 1) &&
           is_cuda_array(cell_uniq, at::kLong, num_nodes * num_features) &&
+          (!rail_cells.has_value() ||
+           is_cuda_array(*rail_cells, at::kLong, num_nodes * num_features)) &&
           (!rail_keys.has_value() ||
            (is_cuda_array(
                 *rail_keys, at::kLong,
@@ -277,35 +291,38 @@ std::map<std::string, at::Tensor> rail_tables_test(
       "hier_output_dist: rail_tables' inputs");
   const at::Tensor other_nodes = other_nodes_of(sizes.topo, messages.options());
   const RailLayout rail =
-      rail_layout(messages.view({num_nodes, -1}), own_cells.view({local_size, own_columns}),
-                  other_nodes, sizes);
-  const PutList list = proxy_put_list(round_table.view({rounds_cap, num_nodes, 4}), cell_uniq,
-                                      rail.rail_cell_start, sizes);
+      rail_layout(messages.view({num_nodes, -1}), own_cells, other_nodes, sizes);
   std::map<std::string, at::Tensor> named{{"put_dst", rail.put_dst},
                                           {"put_bytes", rail.put_bytes},
                                           {"put_skip", rail.put_skip},
-                                          {"rail_cell_start", rail.rail_cell_start},
                                           {"kjt_lengths", rail.kjt_lengths},
                                           {"kjt_offsets", rail.kjt_offsets},
                                           {"num_recv", rail.num_recv},
                                           {"length_per_key", rail.length_per_key},
                                           {"slice_in", rail.slice_in},
                                           {"uniq_in", rail.uniq_in},
+                                          {"cells_in", rail.cells_in},
+                                          {"cell_stage", rail.cell_stage},
                                           {"my_cell_starts", rail.my_cell_starts},
                                           {"needs", rail.needs},
-                                          {"publish", status_publish(rail)},
-                                          {"bwd_put_list", list.bwd_put_list},
-                                          {"bwd_put_start", list.bwd_put_start},
-                                          {"round_table", list.round_table},
-                                          {"reduce_task_starts", list.reduce_task_starts},
-                                          {"num_chunks", list.num_chunks}};
+                                          {"publish", status_publish(rail)}};
   if (rail_keys.has_value()) {
-    const OwnerTables owner = owner_tables(
-        rail, own_starts.view({local_size, own_columns}), *node_keys,
-        node_weights.has_value() ? *node_weights : at::Tensor(), *rail_keys, other_nodes, sizes);
-    named["fwd_put_list"] = owner.fwd_put_list;
+    TORCH_CHECK(rail_cells.has_value(), "hier_output_dist: rail_tables' put lists need rail_cells");
+    const OwnerTables owner = owner_tables(rail, own_starts, *node_keys,
+                                           node_weights.has_value() ? *node_weights : at::Tensor(),
+                                           *rail_keys, other_nodes, sizes);
+    const PutLists lists =
+        put_lists(round_table.view({rounds_cap, num_nodes, 4}), num_rounds.reshape({}), cell_uniq,
+                  rail_cells->view({num_nodes, num_features}), owner.fwd_pieces, owner.fwd_rounds,
+                  rail.cells_in, rail.cell_stage, sizes);
     named["kjt_values"] = owner.kjt_values;
     if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
+    named["put_list"] = lists.list;
+    named["bwd_put_start"] = lists.bwd_start;
+    named["fwd_put_start"] = lists.fwd_start;
+    named["round_table"] = lists.round_table;
+    named["reduce_task_starts"] = lists.reduce_task_starts;
+    named["num_chunks"] = lists.num_chunks;
   }
   return named;
 }
@@ -396,26 +413,27 @@ void bind_testing(py::module &py_module) {
   py_module.def("hier_output_dist_fanout", &fanout_test, "Index dedup's fan-out of part 1, by name",
                 py::arg("reverse_indices"), py::arg("inv"));
   py_module.def("hier_output_dist_node_layout", &node_layout_test,
-                "One rank's count vector and node layout on given node counts, and on one node "
+                "One rank's count vector and node layout on its node's counts, and on one node "
                 "with its node_keys its KJT and src, by name",
-                py::arg("node_counts"), py::arg("cell_start"), py::arg("block_start"),
-                py::arg("row_cell"), py::arg("num_nodes"), py::arg("local_size"), py::arg("node"),
-                py::arg("local_rank"), py::arg("num_features"), py::arg("lookup_keys"),
-                py::arg("remote_keys"), py::arg("node_keys") = py::none(),
-                py::arg("node_weights") = py::none());
+                py::arg("totals"), py::arg("before"), py::arg("mine"), py::arg("cell_start"),
+                py::arg("block_start"), py::arg("row_cell"), py::arg("num_nodes"),
+                py::arg("local_size"), py::arg("node"), py::arg("local_rank"),
+                py::arg("num_features"), py::arg("lookup_keys"), py::arg("remote_keys"),
+                py::arg("node_keys") = py::none(), py::arg("node_weights") = py::none());
   py_module.def("hier_output_dist_proxy_plan", &proxy_plan_test,
                 "One proxy's steps of a call across nodes on plain tensors, which it writes as "
-                "its windows, and its count message, by name",
+                "its windows, and its count messages, by name",
                 py::arg("keys"), py::arg("weights"), py::arg("cells"), py::arg("requester_start"),
-                py::arg("skip"), py::arg("tables"), py::arg("need_remote"), py::arg("own_cells"),
+                py::arg("skip"), py::arg("tables"), py::arg("need_remote"), py::arg("own_total"),
                 py::arg("remote_map"), py::arg("key_stage"), py::arg("proxy_hdr"),
                 py::arg("node_dedup"), py::arg("sizes"));
   py_module.def("hier_output_dist_rail_tables", &rail_tables_test,
-                "One rank's rail layout, status publish vector and backward put list on its "
-                "rail's count messages, and given its rail_keys and node_keys its owner tables, "
+                "One rank's rail layout and status publish vector on the count messages it got, "
+                "and given its rail_keys, node_keys and rail_cells its owner tables and put lists, "
                 "by name",
                 py::arg("messages"), py::arg("own_cells"), py::arg("own_starts"),
-                py::arg("round_table"), py::arg("cell_uniq"), py::arg("rail_keys") = py::none(),
+                py::arg("round_table"), py::arg("num_rounds"), py::arg("cell_uniq"),
+                py::arg("rail_cells") = py::none(), py::arg("rail_keys") = py::none(),
                 py::arg("node_keys") = py::none(), py::arg("node_weights") = py::none(),
                 py::arg("sizes"));
   py_module.def("hier_output_dist_requester_tables", &requester_tables_test,

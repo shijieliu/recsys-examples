@@ -67,24 +67,27 @@ namespace hier_output_dist {
 // in its ctrl) and, across nodes, its rail peers that it sends nothing more
 // (a closing signal on the credits' context, behind every credit it sent
 // them on the same QPs), both before waiting for anyone; then wait (at most
-// limit_ns) until every node peer and every rail peer said the same. Records
-// in `closed` whether they all did. Its waits are loops of their own: after
-// limit_ns they give up and record it, where Spin would trap.
+// limit_ns) until every node peer and every rail peer said the same, each
+// lane taking peers in turn. Records in `closed` whether they all did. Its
+// waits are loops of their own: after limit_ns they give up and record it,
+// where Spin would trap.
 __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
   const Topo &topo = channel.topo;
-  const int peer = threadIdx.x, num_nodes = topo.num_nodes;
-  const bool rail = num_nodes > 1 && peer < num_nodes && peer != topo.node;
+  const int lane = threadIdx.x, num_nodes = topo.num_nodes;
   const CtrlWords mine(channel.win, channel.ctrl_at, topo.local_rank);
-  if (peer == 0) st_release_sys(mine.closing(), 1);
-  if (rail)
-    ncclGin(channel.dev, kCtxCredit)
-        .signal(ncclTeamRail(channel.dev), peer,
-                ncclGin_StrongSignalAdd{(ncclGinSignal_t)sig_closing(num_nodes, topo.node), 1},
-                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
-                cuda::thread_scope_system);
+  if (lane == 0) st_release_sys(mine.closing(), 1);
+  if (num_nodes > 1) {
+    ncclGin cred(channel.dev, kCtxCredit);
+    for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
+      if (peer_node != topo.node)
+        cred.signal(ncclTeamRail(channel.dev), peer_node,
+                    ncclGin_StrongSignalAdd{(ncclGinSignal_t)sig_closing(num_nodes, topo.node), 1},
+                    ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+                    cuda::thread_scope_system);
+  }
   bool seen = true;
   const uint64_t start_ns = now_ns();
-  if (peer < topo.local_size) {
+  for (int peer = lane; peer < topo.local_size && seen; peer += 32) {
     const CtrlWords peer_words(channel.win, channel.ctrl_at, peer);
     while (ld_acquire_sys(peer_words.closing()) == 0) {
       if (now_ns() - start_ns > limit_ns) {
@@ -96,15 +99,19 @@ __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
   }
   if (num_nodes > 1) {
     ncclGin cred(channel.dev, kCtxCredit);
-    while (rail && seen && cred.readSignal(sig_closing(num_nodes, peer)) == 0) {
-      if (now_ns() - start_ns > limit_ns) seen = false;
-      __nanosleep(1000);
-    }
+    for (int peer_node = lane; peer_node < num_nodes && seen; peer_node += 32)
+      while (peer_node != topo.node && cred.readSignal(sig_closing(num_nodes, peer_node)) == 0) {
+        if (now_ns() - start_ns > limit_ns) {
+          seen = false;
+          break;
+        }
+        __nanosleep(1000);
+      }
     __syncwarp();
     cred.flush(ncclCoopWarp{});
   }
   const bool all = __all_sync(kFull, seen);
-  if (peer == 0) *mine.closed() = all ? 1 : 0;
+  if (lane == 0) *mine.closed() = all ? 1 : 0;
 }
 
 cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns) {
@@ -148,14 +155,16 @@ int grid_of(int64_t work) {
 
 }  // namespace
 
-at::Tensor launch_node_count_exchange(const ChannelStatic &channel, int64_t seq,
-                                      const at::Tensor &my_counts) {
-  at::Tensor node_counts =
-      at::empty({channel.topo.local_size, my_counts.numel()}, my_counts.options());
+std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
+    const ChannelStatic &channel, int64_t seq, const at::Tensor &my_counts) {
+  at::Tensor totals = at::empty_like(my_counts), before = at::empty_like(my_counts);
+  at::Tensor mine =
+      at::empty({channel.topo.local_size, channel.num_features + 1}, my_counts.options());
   node_count_exchange_kernel<<<1, kThreads, 0, current_stream()>>>(
-      comm_args(channel, seq), my_counts.data_ptr<int64_t>(), node_counts.data_ptr<int64_t>());
+      comm_args(channel, seq), my_counts.data_ptr<int64_t>(), totals.data_ptr<int64_t>(),
+      before.data_ptr<int64_t>(), mine.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return node_counts;
+  return {totals, before, mine};
 }
 
 void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
@@ -176,7 +185,9 @@ void launch_node_done(const ChannelStatic &channel, int64_t seq) {
 
 at::Tensor launch_rail_count_exchange(const ChannelStatic &channel, int64_t seq,
                                       const at::Tensor &message) {
-  at::Tensor messages = at::empty({channel.topo.num_nodes, message.numel()}, message.options());
+  const int num_nodes = channel.topo.num_nodes;
+  at::Tensor messages =
+      at::empty({num_nodes, msg_len(num_nodes, channel.num_features)}, message.options());
   rail_count_exchange_kernel<<<1, 256, 0, current_stream()>>>(
       comm_args(channel, seq), message.data_ptr<int64_t>(), messages.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -65,7 +65,7 @@ bool Plan::wait() {
     // The caller moves the call another way: nothing of it stays.
     inv_ = block_start_ = input_length_per_key_ = meta_ = src_ = dst_ = at::Tensor();
     push_order_ = heavy_groups_ = group_first_sub_ = group_of_sub_ = at::Tensor();
-    reducer_start_ = reducer_entries_ = bwd_put_list_ = ready_ = at::Tensor();
+    reducer_start_ = reducer_entries_ = put_list_ = ready_ = at::Tensor();
     kjt_values_ = kjt_weights_ = kjt_lengths_ = kjt_offsets_ = at::Tensor();
     fanout_ = FanoutTables{};
     return false;
@@ -142,7 +142,7 @@ std::map<std::string, at::Tensor> Plan::tensors() const {
                                              {"group_of_sub", group_of_sub_},
                                              {"reducer_start", reducer_start_},
                                              {"reducer_entries", reducer_entries_},
-                                             {"bwd_put_list", bwd_put_list_},
+                                             {"put_list", put_list_},
                                              {"ready", ready_},
                                              {"kjt_values", kjt_values_},
                                              {"kjt_weights", kjt_weights_},
@@ -163,7 +163,7 @@ void Plan::record_stream(c10::Stream stream) const {
   // start's
   for (const at::Tensor *tensor :
        {&status_, &meta_, &src_, &dst_, &push_order_, &heavy_groups_, &group_first_sub_,
-        &group_of_sub_, &reducer_start_, &reducer_entries_, &bwd_put_list_, &ready_, &kjt_values_,
+        &group_of_sub_, &reducer_start_, &reducer_entries_, &put_list_, &ready_, &kjt_values_,
         &kjt_weights_, &kjt_lengths_, &kjt_offsets_})
     if (tensor->defined()) tensor->record_stream(stream);
 }
@@ -172,7 +172,7 @@ std::vector<at::Tensor *> Plan::backward_members() {
   std::vector<at::Tensor *> members = {&block_start_, &dst_, &inv_, &meta_};
   if (multi_node_)
     members.insert(members.end(), {&push_order_, &heavy_groups_, &group_first_sub_, &group_of_sub_,
-                                   &reducer_start_, &reducer_entries_, &bwd_put_list_, &ready_});
+                                   &reducer_start_, &reducer_entries_, &put_list_, &ready_});
   if (index_dedup_)
     members.insert(members.end(), {&fanout_.exp_off, &fanout_.exp_idx, &fanout_.slot, &fanout_.sub,
                                    &fanout_.count, &fanout_.pos, &fanout_.first});
@@ -206,7 +206,7 @@ OutPlan Plan::out_plan(bool backward) const {
     plan.group_of_sub = group_of_sub_.data_ptr<int32_t>();
     plan.reducer_start = reducer_start_.data_ptr<int32_t>();
     plan.reducer_entries = reducer_entries_.data_ptr<int64_t>();
-    plan.bwd_put_list = (const PutSeg *)bwd_put_list_.data_ptr<int32_t>();
+    plan.put_list = (const PutSeg *)put_list_.data_ptr<int32_t>();
     plan.ready = ready_.data_ptr<int64_t>();
   }
   plan.fanout = fanout_of(fanout_);

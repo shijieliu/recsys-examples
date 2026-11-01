@@ -36,9 +36,9 @@ class Trace {
  public:
   explicit Trace(int device);
   // The next out kernel's row of its direction's ring, started over on
-  // `stream` (two memsets, no kernel), into `call`; returns the dynamic
-  // shared memory its CTAs keep a copy of the row in (0 without kTrace).
-  size_t start_out(bool forward, OutCall &call, cudaStream_t stream);
+  // `stream` (two memsets, no kernel), into `call`; returns whether the
+  // kernel keeps a timeline (false without kTrace).
+  bool start_out(bool forward, OutCall &call, cudaStream_t stream);
   // That kernel was launched.
   void launched(bool forward);
   // [2, kTraceRing, kTraceWords]: forward, then backward, each kernel in

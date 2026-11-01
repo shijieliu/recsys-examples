@@ -89,6 +89,9 @@ struct TaggedWord {
   __device__ __forceinline__ static uint64_t of(int64_t seq, uint64_t payload) {
     return ((uint64_t)seq << PayloadBits) | payload;
   }
+  __device__ __forceinline__ static int64_t tag(uint64_t word) {
+    return (int64_t)(word >> PayloadBits);
+  }
   __device__ __forceinline__ static uint64_t payload(uint64_t word) {
     return word & ((1ull << PayloadBits) - 1);
   }

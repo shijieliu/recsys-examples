@@ -19,8 +19,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // channel's steps.
 #pragma once
 
-#include "hier_output_dist/common/constants.h"
-
 namespace dyn_emb {
 namespace hier_output_dist {
 
@@ -78,8 +76,8 @@ constexpr int kTraceWords = kTraceBinIbOut + kTraceBins;
 constexpr int kTraceRing = 64;  // rows of each direction's ring
 // A CTA's shared copy (dynamic shared memory, only when tracing): its start,
 // then the slots it keeps (first and last NVLink task, first landing, the
-// counters), the rows of each node the backward's watcher saw land (not
-// folded into the row) and the three timelines.
+// counters), the rows each lane of the backward's watcher saw land from its
+// nodes (not folded into the row) and the three timelines.
 enum TraceSmSlots : int {
   kSmStart = 0,
   kSmNvFirst,
@@ -89,8 +87,8 @@ enum TraceSmSlots : int {
   kSmLocalBytes,
   kSmIbIn,
   kSmIbOut,
-  kSmLanded,                        // [kMaxNodes]
-  kSmBins = kSmLanded + kMaxNodes,  // [3][kTraceBins], as in the row
+  kSmLanded,                 // [32], a word per lane
+  kSmBins = kSmLanded + 32,  // [3][kTraceBins], as in the row
   kTraceSmWords = kSmBins + 3 * kTraceBins
 };
 
@@ -116,7 +114,7 @@ enum InTraceSteps : int {
   kStepGathers,         // the two peer_gathers: the proxy headers, the remote_map words
   kStepRequester,       // the requester tables
   kStepOwner,           // the owner tables
-  kStepPutList,         // the proxy's backward put list
+  kStepPutList,         // the put lists: the owner's forward and the proxy's backward
   kStepStatus,          // Meta, the status and its pinned copy
   kInSteps
 };

@@ -26,6 +26,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/channel_args.h"
 #include "hier_output_dist/common/ctrl.h"
 #include "hier_output_dist/common/formats.h"
+#include "hier_output_dist/common/trace_slots.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -39,8 +40,8 @@ namespace hier_output_dist {
 // slot). inv[row] is its row of the requester's output, or under index dedup
 // its deduplicated row, whose original rows the fan-out lists. The tables of
 // the call's Meta (meta) and, across nodes, the requester's push order
-// (push_order), heavy groups and their sub-tasks, and the proxy's reducer and
-// put lists say the rest.
+// (push_order), heavy groups and their sub-tasks, the proxy's reducer list
+// and the put lists say the rest.
 struct OutPlan {
   const int64_t *block_start;  // [world_size + 1]
   const int32_t *rows;         // [sent] forward: src; backward: dst
@@ -54,11 +55,12 @@ struct OutPlan {
   const int32_t *group_of_sub;     // backward: the heavy group of each sub-task
   const int32_t *reducer_start;    // backward, proxy: the reducer list (plan/proxy.h)
   const int64_t *reducer_entries;
-  const PutSeg *bwd_put_list;  // backward, proxy: the put list (plan/put_list.h)
-  int64_t *ready;              // backward, proxy: [chunks] keys of each IB chunk
-                               // reduced; forward, requester: [local_size] rows it
-                               // pulled from each proxy (index dedup's heavy rows
-                               // wait for them); zeroed when the kernel starts
+  const PutSeg *put_list;  // the owner's forward and the proxy's backward put lists
+                           // (plan/put_list.h)
+  int64_t *ready;          // backward, proxy: [chunks] keys of each IB chunk
+                           // reduced; forward, requester: [local_size] rows it
+                           // pulled from each proxy (index dedup's heavy rows
+                           // wait for them); zeroed when the kernel starts
   // rows
   char *out;             // forward: [num_out, row] the requester's output
   const char *grad;      // backward: [num_out, row] its gradient
@@ -92,6 +94,18 @@ struct OutCall {
 // The out kernels' parameter, by value: OutChannel builds it per kernel from
 // its OutStatic and the kernel's OutCall.
 struct OutArgs : OutStatic, OutCall {};
+
+// The out kernels' dynamic shared memory: the backward's half_seen
+// [local_size] (OutTables), then, when the kernel keeps a timeline, the
+// CTA's copy of it (TraceSmSlots, OutTimeline).
+__device__ __forceinline__ unsigned long long *out_shared() {
+  extern __shared__ unsigned long long out_dyn_sm[];
+  return out_dyn_sm;
+}
+// Its bytes, what each out kernel is launched with.
+inline size_t out_shared_bytes(int local_size, bool timeline) {
+  return 8 * ((size_t)local_size + (timeline ? kTraceSmWords : 0));
+}
 static_assert(std::is_trivially_copyable<OutArgs>::value, "a kernel parameter is copied as bytes");
 static_assert(sizeof(OutArgs) <= 4096, "the out kernels' parameter fits the parameter space");
 

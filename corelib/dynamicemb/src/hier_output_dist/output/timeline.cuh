@@ -29,8 +29,8 @@ namespace hier_output_dist {
 
 // The timeline of an out kernel: its row (args.trace, nullptr without
 // kTrace) and the CTA's shared copy (TraceSmSlots, in the kernel's dynamic
-// shared memory). Stamps check on() themselves; the rest is for when it is
-// on. Each member does its work only with kTrace.
+// shared memory after half_seen, out_shared). Stamps check on() themselves;
+// the rest is for when it is on. Each member does its work only with kTrace.
 struct OutTimeline {
   const OutArgs &args;
   __device__ __forceinline__ explicit OutTimeline(const OutArgs &out_args) : args(out_args) {}
@@ -42,9 +42,8 @@ struct OutTimeline {
   __device__ __forceinline__ void stamp_latest(int slot) const { stamp(slot, false); }
 
   // The CTA's shared copy.
-  __device__ __forceinline__ static unsigned long long *shared() {
-    extern __shared__ unsigned long long trace_dyn_sm[];
-    return trace_dyn_sm;
+  __device__ __forceinline__ unsigned long long *shared() const {
+    return out_shared() + args.topo.local_size;
   }
   // At the top of the kernel, every thread of the CTA (on() is the same for
   // all): the CTA's start, the kernel's first and last CTA start, and the

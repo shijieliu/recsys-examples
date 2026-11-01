@@ -16,8 +16,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The rail: GIN between this rank and the ranks of its local index on the
 // other nodes. The credits rail peers raise each other, puts of rows, and the
-// in channel's messages. A GIN warp's lane n works with the rail peer on node
-// n (at most 32 nodes).
+// in channel's messages. A GIN warp's lane l works with the rail peers on
+// nodes l, l + 32, l + 64, ...
 #pragma once
 
 #include <nccl_device.h>

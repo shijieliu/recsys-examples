@@ -103,17 +103,17 @@ struct ProxyPush {
 // (half_free), once the NIC had read the sums of round rnd - 2 out of it.
 // What one warp of the CTA saw is kept for the others (half_seen), so most
 // tasks read no word of the proxy. Every lane of the warp.
-__device__ __forceinline__ void wait_half_warp(const OutArgs &args, OutTables &tables, int proxy,
-                                               int rnd, int lane) {
+__device__ __forceinline__ void wait_half_warp(const OutArgs &args, const OutTables &tables,
+                                               int proxy, int rnd, int lane) {
   if (rnd < 2) return;
   if (lane == 0) {
     const uint64_t want = grant_of(args.ch.seq, rnd);
-    if (ld_acquire_cta(&tables.half_seen[proxy]) < want) {
+    if (ld_acquire_cta(tables.half_seen(proxy)) < want) {
       Spin spin(args.timeout_ns);
       uint64_t word;
-      while ((word = ld_acquire_sys(tables.half_free[proxy])) < want)
+      while ((word = ld_acquire_sys(tables.half_free(proxy))) < want)
         spin.pause("a half of a proxy's rows", proxy, rnd, args.topo.rank);
-      red_max_release_cta(&tables.half_seen[proxy], word);
+      red_max_release_cta(tables.half_seen(proxy), word);
     }
   }
   __syncwarp();
@@ -126,10 +126,10 @@ __device__ __forceinline__ void push_flag_warp(const OutArgs &args, const OutTab
                                                int proxy, int rnd, int64_t flag, int lane) {
   __syncwarp();
   if (lane == 0)
-    st_release_sys(&tables.push_flags[proxy][(rnd & 1) * half_flags(args.win.num_proxy_rows,
-                                                                    args.topo.local_size) +
-                                             flag],
-                   grant_of(args.ch.seq, rnd));
+    st_release_sys(
+        &tables.push_flags(
+            proxy)[(rnd & 1) * half_flags(args.win.num_proxy_rows, args.topo.local_size) + flag],
+        grant_of(args.ch.seq, rnd));
 }
 
 // Index dedup, a heavy row (more than kHeavy original rows): once its
@@ -164,7 +164,7 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
   const int64_t dedup_row = fanout.sub[2 * sub], begin = fanout.sub[2 * sub + 1],
                 row_end = fanout.exp_off[dedup_row + 1];
   const int32_t slot = fanout.slot[dedup_row], row = fanout.pos[slot];
-  const int owner = tables.owner_of(args, row);
+  const int owner = tables.owner_of(row);
   if ((owner / local_size != args.topo.node) != remote) return;
   const OutTimeline timeline(args);
   const unsigned long long start = timeline.on() ? now_ns() : 0;
@@ -187,7 +187,7 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
   if ((int64_t)__shfl_sync(kFull, before, 0) + 1 < num_subs) return;
   // the last one: every sub-task of the row has ended (acquired above)
   const float *sums = plan.partial + (int64_t)fanout.first[slot] * dim;
-  char *dst = tables.lookup_rows[owner % local_size] + (int64_t)plan.rows[row] * args.row_bytes;
+  char *dst = tables.lookup_rows(owner % local_size) + (int64_t)plan.rows[row] * args.row_bytes;
   for (int col = lane; col < args.vec; col += 32) {
     float acc[kValues];
     sum_fp32<kValues>(sums, num_subs, dim, col, acc);
@@ -352,7 +352,7 @@ __device__ void push_groups_warp(const OutArgs &args, const OutTables &tables, i
     const HeavyGroup span = plan.heavy_groups[group];
     num_subs = ceil_div<kHeavy>(span.end - span.start);
     part = plan.partial + (plan.heavy_subs + plan.group_first_sub[group]) * dim;
-    slot = (float *)(tables.proxy_rows[proxy] +
+    slot = (float *)(tables.proxy_rows(proxy) +
                      (int64_t)plan.rows[plan.push_order[span.start]] * args.row_bytes);
     SubTaskDone{plan.group_done + group}.wait_lane(args, num_subs, "sub-tasks of a heavy group");
   }
@@ -381,9 +381,9 @@ __device__ __forceinline__ bool remote_push(const OutArgs &args, const OutTables
   const int64_t slot = remote_task - (is_group_task ? cursor.lo : cursor.mid);
   const int proxy = (int)((me + slot) % local_size);
   const int64_t nth = slot / local_size;
-  if (rnd >= tables.rounds[proxy]) return false;
+  if (rnd >= tables.rounds(proxy)) return false;
   ReqEntry entry, next;
-  tables.req_of(args, proxy, rnd, entry, next);
+  tables.req_of(proxy, rnd, entry, next);
   const int64_t plain_tasks = ceil_div<kTaskRows>(entry.heavy - entry.start);
   push.is_group_task = is_group_task;
   push.proxy = proxy;
@@ -399,7 +399,7 @@ __device__ __forceinline__ bool remote_push(const OutArgs &args, const OutTables
 // sums into their partial slots, then the task's flag. Every lane of the
 // warp.
 template <typename RowT>
-__device__ __forceinline__ void push_groups_task_warp(const OutArgs &args, OutTables &tables,
+__device__ __forceinline__ void push_groups_task_warp(const OutArgs &args, const OutTables &tables,
                                                       const ProxyPush &push, int lane) {
   const int me = args.topo.local_rank;
   const OutTimeline timeline(args);
@@ -425,7 +425,7 @@ __device__ __forceinline__ void push_groups_task_warp(const OutArgs &args, OutTa
 // order there): their gradients into their rows of proxy_rows, then the
 // task's flag. Every lane of the warp.
 template <typename RowT>
-__device__ __forceinline__ void push_rows_task_warp(const OutArgs &args, OutTables &tables,
+__device__ __forceinline__ void push_rows_task_warp(const OutArgs &args, const OutTables &tables,
                                                     const ProxyPush &push, int lane) {
   const OutPlan &plan = args.plan;
   const int me = args.topo.local_rank, row_bytes = args.row_bytes;
@@ -442,7 +442,7 @@ __device__ __forceinline__ void push_rows_task_warp(const OutArgs &args, OutTabl
   if (lane < num_rows) {
     const int32_t row = plan.push_order[pos0 + lane];
     dedup_row = plan.inv[row];
-    dst = tables.proxy_rows[proxy] + (int64_t)plan.rows[row] * row_bytes;
+    dst = tables.proxy_rows(proxy) + (int64_t)plan.rows[row] * row_bytes;
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   push_rows_warp<RowT>(args, dedup_row, dst, num_rows, false, lane);
@@ -471,7 +471,7 @@ __device__ __forceinline__ void local_push_warp(const OutArgs &args, const OutTa
   if (lane < job.count) {
     const int64_t row = job.row0 + lane;
     dedup_row = plan.inv[row];
-    dst = tables.lookup_rows[job.owner] + (int64_t)plan.rows[row] * row_bytes;
+    dst = tables.lookup_rows(job.owner) + (int64_t)plan.rows[row] * row_bytes;
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   const int wrote = push_rows_warp<RowT>(args, dedup_row, dst, num_rows, true, lane);

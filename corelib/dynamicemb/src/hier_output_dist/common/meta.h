@@ -45,19 +45,19 @@ struct Meta {
                            // rnd's push tasks of heavy groups (2 * rnd), and before those of
                            // its rows (2 * rnd + 1)
   // owner (num_nodes > 1)
-  int slice_in;      // [num_nodes][2] each source node's rail_keys slice: byte offset,
-                     // rounds
-  int uniq_in;       // [num_nodes] node-unique keys from each source node
-  int fwd_put_list;  // [num_nodes][rounds_cap][num_features] PutSeg: its forward put
-                     // list, its rows of lookup_rows to each rail proxy, per round and
-                     // feature (rows 0: none)
+  int slice_in;       // [num_nodes][2] each source node's rail_keys slice: byte offset,
+                      // rounds
+  int uniq_in;        // [num_nodes] node-unique keys from each source node
+  int fwd_put_start;  // [num_nodes][rounds_cap + 1] int32: its forward put list's segments
+                      // of each (proxy node, round); [node][rounds_cap]: the node's end
   // proxy (num_nodes > 1)
   int uniq_off;            // [num_nodes + 1] int32: its first node-unique key of each owner
                            // node, over all (the reducer list's index)
   int uniq_out;            // [num_nodes] its node-unique keys of each owner node
   int round_table;         // [rounds_cap][num_nodes] RoundPiece: its round table
-  int bwd_put_start;       // [rounds_cap * num_nodes + 1] int32: its backward put list's
-                           // segments of each (round, owner node)
+  int bwd_put_start;       // [num_nodes][rounds_cap + 1] int32: its backward put list's
+                           // segments of each (owner node, round); [node][rounds_cap]: the
+                           // node's end
   int push_start;          // [local_size][rounds_cap + 1] int32: where each same-node
                            // requester's rows of each round start in its push order here
                            // (ReqEntry::start; round num_rounds: the end)
@@ -73,8 +73,7 @@ enum MiscSlots : int {
   kMiscRemoteKeys,  // remote occurrences it deduplicates
   kNumMisc
 };
-__host__ __device__ inline Meta meta_layout(int num_nodes, int local_size, int num_features,
-                                            int rounds_cap) {
+__host__ __device__ inline Meta meta_layout(int num_nodes, int local_size, int rounds_cap) {
   auto i32 = [](int64_t count) { return (int)((count + 1) / 2); };
   Meta layout;
   int next = 0;
@@ -91,11 +90,11 @@ __host__ __device__ inline Meta meta_layout(int num_nodes, int local_size, int n
   layout.bwd_task_starts = take(2 * rounds_cap + 1);
   layout.slice_in = take(2 * num_nodes);
   layout.uniq_in = take(num_nodes);
-  layout.fwd_put_list = take(i32((int64_t)num_nodes * rounds_cap * num_features * 4));
+  layout.fwd_put_start = take(i32((int64_t)num_nodes * (rounds_cap + 1)));
   layout.uniq_off = take(i32(num_nodes + 1));
   layout.uniq_out = take(num_nodes);
   layout.round_table = take(i32((int64_t)rounds_cap * num_nodes * 4));
-  layout.bwd_put_start = take(i32((int64_t)rounds_cap * num_nodes + 1));
+  layout.bwd_put_start = take(i32((int64_t)num_nodes * (rounds_cap + 1)));
   layout.push_start = take(i32((int64_t)local_size * (rounds_cap + 1)));
   layout.reduce_task_starts = take(rounds_cap + 1);
   layout.misc = take(kNumMisc);

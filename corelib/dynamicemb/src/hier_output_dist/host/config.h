@@ -69,7 +69,8 @@ struct Config {
 };
 
 // Why the op does not apply to a sharding of these ranks, features and rows
-// (static limits of its kernels), or "" if it does.
+// (ranks that are not whole nodes, int32 cell numbers, rows the kernels
+// cannot move), or "" if it does.
 std::string unsupported(int world_size, int local_size, int num_features, int64_t row_bytes);
 
 }  // namespace hier_output_dist

@@ -36,6 +36,7 @@ namespace hier_output_dist {
 struct PlanSizes {
   Topo topo;
   int64_t num_features;
+  int64_t num_tables;                // the features' tables, numbered densely
   int64_t lookup_keys, remote_keys;  // the capacities (entries)
   int64_t num_proxy_rows;            // rows of proxy_rows
   int64_t rounds_cap;                // the most rounds of a call (rounds_for(remote_keys,

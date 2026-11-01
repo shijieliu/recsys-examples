@@ -14,11 +14,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// The proxy's backward put list (the in channel's side stream, across
-// nodes): the summed gradient rows of its node-unique keys go back to their
-// owners in IB chunks of chunk_rows keys, piece after piece (round-major,
-// then owner node), each chunk as one segment per feature cell it overlaps.
-// ATen ops; nothing waits for the device.
+// The put lists of a call across nodes (the in channel's side stream), made
+// in one step: the rows that cross the rail between an owner's KJT and a
+// proxy's proxy_rows. The proxy's backward list sends the summed gradient
+// rows of its node-unique keys to their owners; the owner's forward list
+// sends its rows to the proxies that asked for them. Each cuts a node's keys
+// at its IB chunks and at its feature cells, so that a segment lies in one
+// chunk and one cell. ATen ops; nothing waits for the device.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -30,32 +32,45 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// The most IB chunks of a call (a piece of k keys takes ceil(k / chunk_rows),
-// and a call has at most remote_keys keys in rounds_cap * num_nodes pieces),
-// and the most segments (each cell start inside a chunk adds one).
-inline int64_t chunk_bound(const PlanSizes &sizes) {
-  return sizes.remote_keys / sizes.chunk_rows + sizes.rounds_cap * sizes.topo.num_nodes + 1;
-}
-inline int64_t segment_bound(const PlanSizes &sizes) {
-  return chunk_bound(sizes) + sizes.topo.num_nodes * sizes.num_features;
+// The most IB chunks of a list's pieces, for at most `keys` keys in all: a
+// piece of k keys takes ceil(k / chunk_rows), and a list has rounds_cap *
+// num_nodes pieces.
+inline int64_t chunk_bound(int64_t keys, const PlanSizes &sizes) {
+  return keys / sizes.chunk_rows + sizes.rounds_cap * sizes.topo.num_nodes + 1;
 }
 
-struct PutList {
-  at::Tensor bwd_put_list;        // int32 [segment_bound][4]: PutSeg {src row in proxy_rows,
-                                  // dst row in the owner's KJT, rows, chunk}
-  at::Tensor bwd_put_start;       // int32 [rounds_cap * num_nodes + 1]: the segments of each
-                                  // (round, owner node)
-  at::Tensor round_table;         // int32 [rounds_cap][num_nodes][4]: RoundPiece with each
-                                  // piece's first chunk
+// Both lists, in one tensor. A list's segments are in (node, key) order:
+// node after node, round by round, and those of an IB chunk follow each
+// other. IB chunks are numbered piece by piece, round after round, the
+// backward's pieces before the forward's in each round.
+struct PutLists {
+  at::Tensor list;                // int32 [bound][4]: PutSeg {src, dst, rows, chunk}; the
+                                  // backward's src is a row of proxy_rows and its dst a row
+                                  // of the owner's KJT, the forward's the other way round
+  at::Tensor bwd_start;           // int32 [num_nodes][rounds_cap + 1]: the backward list's first
+                                  // segment of each (owner node, round); [node][rounds_cap]:
+                                  // the node's end
+  at::Tensor fwd_start;           // int32 [num_nodes][rounds_cap + 1]: the forward list's of
+                                  // each (proxy node, round)
+  at::Tensor round_table;         // int32 [rounds_cap][num_nodes][4]: the proxy's RoundPiece
+                                  // with each piece's first chunk
   at::Tensor reduce_task_starts;  // int64 [rounds_cap + 1]: the reducers' tasks before each
                                   // round
-  at::Tensor num_chunks;          // int64 0-dim: the IB chunks
+  at::Tensor num_chunks;          // int64 0-dim: the IB chunks of both lists
 };
-// From the proxy's round table (its pieces, chunk 0), its node-unique keys
-// per (owner node, feature), and where its cells start in each rail owner's
-// KJT (the rail layout's rail_cell_start).
-PutList proxy_put_list(const at::Tensor &round_table, const at::Tensor &cell_uniq,
-                       const at::Tensor &rail_cell_start, const PlanSizes &sizes);
+// The backward list from the proxy's round table (its pieces, chunk 0) and
+// rounds, its node-unique keys per (owner node, feature) and where its cells
+// start in each rail owner's KJT (rail_cells, int64 [num_nodes]
+// [num_features], as the owners put them). The forward list from each
+// source node's round pieces (fwd_pieces, int64 [rounds_cap][num_nodes][3]:
+// lo, hi and the row of lo in the proxy's proxy_rows; zeros past its rounds
+// fwd_rounds), its keys per feature (cells_in) and where those cells start
+// in the owner's KJT (cell_stage).
+PutLists put_lists(const at::Tensor &round_table, const at::Tensor &num_rounds,
+                   const at::Tensor &cell_uniq, const at::Tensor &rail_cells,
+                   const at::Tensor &fwd_pieces, const at::Tensor &fwd_rounds,
+                   const at::Tensor &cells_in, const at::Tensor &cell_stage,
+                   const PlanSizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

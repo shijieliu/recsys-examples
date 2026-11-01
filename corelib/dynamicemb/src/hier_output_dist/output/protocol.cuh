@@ -45,7 +45,8 @@ __device__ __forceinline__ void pass_entry_barrier(const OutArgs &args, int thre
     fence_sc_sys();
     barrier.publish(CtrlWords::of(args, args.topo.local_rank));
   }
-  if (tid < local_size) barrier.wait(tid, "out-channel node barrier");
+  for (int peer = tid; peer < local_size; peer += threads)
+    barrier.wait(peer, "out-channel node barrier");
   cta_sync(threads);
   if (tid == 0) {
     const OutTimeline timeline(args);

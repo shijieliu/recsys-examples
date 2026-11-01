@@ -92,7 +92,7 @@ __device__ __forceinline__ void wait_landed_warp(const OutArgs &args, const OutT
     if (lane == __ffs(peers) - 1) {
       const uint64_t want = LandedRows::of(args.ch.seq, need);
       Spin spin(args.timeout_ns);
-      while (ld_acquire_sys(&tables.landed_rows[proxy][owner_node]) < want)
+      while (ld_acquire_sys(tables.landed_rows(proxy, owner_node)) < want)
         spin.pause("rows landed at a proxy", proxy, need, args.topo.rank);
     }
   }
@@ -120,12 +120,12 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
   const int64_t begin = fanout.sub[2 * sub + 1],
                 end = min(begin + kHeavy, (int64_t)fanout.exp_off[dedup_row + 1]);
   const int32_t row = fanout.pos[fanout.slot[dedup_row]];
-  const int owner = tables.owner_of(args, row), rail = owner % local_size,
+  const int owner = tables.owner_of(row), rail = owner % local_size,
             owner_node = owner / local_size;
   const bool remote = kMulti && owner_node != args.topo.node,
-             staged = remote && tables.rounds[rail] > 1;
+             staged = remote && tables.rounds(rail) > 1;
   if (remote != late) return;
-  const char *src = (remote ? tables.proxy_rows[rail] : tables.lookup_rows[rail]) +
+  const char *src = (remote ? tables.proxy_rows(rail) : tables.lookup_rows(rail)) +
                     (int64_t)plan.rows[row] * row_bytes;
   int64_t from = begin;
   if (staged) {
@@ -141,7 +141,7 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
     from = max(begin, first + 1);
   } else if (remote) {
     wait_landed_warp(args, tables, rail, lane == 0, owner_node,
-                     tables.piece_of(args, rail, 0, owner_node), plan.rows[row], lane);
+                     tables.piece_of(rail, 0, owner_node), plan.rows[row], lane);
   }
   const OutTimeline timeline(args);
   const unsigned long long start = timeline.on() ? now_ns() : 0;
@@ -166,7 +166,7 @@ __device__ __forceinline__ bool local_pull(const OutArgs &args, const OutTables 
   if (job.count == 0) return false;
   if (lane < job.count) {
     const int64_t row = job.row0 + lane;
-    src = tables.lookup_rows[job.owner] + (int64_t)plan.rows[row] * row_bytes;
+    src = tables.lookup_rows(job.owner) + (int64_t)plan.rows[row] * row_bytes;
     out_row = plan.inv[row];
   }
   pull.src = src;
@@ -193,9 +193,9 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
   const int64_t slot = task - cursor.mid;
   const int proxy = (int)((me + slot) % local_size);
   const int64_t nth = slot / local_size;
-  if (rnd >= tables.rounds[proxy]) return false;
+  if (rnd >= tables.rounds(proxy)) return false;
   ReqEntry entry, next;
-  tables.req_of(args, proxy, rnd, entry, next);
+  tables.req_of(proxy, rnd, entry, next);
   const int64_t plain = ceil_div<kTaskRows>(entry.heavy - entry.start);
   int64_t pos0, end;
   if (nth < plain) {
@@ -213,10 +213,10 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
   RoundPiece piece{0, 0, 0, 0};
   if (lane < num_rows) {
     const int32_t row = plan.push_order[pos0 + lane];
-    owner_node = tables.owner_of(args, row) / local_size;
+    owner_node = tables.owner_of(row) / local_size;
     at = plan.rows[row];
-    piece = tables.piece_of(args, proxy, rnd, owner_node);
-    src = tables.proxy_rows[proxy] + (int64_t)at * row_bytes;
+    piece = tables.piece_of(proxy, rnd, owner_node);
+    src = tables.proxy_rows(proxy) + (int64_t)at * row_bytes;
     out_row = plan.inv[row];
   }
   wait_landed_warp(args, tables, proxy, lane < num_rows, owner_node, piece, at, lane);
@@ -226,7 +226,7 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
   pull.rnd = rnd;
   pull.peer = proxy;
   pull.shared = shared;
-  pull.count = tables.rounds[proxy] > 1;
+  pull.count = tables.rounds(proxy) > 1;
   return true;
 }
 
@@ -258,7 +258,7 @@ __device__ __forceinline__ void pull_warp(const OutArgs &args, const OutTables &
     // release).
     __syncwarp();
     if (lane == 0) {
-      red_release_sys(tables.done[peer] + (rnd & 1), (uint64_t)num_rows);
+      red_release_sys(tables.done(peer) + (rnd & 1), (uint64_t)num_rows);
       if (tables.staged) red_release_gpu((uint64_t *)&plan.ready[peer], (uint64_t)num_rows);
     }
   }

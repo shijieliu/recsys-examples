@@ -63,6 +63,16 @@ struct CtrlWords {
   __device__ __forceinline__ uint64_t *bwd_ready_sent(int proxy_node) const {
     return &words[at.bwd_ready_sent + proxy_node];
   }
+  // An issuer's place in its put list for the rail peer on node peer_node:
+  // its next segment, and that segment's round.
+  __device__ __forceinline__ int64_t *put_at(int peer_node) const {
+    return (int64_t *)words + at.put_at + 2 * peer_node;
+  }
+  // The done words the relay waits for of a requester, of its even and its
+  // odd rounds.
+  __device__ __forceinline__ uint64_t *relay_want(int requester) const {
+    return words + at.relay_want + 2 * requester;
+  }
   __device__ __forceinline__ uint64_t *posted(int half) const { return &words[at.posted + half]; }
   // A requester's two done words: of its even and of its odd rounds.
   __device__ __forceinline__ uint64_t *done(int requester) const {

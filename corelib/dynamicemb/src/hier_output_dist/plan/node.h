@@ -41,15 +41,24 @@ namespace hier_output_dist {
 // owner of its node, [owner][feature]. From part 1's cell_start.
 at::Tensor node_count_vector(const at::Tensor &cell_start, const Topo &topo, int64_t num_features);
 
-// The layout of the node's keys, from node_counts (int64 [local_size][count
-// vector], a row per requester) and this rank's part 1. Under a need above
-// a capacity no rank of the node pushes (skip). One node has no remote part:
-// there requester_start and need_remote stay undefined.
+// The node's count vectors as node_count_exchange gives them to this rank.
+struct NodeCounts {
+  at::Tensor totals;  // int64 [local_size * (num_features + 1)]: their sum over the node
+  at::Tensor before;  // int64 [local_size * (num_features + 1)]: their sum over the ranks
+                      // before this one
+  at::Tensor mine;    // int64 [local_size][num_features + 1]: each requester's keys for this
+                      // rank: for its remote part, then for each feature of its own part
+};
+
+// The layout of the node's keys, from the node's counts and this rank's part
+// 1. Under a need above a capacity no rank of the node pushes (skip). One
+// node has no remote part: there requester_start and need_remote stay
+// undefined.
 struct NodeLayout {
-  at::Tensor own_cells;         // int64 [local_size][num_features * local_size]: keys of cell
-                                // (feature, requester) in each owner's own part
-  at::Tensor own_starts;        // int64 [local_size][num_features * local_size]: where each
-                                // such cell starts there
+  at::Tensor own_cells;         // int64 [num_features * local_size]: keys of cell (feature,
+                                // requester) in this rank's own part
+  at::Tensor own_starts;        // int64 [num_features * local_size]: where each such cell
+                                // starts there
   at::Tensor own_total;         // int64 [local_size]: each owner's own part
   at::Tensor requester_start;   // int64 [local_size + 1]: where each requester's keys start in
                                 // this rank's remote part
@@ -61,7 +70,7 @@ struct NodeLayout {
                                 // goes to destination_base[row_cell[row]] + row in node_keys
                                 // of its target
 };
-NodeLayout node_layout(const at::Tensor &node_counts, const at::Tensor &cell_start,
+NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
                        const at::Tensor &block_start, const Topo &topo, int64_t num_features,
                        int64_t lookup_keys, int64_t remote_keys);
 

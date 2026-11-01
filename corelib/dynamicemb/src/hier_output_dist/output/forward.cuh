@@ -87,20 +87,21 @@ namespace hier_output_dist {
 namespace fwd {
 
 // At the end of a forward, the credits for the next out kernel (warp 0 of the
-// last CTA, one lane per rail peer), and a flush of their context. The exit
-// barrier and the owner lanes' flushes mean no node peer and no NIC reads
-// this rank's lookup_rows or proxy_rows any more. So the owner lets each rail
-// proxy put the next kernel's gradient rows (bwd_ready), and the proxy grants
-// each rail owner rounds 0 and 1 of proxy_rows. (At the end of a backward the
-// proxy's issuer sends its grants itself, bwd::ProxyIssuer.)
+// last CTA, its lanes taking the rail peers in turn), and a flush of their
+// context. The exit barrier and the owner lanes' flushes mean no node peer
+// and no NIC reads this rank's lookup_rows or proxy_rows any more. So the
+// owner lets each rail proxy put the next kernel's gradient rows
+// (bwd_ready), and the proxy grants each rail owner rounds 0 and 1 of
+// proxy_rows. (At the end of a backward the proxy's issuer sends its grants
+// itself, bwd::ProxyIssuer.)
 __device__ void next_kernel_credits_warp(const OutArgs &args) {
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
-            peer_node = lane;
+  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
   ncclGin cred(args.dev, kCtxCredit);
-  if (peer_node < num_nodes && peer_node != node) {
-    const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
-    const ncclTeam rail = ncclTeamRail(args.dev);
-    const Credits credits(cred, rail);
+  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const ncclTeam rail = ncclTeamRail(args.dev);
+  const Credits credits(cred, rail);
+  for (int peer_node = lane; peer_node < num_nodes; peer_node += 32) {
+    if (peer_node == node) continue;
     credits.raise(peer_node, sig_bwd_ready(num_nodes, node), (uint64_t)args.ch.seq + 1,
                   mine.bwd_ready_sent(peer_node));
     credits.raise(peer_node, sig_grant(node), grant_of(args.ch.seq + 1, 2),
@@ -128,7 +129,8 @@ __device__ __forceinline__ void exit(const OutArgs &args) {
     TaskQueue::reset_all(args);
     pulled.publish(mine);
   }
-  if (tid < args.topo.local_size) pulled.wait(tid, "exit barrier of the forward");
+  for (int peer = tid; peer < args.topo.local_size; peer += blockDim.x)
+    pulled.wait(peer, "exit barrier of the forward");
   __syncthreads();
   if (kMulti && args.topo.num_nodes > 1 && (tid >> 5) == 0) next_kernel_credits_warp(args);
   if (tid == 0) timeline.stamp_latest(kTraceExited);
@@ -142,13 +144,12 @@ __device__ __forceinline__ void exit(const OutArgs &args) {
 // nodes' node-unique keys into their rail proxies' proxy_rows, from which the
 // requesters pull those. Roles: across nodes the last two warps of CTA 0 are
 // the proxy's relay and the owner's issuer, which skip the entry barrier;
-// every other warp requests (fwd_requester.cuh): it copies the call's tables,
-// zeroes the counters this kernel counts from 0 (before this rank publishes
-// its out_seq), passes the entry barrier and takes its tasks. Every CTA then
-// arrives, and the last one ends the forward for this rank (fwd::exit).
+// every other warp requests (fwd_requester.cuh): it zeroes the counters this
+// kernel counts from 0 (before this rank publishes its out_seq), passes the
+// entry barrier and takes its tasks. Every CTA then arrives, and the last one
+// ends the forward for this rank (fwd::exit).
 template <bool kMulti>
 __global__ void __launch_bounds__(kThreads, 1) fwd_kernel(OutArgs args) {
-  __shared__ OutTables tables;
   const OutPlan &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int local_size = args.topo.local_size, num_nodes = kMulti ? args.topo.num_nodes : 1,
@@ -163,16 +164,16 @@ __global__ void __launch_bounds__(kThreads, 1) fwd_kernel(OutArgs args) {
     else
       fwd::OwnerIssuer::run(args);
   } else {
-    tables.load(args);
+    const OutTables tables(args);
     const int64_t heavy = fanout.exp_off != nullptr ? fanout.count[1] : 0;
     if (num_nodes > 1 && heavy > 0 && blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
-      if (tid < local_size) plan.ready[tid] = 0;
+      for (int proxy = tid; proxy < local_size; proxy += workers) plan.ready[proxy] = 0;
       cta_sync(workers);
     }
     pass_entry_barrier(args, workers);
-    const int64_t *node_block_start = tables.block_start + node * local_size;  // this node's owners
+    const int64_t *node_block_start = plan.block_start + node * local_size;  // this node's owners
     const int64_t *fwd_task_starts = plan.meta + args.meta_at.fwd_task_starts;
     const LocalRows local_rows{node_block_start, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;

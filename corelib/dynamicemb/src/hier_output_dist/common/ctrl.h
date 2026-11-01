@@ -32,7 +32,8 @@ namespace hier_output_dist {
 // words (in_meta, cell_start, the needs after in_done, the count messages)
 // are written whole in each call, before a tagged word, the node barrier or
 // a signal publishes them. So none is ever reset, and a call that overflowed
-// leaves all of them valid for the next.
+// leaves all of them valid for the next. Words marked (local) are only this
+// rank's: a GIN warp's place with each peer, which it sets when it starts.
 struct Ctrl {
   // in channel
   int in_started;     // in_seq of this rank's current node_count_exchange (its node barrier)
@@ -43,7 +44,8 @@ struct Ctrl {
                       // requester's cell (feature, requester) starts in this rank's KJT
   int in_done;        // (num_nodes > 1) in_seq of this rank's node_status_exchange; then
                       // [kNumNeeds] its rail's needs
-  int count_msg_out;  // (num_nodes > 1) the count message this rank sends its rail peers
+  int count_msg_out;  // (num_nodes > 1) the count message this rank sends its rail peers: its
+                      // common part, then the part for each node (msg_out_words)
   int count_msgs;     // (num_nodes > 1) [2][num_nodes] the count messages of the rail
                       // peers, by in_seq parity and source node (this rank's own too)
   int msg_words;      // words of a count message's slot (whole 16-byte units)
@@ -68,6 +70,12 @@ struct Ctrl {
                        // owner (local)
   int bwd_ready_sent;  // (num_nodes > 1) [num_nodes] the bwd_ready this owner sent each
                        // rail proxy (local)
+  int put_at;          // (num_nodes > 1) [num_nodes][2] an issuer's place in its put list
+                       // for each rail peer: its next segment, and that segment's round
+                       // (local)
+  int relay_want;      // (num_nodes > 1) [local_size][2] the done words the forward's relay
+                       // waits for of each requester, of its even and its odd rounds
+                       // (local)
   int posted;          // (num_nodes > 1) [2] backward puts this proxy posted in calls of
                        // more than one round, per half of proxy_rows: what its put
                        // counters count (local)
@@ -85,12 +93,19 @@ struct Ctrl {
   int words;    // size, in words
 };
 
-// The words (int64) of a count message, all a rail peer needs to lay out
-// every owner of the rail (plan/rail.h, count_message): its node's largest
-// remote part, its rounds and its node-unique keys per (owner node, feature)
-// as proxy, and the keys it receives from its node per feature as owner.
+// A count message (int64 words, plan/rail.h, count_message), all a rail peer
+// needs to lay out the keys its rail puts: a common part, the same for every
+// peer (msg_common words: its node's largest remote part and its rounds as
+// proxy, the keys it looks up of its own node as owner, and its node-unique
+// keys per owner node), then the part for the peer's node alone
+// (num_features words: its node-unique keys of each feature there).
+__host__ __device__ inline int msg_common(int num_nodes) { return 3 + num_nodes; }
 __host__ __device__ inline int msg_len(int num_nodes, int num_features) {
-  return 2 + (num_nodes + 1) * num_features;
+  return msg_common(num_nodes) + num_features;
+}
+// The words a rank sends from: the common part, then the part for each node.
+__host__ __device__ inline int msg_out_words(int num_nodes, int num_features) {
+  return msg_common(num_nodes) + num_nodes * num_features;
 }
 
 // Kernels of one channel run one at a time, in issue order, and share a

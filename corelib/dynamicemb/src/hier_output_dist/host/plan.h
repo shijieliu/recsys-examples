@@ -108,7 +108,7 @@ class Plan {
   // the call's tables, from start
   at::Tensor meta_, src_, dst_;
   at::Tensor push_order_, heavy_groups_, group_first_sub_, group_of_sub_;  // across nodes
-  at::Tensor reducer_start_, reducer_entries_, bwd_put_list_, ready_;      // across nodes
+  at::Tensor reducer_start_, reducer_entries_, put_list_, ready_;          // across nodes
   at::Tensor kjt_values_, kjt_weights_, kjt_lengths_, kjt_offsets_;        // the owner's KJT
   at::Tensor status_;            // [status_words] the call's status on the device
   at::Tensor status_host_;       // pinned: start copies the status into it

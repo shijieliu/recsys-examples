@@ -24,6 +24,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <nccl_device.h>
 
 #include <cstdint>
+#include <tuple>
 #include <utility>
 
 #include "hier_output_dist/common/channel_args.h"
@@ -47,10 +48,12 @@ cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns);
 // On the current stream (the side stream, in InChannel::start), at call seq;
 // each allocates its outputs there.
 
-// The node barrier, and every node peer's count vector: int64 [local_size]
-// [my_counts.numel()].
-at::Tensor launch_node_count_exchange(const ChannelStatic &channel, int64_t seq,
-                                      const at::Tensor &my_counts);
+// The node barrier, and the node's count vectors (int64): their sum over the
+// node and over the ranks before this one ([my_counts.numel()] each), and
+// each requester's counts for this rank ([local_size][num_features + 1]),
+// as plan/node.h's NodeCounts.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
+    const ChannelStatic &channel, int64_t seq, const at::Tensor &my_counts);
 // This rank's first *rows_to_push rows of part 1 (keys, weights or undefined,
 // row_cell) into its targets' node_keys at destination_base[cell] + row.
 void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
@@ -60,11 +63,14 @@ void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
 // Tells the node this rank's keys are pushed, and waits until every
 // requester of the node told it.
 void launch_node_done(const ChannelStatic &channel, int64_t seq);
-// The rail's count messages: int64 [num_nodes][message.numel()].
+// Sends each rail peer its count message (message: msg_out_words, the
+// common part and the part for each node); returns the messages this rank
+// got, int64 [num_nodes][msg_len].
 at::Tensor launch_rail_count_exchange(const ChannelStatic &channel, int64_t seq,
                                       const at::Tensor &message);
 // Puts this proxy's key_stage slices into its rail owners' rail_keys (each
-// [num_nodes], int64 but put_skip), and waits for the other nodes' key streams.
+// [num_nodes], int64 but put_skip) and its cell_stage rows into its rail
+// proxies' rail_cells, and waits for the other nodes' key streams.
 void launch_rail_key_exchange(const ChannelStatic &channel, int64_t seq, const at::Tensor &put_src,
                               const at::Tensor &put_dst, const at::Tensor &put_bytes,
                               const at::Tensor &put_skip);

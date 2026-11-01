@@ -134,11 +134,12 @@ void OutChannel::launch(const void *kernel, bool forward, OutCall &call) {
   const int ctas = budget_.out_ctas(forward);
   call.reducers = budget_.reducers(ctas);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
-  const size_t smem = trace_.start_out(forward, call, stream);
+  const bool timeline = trace_.start_out(forward, call, stream);
   call.ch = Channel{channel_.seq + 1, channel_.started};
   call.arrive0 = arrive_;
   OutArgs args{static_, call};
-  launch_out_kernel(kernel, args, ctas, smem, stream);
+  launch_out_kernel(kernel, args, ctas, out_shared_bytes(static_.topo.local_size, timeline),
+                    stream);
   trace_.launched(forward);
   channel_.seq = call.ch.seq;
   arrive_ += ctas;

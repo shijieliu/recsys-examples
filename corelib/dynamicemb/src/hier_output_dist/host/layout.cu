@@ -56,7 +56,7 @@ Ctrl ctrl_layout(int local_size, int num_nodes, int num_features) {
   ctrl_at.cell_start = take(multi ? local_size * num_features : 0);
   ctrl_at.in_done = take(multi ? 1 + kNumNeeds : 0);
   ctrl_at.msg_words = (msg_len(num_nodes, num_features) + 1) / 2 * 2;  // whole 16-byte units
-  ctrl_at.count_msg_out = take(multi ? ctrl_at.msg_words : 0);
+  ctrl_at.count_msg_out = take(multi ? msg_out_words(num_nodes, num_features) : 0);
   ctrl_at.count_msgs = take(multi ? 2 * num_nodes * ctrl_at.msg_words : 0);
   ctrl_at.out_started = take(1);
   ctrl_at.pushed = take(local_size);
@@ -68,6 +68,8 @@ Ctrl ctrl_layout(int local_size, int num_nodes, int num_features) {
   ctrl_at.bwd_tot = take(multi ? num_nodes : 0);
   ctrl_at.grant_sent = take(multi ? num_nodes : 0);
   ctrl_at.bwd_ready_sent = take(multi ? num_nodes : 0);
+  ctrl_at.put_at = take(multi ? 2 * num_nodes : 0);
+  ctrl_at.relay_want = take(multi ? 2 * local_size : 0);
   ctrl_at.posted = take(multi ? 2 : 0);
   ctrl_at.done = take(multi ? 2 * local_size : 0);
   ctrl_at.half_free = take(multi ? 1 : 0);
@@ -77,12 +79,24 @@ Ctrl ctrl_layout(int local_size, int num_nodes, int num_features) {
   return ctrl_at;
 }
 
+std::vector<int> dense_tables(const std::vector<int> &feature_tables) {
+  std::vector<int> seen, dense;
+  for (int table : feature_tables) {
+    const auto it = std::find(seen.begin(), seen.end(), table);
+    dense.push_back((int)(it - seen.begin()));
+    if (it == seen.end()) seen.push_back(table);
+  }
+  return dense;
+}
+
 Layout::Layout(const Config &config) {
   const int local_size = config.local_size, num_nodes = config.num_nodes();
   topo = Topo{config.world_size,          local_size,  num_nodes,
               local_size + num_nodes - 1, config.rank, config.rank % local_size,
               config.rank / local_size};
   num_features = config.num_features();
+  const std::vector<int> tables = dense_tables(config.feature_tables);
+  num_tables = tables.empty() ? 0 : *std::max_element(tables.begin(), tables.end()) + 1;
   row_bytes = config.row_bytes();
   partial_rows = partial_rows_for(config.dim, row_bytes);
   chunk_rows = chunk_rows_for(row_bytes);
@@ -107,7 +121,7 @@ Layout::Layout(const Config &config) {
   bytes[kNodeWeights] = config.weights ? 4 * node_entries : 0;
   bytes[kLookupRows] = (uint64_t)lookup_keys * row_bytes;
   if (num_nodes > 1) {
-    bytes[kRemoteCells] = 2 * (uint64_t)remote_keys;
+    bytes[kRemoteCells] = 4 * (uint64_t)remote_keys;
     bytes[kRemoteMap] = 12 * (uint64_t)remote_keys;
     // its rounds, its round table and each requester's push tables (int32 words)
     bytes[kProxyHdr] = 4 * (4 + 4 * (uint64_t)rounds_cap * num_nodes +
@@ -115,10 +129,11 @@ Layout::Layout(const Config &config) {
     // the slices, then 16 bytes that take what no key writes
     bytes[kKeyStage] = pieces + (uint64_t)remote_keys * record_bytes + 16;
     bytes[kRailKeys] = (uint64_t)lookup_keys * record_bytes + pieces;
+    bytes[kCellStage] = bytes[kRailCells] = 8 * (uint64_t)num_nodes * num_features;
     bytes[kProxyRows] = (uint64_t)num_proxy_rows * row_bytes;
     bytes[kPushFlags] = 8 * 2 * (uint64_t)half_flags(num_proxy_rows, local_size);
   }
-  meta_at = meta_layout(num_nodes, local_size, num_features, meta_rounds());
+  meta_at = meta_layout(num_nodes, local_size, meta_rounds());
   // The regions of each window in Region order, each at a multiple of
   // kRegionAlign.
   for (int window = 0; window < kNumWins; ++window) {
@@ -133,8 +148,8 @@ Layout::Layout(const Config &config) {
 }
 
 PlanSizes Layout::plan_sizes() const {
-  return PlanSizes{topo,       num_features, lookup_keys, remote_keys, num_proxy_rows,
-                   rounds_cap, partial_rows, chunk_rows,  record_bytes};
+  return PlanSizes{topo,           num_features, num_tables,   lookup_keys, remote_keys,
+                   num_proxy_rows, rounds_cap,   partial_rows, chunk_rows,  record_bytes};
 }
 
 std::vector<std::pair<std::string, int64_t>> meta_fields(const Meta &meta_at) {
@@ -146,7 +161,7 @@ std::vector<std::pair<std::string, int64_t>> meta_fields(const Meta &meta_at) {
           {"bwd_task_starts", meta_at.bwd_task_starts},
           {"slice_in", meta_at.slice_in},
           {"uniq_in", meta_at.uniq_in},
-          {"fwd_put_list", meta_at.fwd_put_list},
+          {"fwd_put_start", meta_at.fwd_put_start},
           {"uniq_off", meta_at.uniq_off},
           {"uniq_out", meta_at.uniq_out},
           {"round_table", meta_at.round_table},
@@ -159,8 +174,9 @@ std::vector<std::pair<std::string, int64_t>> meta_fields(const Meta &meta_at) {
 
 const std::vector<std::string> &region_names() {
   static const std::vector<std::string> names = {
-      "ctrl",      "node_keys", "node_weights", "remote_cells", "remote_map", "proxy_hdr",
-      "key_stage", "rail_keys", "lookup_rows",  "proxy_rows",   "push_flags"};
+      "ctrl",        "node_keys",  "node_weights", "remote_cells", "remote_map",
+      "proxy_hdr",   "key_stage",  "rail_keys",    "cell_stage",   "rail_cells",
+      "lookup_rows", "proxy_rows", "push_flags"};
   return names;
 }
 

@@ -56,9 +56,6 @@ std::pair<at::Tensor, at::Tensor> sort_pairs(const at::Tensor &keys, const at::T
   at::Tensor sorted_keys = at::empty_like(keys), sorted_values = at::empty_like(values);
   if (keys.numel() == 0) return {sorted_keys, sorted_values};
   switch (keys.scalar_type()) {
-    case at::kShort:
-      radix_sort<int16_t>(keys, values, sorted_keys, sorted_values, end_bit);
-      break;
     case at::kInt:
       radix_sort<int32_t>(keys, values, sorted_keys, sorted_values, end_bit);
       break;
@@ -66,7 +63,7 @@ std::pair<at::Tensor, at::Tensor> sort_pairs(const at::Tensor &keys, const at::T
       radix_sort<int64_t>(keys, values, sorted_keys, sorted_values, end_bit);
       break;
     default:
-      TORCH_CHECK(false, "hier_output_dist: sort_pairs sorts int16, int32 or int64 keys, got ",
+      TORCH_CHECK(false, "hier_output_dist: sort_pairs sorts int32 or int64 keys, got ",
                   keys.scalar_type());
   }
   return {sorted_keys, sorted_values};
