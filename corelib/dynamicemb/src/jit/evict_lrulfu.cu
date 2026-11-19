@@ -61,7 +61,7 @@ __device__ __forceinline__ void run_evict(const EvictParams &p,
                          /*OutputScore=*/true, EnableOverflow>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
-                   p.num_scores);
+                   p.num_scores, p.table_global_capacities);
   EvictTable ovf_table =
       EnableOverflow ? EvictTable(p.ovf_storage, p.ovf_num_buckets,
                                   p.ovf_bucket_capacity, p.num_scores)
@@ -76,11 +76,13 @@ __device__ __forceinline__ void run_evict(const EvictParams &p,
       p.ovf_counter, p.ovf_output_offsets, cur_ts, p.num_valid);
 }
 
-extern "C" __global__ void dyn_emb_evict_entry_ovf(EvictParams p) {
+extern "C" __global__ void
+DYN_EMB_EVICT_SYM(dyn_emb_evict_entry_ovf)(EvictParams p) {
   run_evict<true>(p, read_globaltimer());
 }
 
-extern "C" __global__ void dyn_emb_evict_entry_noovf(EvictParams p) {
+extern "C" __global__ void
+DYN_EMB_EVICT_SYM(dyn_emb_evict_entry_noovf)(EvictParams p) {
   run_evict<false>(p, read_globaltimer());
 }
 
@@ -96,7 +98,7 @@ __device__ __forceinline__ void run_insert(const EvictParams &p,
                          /*OutputScore=*/true>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
-                   p.num_scores);
+                   p.num_scores, p.table_global_capacities);
 
   insert_body<EvictTable, KernelTraits, RankedEvictor<EvictComparator>>(
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
@@ -106,7 +108,8 @@ __device__ __forceinline__ void run_insert(const EvictParams &p,
       /*evicted_counter=*/nullptr, p.num_valid);
 }
 
-extern "C" __global__ void dyn_emb_insert_entry(EvictParams p) {
+extern "C" __global__ void
+DYN_EMB_EVICT_SYM(dyn_emb_insert_entry)(EvictParams p) {
   run_insert(p, read_globaltimer());
 }
 
@@ -122,7 +125,7 @@ __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
                          /*OutputScore=*/true>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
-                   p.num_scores);
+                   p.num_scores, p.table_global_capacities);
 
   insert_body<EvictTable, KernelTraits, RankedEvictor<EvictComparator>,
               /*CollectEvicted=*/true>(
@@ -133,7 +136,8 @@ __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
       p.num_valid);
 }
 
-extern "C" __global__ void dyn_emb_insert_collect_entry(EvictParams p) {
+extern "C" __global__ void
+DYN_EMB_EVICT_SYM(dyn_emb_insert_collect_entry)(EvictParams p) {
   run_insert_collect(p, read_globaltimer());
 }
 

@@ -26,6 +26,7 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores,
+                 std::optional<at::Tensor> table_global_capacities,
                  std::optional<at::Tensor> num_valid) {
 
   int64_t num_total = keys.size(0);
@@ -38,6 +39,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
   auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
+  auto global_caps_ptr =
+      global_capacities_ptr(table_global_capacities, table_bucket_offsets);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -56,7 +59,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     table_erase_kernel<Table, 1>
         <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),

@@ -70,6 +70,27 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
+// Validates the optional per-logical-table global capacities (int64 CUDA
+// tensor, one entry per table, 0 == "own capacity") and returns its device
+// pointer, or nullptr when absent. See LinearBucketTable::home_bucket.
+inline int64_t const *
+global_capacities_ptr(const std::optional<at::Tensor> &table_global_capacities,
+                      const at::Tensor &table_bucket_offsets) {
+  if (!table_global_capacities.has_value() ||
+      !table_global_capacities.value().defined()) {
+    return nullptr;
+  }
+  const at::Tensor &t = table_global_capacities.value();
+  TORCH_CHECK(t.scalar_type() == at::kLong,
+              "table_global_capacities must be int64");
+  TORCH_CHECK(t.is_cuda(), "table_global_capacities must be a CUDA tensor");
+  TORCH_CHECK(t.is_contiguous(), "table_global_capacities must be contiguous");
+  TORCH_CHECK(t.numel() == table_bucket_offsets.numel() - 1,
+              "table_global_capacities must have one entry per table (",
+              table_bucket_offsets.numel() - 1, "), got ", t.numel());
+  return t.data_ptr<int64_t>();
+}
+
 // Number of blocks for a grid-stride launch over the `num_total` entries of a
 // per-key array: one thread per entry, capped by counted_grid when `counted`
 // (the live length is a device count the host does not know).
@@ -79,8 +100,7 @@ inline int64_t table_grid_size(int64_t num_total, int block_size,
   return counted ? counted_grid(grid, block_size) : grid;
 }
 
-// `num_valid` (last, optional, on every op below that has it): see
-// counted_ops.h. Per-key outputs at or past it are undefined.
+// Per-key outputs at or past the optional device count are undefined.
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
@@ -90,6 +110,7 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t ovf_bucket_capacity = 0,
              std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
              int64_t num_scores = 1,
+             std::optional<at::Tensor> table_global_capacities = std::nullopt,
              std::optional<at::Tensor> num_valid = std::nullopt);
 
 at::Tensor table_insert(at::Tensor table_storage,
@@ -101,6 +122,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
                         int64_t num_scores = 1, int64_t score_fn_key = 0,
+                        std::optional<at::Tensor> table_global_capacities = std::nullopt,
                         std::optional<at::Tensor> num_valid = std::nullopt);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
@@ -115,6 +137,7 @@ table_insert_collect_evicted(
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0,
+    std::optional<at::Tensor> table_global_capacities = std::nullopt,
     std::optional<at::Tensor> num_valid = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
@@ -133,6 +156,7 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0,
     std::optional<at::Tensor> refused = std::nullopt,
+    std::optional<at::Tensor> table_global_capacities = std::nullopt,
     std::optional<at::Tensor> num_valid = std::nullopt,
     std::optional<at::Tensor> insert_status = std::nullopt);
 
@@ -147,6 +171,7 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores = 1,
+                 std::optional<at::Tensor> table_global_capacities = std::nullopt,
                  std::optional<at::Tensor> num_valid = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -185,7 +210,8 @@ std::tuple<at::Tensor, at::Tensor> table_scatter_keys_at_slots(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, at::Tensor slots, at::Tensor scores,
-    int64_t num_scores = 1);
+    int64_t num_scores = 1,
+    std::optional<at::Tensor> table_global_capacities = std::nullopt);
 
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,
@@ -199,7 +225,10 @@ std::vector<at::Tensor> tensor_partition(at::Tensor input,
 std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
                                        int64_t num_buckets,
-                                       int64_t bucket_capacity);
+                                       int64_t bucket_capacity,
+                                       std::optional<at::Tensor>
+                                           table_global_capacities =
+                                               std::nullopt);
 
 void table_update_counter_with_layout(
     at::Tensor counter, at::Tensor slot_indices, int32_t delta,
