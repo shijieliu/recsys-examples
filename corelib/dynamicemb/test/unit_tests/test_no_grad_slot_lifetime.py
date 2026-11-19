@@ -277,3 +277,20 @@ def test_no_grad_release_after_rehash_by_a_later_prefetch(grad_first):
     grad_output = outputs[0 if grad_first else 1]
     grad_output.sum().backward()
     assert (counter() == 0).all(), "a ref counter is not 0 after the backward"
+
+
+def test_cache_refusal_uses_distinct_keys_and_preserves_existing_pins():
+    """Repeated keys fit. A refused batch leaves earlier gradient pins intact."""
+    model, counter = make_model(DynamicEmbPoolingMode.NONE, "cache")
+    capacity = model._cache._state.capacity
+    n = (capacity // 2 + 100) * 2  # more input keys than the cache has rows
+    offsets = torch.arange(0, n + 1, n // 2, device="cuda")  # 2 features, 1 sample
+
+    repeats = torch.arange(n, device="cuda") % 8  # 8 distinct keys in each feature
+    model.prefetch(repeats, offsets)
+    model(repeats, offsets)  # consumes it: nothing is outstanding any more
+
+    pinned = pins(counter)
+    with pytest.raises(RuntimeError, match="could not place"):
+        model.prefetch(torch.arange(n, device="cuda"), offsets)
+    assert pins(counter) == pinned
