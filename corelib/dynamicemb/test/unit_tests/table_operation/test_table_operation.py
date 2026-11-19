@@ -1352,6 +1352,32 @@ def test_insert_collect_evicted(n, policy):
     assert (results[:n] != UNSET).all()
 
 
+@pytest.mark.parametrize(
+    "capacity,count,live",
+    [(0, None, 0), (0, 4, 0), (8, -2, 0), (8, 0, 0), (8, 5, 5), (8, 20, 8)],
+)
+def test_cache_placement_report_live_prefix(capacity, count, live):
+    table = _table(caps=(128,), enable_overflow=True)
+    keys = torch.arange(1, capacity + 1, device="cuda")
+    ids = torch.zeros_like(keys)
+    (
+        slots,
+        evicted,
+        *victims,
+        refused,
+    ) = table.insert_and_evict_with_counter_and_overflow(
+        keys,
+        ids,
+        _arg(keys.to(torch.uint64)),
+        report_refused=True,
+        num_valid=None if count is None else _nv(count),
+    )
+    assert slots.numel() == live
+    assert evicted == refused == 0
+    assert all(v.numel() == 0 for v in victims)
+    assert int(table.bucket_sizes.sum()) == live
+
+
 @FEW
 def test_overflow(n):
     a, b = (_table(caps=(128,), enable_overflow=True) for _ in range(2))

@@ -1936,7 +1936,7 @@ For a fixed-capacity training lookup using the built-in storage and default diag
 | --- | --- | --- |
 | HBM only, up to 2,048 input IDs, built-in initializer, no admission or per-key scores | At most one | Pins hits and reads the miss count. An all-hit lookup returns immediately. On misses, it sizes the remaining work to the miss count. |
 | Other fixed-capacity HBM, hybrid or host storage | Zero | Keeps counts on the device. HBM updates the hash-slot and value-row maps together using one indexed scatter. |
-| HBM cache over built-in storage | One for a nonempty placement attempt | Updates scores for all keys and prepares backing rows. After cache insertion it reads the install, eviction and refusal counts together. An all-hit batch skips the remaining work. A refused batch releases its hit pins and raises before returning a prefetch state. |
+| HBM cache over built-in storage | At most one, including an all-hit batch | Updates scores for all keys and prepares backing rows. After cache insertion it reads the attempted, evicted and refused counts together. An all-hit batch skips the remaining work. A refused batch releases its hit pins and raises before returning a prefetch state. |
 
 The 2,048-ID cutoff uses the input length already known to Python. Read-only evaluation uses device counts. Table growth, recording cache metrics, retaining evicted keys, deterministic or debug checks, and host-backed custom callbacks can introduce additional waits. The profiler regression exercises training, no-grad and evaluation through the module API.
 

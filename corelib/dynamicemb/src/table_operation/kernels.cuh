@@ -29,6 +29,9 @@ namespace cg = cooperative_groups;
 
 namespace dyn_emb {
 
+// PackedStatus is [live, evicted, refused].
+enum class RefusedOutput { PinnedFlag, DeviceCount, PackedStatus };
+
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
           int CompactTileSize_, int NumScorePerThread_,
           ScorePolicyType PolicyType_ = ScorePolicyType::Const,
@@ -550,7 +553,7 @@ __device__ __forceinline__ void insert_and_evict_body(
     int32_t *__restrict__ ovf_counter,
     int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts,
     int64_t const *__restrict__ num_valid, int64_t *refused = nullptr,
-    bool count_refused = false) {
+    RefusedOutput refused_output = RefusedOutput::PinnedFlag) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -573,6 +576,14 @@ __device__ __forceinline__ void insert_and_evict_body(
   // dispatch in insert_and_evict.cu): the ballot below then spans one lane, and
   // the bound needs no rounding.
   const int64_t n = counted_limit(num_valid, batch);
+  if constexpr (KernelTraits::ReportRefused) {
+    if (refused_output == RefusedOutput::PackedStatus) {
+      if (tid == 0) {
+        refused[0] = n;
+      }
+      refused += 2;
+    }
+  }
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
@@ -693,7 +704,7 @@ __device__ __forceinline__ void insert_and_evict_body(
         if (cmp_result == InsertResult::Busy) {
           // Device memory holds an exact count. The legacy pinned host flag
           // only records whether any insert was refused.
-          if (count_refused) {
+          if (refused_output != RefusedOutput::PinnedFlag) {
             ::atomicAdd(reinterpret_cast<unsigned long long *>(refused), 1ULL);
           } else {
             *refused = 1;
@@ -766,13 +777,14 @@ __global__ void table_insert_and_evict_kernel(
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
     int64_t const *__restrict__ ovf_output_offsets,
-    int64_t const *__restrict__ num_valid, int64_t *refused, bool count_refused) {
+    int64_t const *__restrict__ num_valid, int64_t *refused,
+    RefusedOutput refused_output) {
   insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       evicted_counter, evicted_keys, evicted_scores, evicted_indices,
       evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
-      ovf_output_offsets, /*cur_ts=*/0, num_valid, refused, count_refused);
+      ovf_output_offsets, /*cur_ts=*/0, num_valid, refused, refused_output);
 }
 
 template <typename Table>

@@ -1268,7 +1268,7 @@ class LinearBucketTable(ScoredHashTable):
                 return result
             return self._counted_result(result, keys.numel())
 
-        refused = keys.new_zeros((1,), dtype=torch.int64) if report_refused else None
+        status = keys.new_empty((3,), dtype=torch.int64) if report_refused else None
         indices, num_evicted, *evicted = table_insert_and_evict(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -1289,22 +1289,19 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
             num_valid=num_valid,
-            refused=refused,
+            insert_status=status,
         )
         if num_valid is not None and not report_refused:
             return (indices, num_evicted, *evicted)
 
-        if report_refused:
-            # Read all decisions together, including the exact count on failure.
-            counts = [num_evicted, refused]
-            if num_valid is not None:
-                counts.append(num_valid.reshape(1))
-            packed = torch.cat(counts)
-            host_counts = torch.empty(len(counts), dtype=torch.int64, pin_memory=True)
-            host_counts.copy_(packed, non_blocking=True)
+        if status is not None:
+            # The insertion writes the live, eviction and refusal counts together.
+            host_counts = torch.empty(
+                3, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            host_counts.copy_(status, non_blocking=True)
             torch.cuda.current_stream(keys.device).synchronize()
-            n_evicted, n_refused, *live = host_counts.tolist()
-            n = max(0, min(live[0], keys.numel())) if live else keys.numel()
+            n, n_evicted, n_refused = host_counts.tolist()
             return (
                 indices[:n],
                 n_evicted,

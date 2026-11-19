@@ -678,8 +678,8 @@ def _prefetch_cache_path(
                 cache_keys, cache_tids, None, report_refused=True, num_valid=num_cache
             )
 
-        installs = cache_slots.numel()
-        if installs == 0:
+        num_attempted = cache_slots.numel()
+        if num_attempted == 0:
             return slot_indices, non_admitted_positions, num_refused
 
         # Read genuine victims before installing new values. On partial failure
@@ -706,12 +706,12 @@ def _prefetch_cache_path(
                     num_valid=victim_count,
                 )
 
-        cache_tids = cache_tids[:installs]
+        cache_tids = cache_tids[:num_attempted]
         with torch.cuda.nvtx.range("op:store_to_flat"):
             cache_values = (
-                values[:installs]
+                values[:num_attempted]
                 if into_cache is None
-                else counted_gather(values, into_cache[:installs], None)
+                else counted_gather(values, into_cache[:num_attempted], None)
             )
             store_to_flat(state, cache_slots, cache_tids, cache_values, num_valid=None)
         if num_victims:
@@ -737,7 +737,7 @@ def _prefetch_cache_path(
             )
 
         cache.increment_counter(cache_slots, cache_tids)
-        counted_scatter(slot_indices, cache_pos[:installs], cache_slots, None)
+        counted_scatter(slot_indices, cache_pos[:num_attempted], cache_slots, None)
         return slot_indices, non_admitted_positions, num_refused
 
 
