@@ -25,7 +25,8 @@ void table_lookup_single_score(
     int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
-    int64_t num_scores, int64_t const *global_caps_ptr) {
+    int64_t num_scores, int64_t const *global_caps_ptr,
+    int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -69,12 +70,19 @@ void table_lookup_single_score(
                        num_buckets, bucket_capacity, num_scores,
                        global_caps_ptr);
 
+    // A lookup takes a thread per entry of its arrays, with a device count
+    // too, rather than the capped grid of the other counted ops: each entry is
+    // a probe of the hash table that waits on memory, and a capped grid gives
+    // each thread several probes in turn and leaves much of the GPU idle in
+    // its last wave (10.5M keys: 3.27 ms against 2.65 ms with a thread each).
+    // The threads past the count return at once.
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, false>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, table_bucket_offsets_ptr, num_total, keys_ptr,
-                       table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
-                       score_output_ptr, Table(), nullptr);
+          <<<table_grid_size(num_total, BLOCK_SIZE, /*counted=*/false),
+             BLOCK_SIZE, 0, stream>>>(
+              table, table_bucket_offsets_ptr, num_total, keys_ptr,
+              table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
+              score_output_ptr, Table(), nullptr, num_valid_ptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -87,7 +95,8 @@ static void table_lookup_with_overflow_single_score(
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_output_offsets, int64_t num_scores,
-    int64_t const *global_caps_ptr) {
+    int64_t const *global_caps_ptr,
+    int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -139,12 +148,15 @@ static void table_lookup_with_overflow_single_score(
     auto ovf_table = Table(reinterpret_cast<uint8_t *>(ovf_storage.data_ptr()),
                            ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
+    // A thread per entry, as in table_lookup_single_score.
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, true>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, table_bucket_offsets_ptr, num_total, keys_ptr,
-                       table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
-                       score_output_ptr, ovf_table, ovf_output_offsets_ptr);
+          <<<table_grid_size(num_total, BLOCK_SIZE, /*counted=*/false),
+             BLOCK_SIZE, 0, stream>>>(
+              table, table_bucket_offsets_ptr, num_total, keys_ptr,
+              table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
+              score_output_ptr, ovf_table, ovf_output_offsets_ptr,
+              num_valid_ptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -156,7 +168,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage, int64_t ovf_bucket_capacity,
              std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores,
-             std::optional<at::Tensor> table_global_capacities) {
+             std::optional<at::Tensor> table_global_capacities,
+             std::optional<at::Tensor> num_valid) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -177,18 +190,19 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
   auto global_caps_ptr =
       global_capacities_ptr(table_global_capacities, table_bucket_offsets);
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   if (use_overflow) {
     table_lookup_with_overflow_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, policy_type, score_output, founds, indices,
         ovf_storage.value(), ovf_bucket_capacity, ovf_output_offsets.value(),
-        num_scores, global_caps_ptr);
+        num_scores, global_caps_ptr, num_valid_ptr);
   } else {
     table_lookup_single_score(table_storage, table_bucket_offsets,
                               bucket_capacity, keys, table_ids, score_input,
                               policy_type, score_output, founds, indices,
-                              num_scores, global_caps_ptr);
+                              num_scores, global_caps_ptr, num_valid_ptr);
   }
 
   return std::make_tuple(score_output, founds, indices);

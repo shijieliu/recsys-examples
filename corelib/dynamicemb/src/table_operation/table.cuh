@@ -15,11 +15,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+#pragma once
+
 #include "../check.h"
+#include "device_count.h"
 #include "torch_utils.h"
 #include "types.cuh"
 
 #include <iostream>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -87,6 +91,17 @@ global_capacities_ptr(const std::optional<at::Tensor> &table_global_capacities,
   return t.data_ptr<int64_t>();
 }
 
+// Number of blocks for a grid-stride launch over the `num_total` entries of a
+// per-key array: one thread per entry, capped by counted_grid when `counted`
+// (the live length is a device count the host does not know).
+inline int64_t table_grid_size(int64_t num_total, int block_size,
+                               bool counted) {
+  const int64_t grid = (num_total + block_size - 1) / block_size;
+  return counted ? counted_grid(grid, block_size) : grid;
+}
+
+// Per-key outputs at or past the optional device count are undefined.
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
@@ -95,7 +110,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t ovf_bucket_capacity = 0,
              std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
              int64_t num_scores = 1,
-             std::optional<at::Tensor> table_global_capacities = std::nullopt);
+             std::optional<at::Tensor> table_global_capacities = std::nullopt,
+             std::optional<at::Tensor> num_valid = std::nullopt);
 
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
@@ -106,7 +122,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
                         int64_t num_scores = 1, int64_t score_fn_key = 0,
-    std::optional<at::Tensor> table_global_capacities = std::nullopt);
+                        std::optional<at::Tensor> table_global_capacities = std::nullopt,
+                        std::optional<at::Tensor> num_valid = std::nullopt);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
 // (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids); the
@@ -120,7 +137,8 @@ table_insert_collect_evicted(
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0,
-    std::optional<at::Tensor> table_global_capacities = std::nullopt);
+    std::optional<at::Tensor> table_global_capacities = std::nullopt,
+    std::optional<at::Tensor> num_valid = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -138,7 +156,10 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0,
     std::optional<at::Tensor> refused = std::nullopt,
-    std::optional<at::Tensor> table_global_capacities = std::nullopt);
+    std::optional<at::Tensor> table_global_capacities = std::nullopt,
+    std::optional<at::Tensor> num_valid = std::nullopt,
+    std::optional<at::Tensor> insert_status = std::nullopt,
+    std::optional<at::Tensor> backing_rows = std::nullopt);
 
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -147,12 +168,19 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t num_scores, int64_t score_index,
                           at::Tensor counts);
 
+void table_rollback_cache_placement(
+    at::Tensor storage, at::Tensor bucket_offsets, int64_t bucket_capacity,
+    at::Tensor bucket_sizes, at::Tensor overflow_storage,
+    int64_t overflow_bucket_capacity, at::Tensor overflow_sizes,
+    at::Tensor slots, at::Tensor table_ids, at::Tensor evicted_keys,
+    at::Tensor evicted_slots, at::Tensor evicted_scores, at::Tensor evicted_table_ids);
+
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores = 1,
-                 std::optional<at::Tensor> table_global_capacities =
-                     std::nullopt);
+                 std::optional<at::Tensor> table_global_capacities = std::nullopt,
+                 std::optional<at::Tensor> num_valid = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
@@ -216,7 +244,8 @@ void table_update_counter_with_layout(
     int64_t main_capacity, int64_t num_tables,
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity);
+    int64_t overflow_bucket_capacity,
+    std::optional<at::Tensor> num_valid = std::nullopt);
 
 // Resolve table-relative hash slots to the value rows they own, taking the
 // next row of the slot's table for a slot that has none yet when `allocate`;
@@ -225,7 +254,9 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor row_limits,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
-                              at::Tensor table_ids, bool allocate);
+                              at::Tensor table_ids, bool allocate,
+                              std::optional<at::Tensor> num_valid =
+                                  std::nullopt);
 
 // Rehash support. table_collect_reclaimed_rows returns the rows owned by the
 // reclaimed slots of buckets [bkt_begin, bkt_end) as int64[num_rows], where

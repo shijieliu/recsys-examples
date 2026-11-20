@@ -1284,7 +1284,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._optimizer,
             layout,
             self._admitter,
-            self._evict_strategy,
             pooling_weights,
             self._empty_tensor,
             self.output_alloc,
@@ -1305,6 +1304,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 prefetch_state.storage_mode,
                 prefetch_state.slot_indices,
                 prefetch_state.unique_table_ids,
+                num_valid=prefetch_state.num_unique,
             )
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False

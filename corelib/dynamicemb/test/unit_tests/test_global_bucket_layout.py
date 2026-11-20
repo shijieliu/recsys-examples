@@ -189,6 +189,52 @@ def test_table_places_keys_in_their_global_bucket(current_device, num_shards):
         assert founds.all()
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_counted_eviction_uses_the_global_bucket(
+    current_device, deterministic, monkeypatch
+):
+    if deterministic:
+        monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    device = torch.device(f"cuda:{current_device}")
+    table = get_scored_table(
+        capacity=[2 * BC],
+        bucket_capacity=BC,
+        key_type=torch.int64,
+        score_specs=[ScoreSpec(name="s", policy=ScorePolicy.ASSIGN)],
+        device=device,
+        global_capacities=[3 * BC],
+    )
+    # These keys all belong in local bucket 0 by the global rule, and in
+    # bucket 1 under ordinary shard-local hashing.
+    candidates = np.arange(1, 4096, dtype=np.int64)
+    h = oracle_hash(candidates)
+    different = ((h % (3 * BC) // BC) % 2 == 0) & (h % (2 * BC) // BC == 1)
+    keys = torch.tensor(candidates[different][: BC + 2], device=device)
+    assert keys.numel() == BC + 2
+    tids = torch.zeros_like(keys)
+    scores = torch.arange(1, keys.numel() + 1, device=device).to(torch.uint64)
+    live = tids.new_full((1,), BC)
+    slots = table.insert(keys, tids, ScoreArg(name="s", value=scores), num_valid=live)
+    assert ((slots[:BC] >= 0) & (slots[:BC] < BC)).all()
+
+    # One live newcomer takes one existing row. The last input is padding.
+    newcomers = keys[BC:]
+    one = live.new_ones((1,))
+    slots, num_evicted, evicted, *_ = table.insert_and_evict(
+        newcomers, tids[BC:], ScoreArg(name="s", value=scores[BC:]), num_valid=one
+    )
+    assert 0 <= slots[0].item() < BC
+    assert num_evicted.item() == 1 and evicted[0].item() == keys[0].item()
+    score_out, found, _ = table.lookup(
+        keys,
+        tids,
+        ScoreArg(name="s", policy=ScorePolicy.CONST, value=None),
+        num_valid=tids.new_full((1,), keys.numel()),
+    )
+    assert not found[0].item() and found[1:-1].all() and not found[-1].item()
+    assert torch.equal(score_out[1:-1].long(), scores[1:-1].long())
+
+
 def test_table_without_global_capacity_keeps_the_old_buckets(current_device):
     """Unset, or equal to the table's own capacity, the formula is the old one
     bit for bit -- roundrobin tables and caches must not move a single key."""

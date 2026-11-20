@@ -102,7 +102,8 @@ void bind_table_operation(py::module &m) {
         py::arg("score_input"), py::arg("policy_type"),
         py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
         py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
-        py::arg("table_global_capacities") = py::none());
+        py::arg("table_global_capacities") = py::none(),
+        py::arg("num_valid") = py::none());
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
@@ -111,7 +112,8 @@ void bind_table_operation(py::module &m) {
         py::arg("counter"), py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
         py::arg("score_fn_key") = 0,
-        py::arg("table_global_capacities") = py::none());
+        py::arg("table_global_capacities") = py::none(),
+        py::arg("num_valid") = py::none());
 
   m.def("table_insert_collect_evicted", &dyn_emb::table_insert_collect_evicted,
         "insert into the table, retaining evicted (key, table_id)",
@@ -121,7 +123,8 @@ void bind_table_operation(py::module &m) {
         py::arg("counter"), py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
         py::arg("score_fn_key") = 0,
-        py::arg("table_global_capacities") = py::none());
+        py::arg("table_global_capacities") = py::none(),
+        py::arg("num_valid") = py::none());
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
         "insert into the table", py::arg("table_storage"),
@@ -135,14 +138,24 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_counter") = py::none(),
         py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
         py::arg("score_fn_key") = 0, py::arg("refused") = py::none(),
-        py::arg("table_global_capacities") = py::none());
+        py::arg("table_global_capacities") = py::none(),
+        py::arg("num_valid") = py::none(), py::arg("insert_status") = py::none(),
+        py::arg("backing_rows") = py::none());
+
+  m.def("table_rollback_cache_placement", &dyn_emb::table_rollback_cache_placement,
+        "Undo a cache reservation before replacing any value rows",
+        py::arg("storage"), py::arg("bucket_offsets"), py::arg("bucket_capacity"),
+        py::arg("bucket_sizes"), py::arg("overflow_storage"), py::arg("overflow_bucket_capacity"),
+        py::arg("overflow_sizes"), py::arg("slots"), py::arg("table_ids"), py::arg("evicted_keys"),
+        py::arg("evicted_slots"), py::arg("evicted_scores"), py::arg("evicted_table_ids"));
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("table_ids"), py::arg("indices") = py::none(),
         py::arg("num_scores") = 1,
-        py::arg("table_global_capacities") = py::none());
+        py::arg("table_global_capacities") = py::none(),
+        py::arg("num_valid") = py::none());
 
   m.def("table_export_batch", &dyn_emb::table_export_batch,
         "export items[offset, offset + batch) from the table",
@@ -214,7 +227,8 @@ void bind_table_operation(py::module &m) {
         py::arg("main_capacity"), py::arg("num_tables"),
         py::arg("table_ids") = py::none(),
         py::arg("overflow_output_offsets") = py::none(),
-        py::arg("overflow_bucket_capacity") = 0);
+        py::arg("overflow_bucket_capacity") = 0,
+        py::arg("num_valid") = py::none());
 
   m.def("table_resolve_rows", &dyn_emb::table_resolve_rows,
         "map table-relative hash slots to the value rows they own, "
@@ -222,7 +236,8 @@ void bind_table_operation(py::module &m) {
         "allocate is set (asserting it is below the table's row limit)",
         py::arg("rows"), py::arg("row_counters"), py::arg("row_limits"),
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
-        py::arg("slots"), py::arg("table_ids"), py::arg("allocate"));
+        py::arg("slots"), py::arg("table_ids"), py::arg("allocate"),
+        py::arg("num_valid") = py::none());
 
   m.def("table_collect_reclaimed_rows", &dyn_emb::table_collect_reclaimed_rows,
         "rows owned by the reclaimed slots of a bucket range; num_rows is "
