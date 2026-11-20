@@ -494,6 +494,7 @@ class Cache(abc.ABC):
         report_refused: bool = False,
         *,
         num_valid: Optional[torch.Tensor] = None,
+        backing_rows: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Insert with counter-aware eviction and overflow fallback.
 
@@ -513,7 +514,9 @@ class Cache(abc.ABC):
             sliced to their exact length and num_evicted is an int.
             Requesting report_refused also returns exact slices, including
             the live prefix of indices, and appends an exact refusal count.
-            All host counts are read in one wait in the normal insertion path.
+            With report_refused, supplying backing_rows also reports whether any
+            live key has a negative backing row. The normal path reads the entire
+            report in one host wait.
         """
 
     @abc.abstractmethod

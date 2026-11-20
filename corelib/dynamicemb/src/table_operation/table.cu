@@ -139,7 +139,15 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
         py::arg("score_fn_key") = 0, py::arg("refused") = py::none(),
         py::arg("table_global_capacities") = py::none(),
-        py::arg("num_valid") = py::none(), py::arg("insert_status") = py::none());
+        py::arg("num_valid") = py::none(), py::arg("insert_status") = py::none(),
+        py::arg("backing_rows") = py::none());
+
+  m.def("table_rollback_cache_placement", &dyn_emb::table_rollback_cache_placement,
+        "Undo a cache reservation before replacing any value rows",
+        py::arg("storage"), py::arg("bucket_offsets"), py::arg("bucket_capacity"),
+        py::arg("bucket_sizes"), py::arg("overflow_storage"), py::arg("overflow_bucket_capacity"),
+        py::arg("overflow_sizes"), py::arg("slots"), py::arg("table_ids"), py::arg("evicted_keys"),
+        py::arg("evicted_slots"), py::arg("evicted_scores"), py::arg("evicted_table_ids"));
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),

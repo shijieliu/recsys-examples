@@ -177,7 +177,7 @@ void table_insert_single_score(at::Tensor table_storage,
 
   int64_t num_total = keys.size(0);
 
-  auto table_key_slots = at::zeros(
+  auto table_key_slots = at::empty(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
 
   bool output_score = (score_output_ptr != nullptr);
@@ -297,7 +297,7 @@ void table_insert_collect_single_score(
 
   int64_t num_total = keys.size(0);
 
-  auto table_key_slots = at::zeros(
+  auto table_key_slots = at::empty(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
 
   bool output_score = (score_output_ptr != nullptr);

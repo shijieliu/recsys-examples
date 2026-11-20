@@ -24,7 +24,7 @@ namespace dyn_emb {
 
 // n = clamp(*num_valid, 0, capacity), read on the device: how many leading
 // entries of a per-key array of capacity `capacity` are live; all of them
-// without a count (nullptr). The contract of `num_valid` is in counted_ops.h.
+// without a count (nullptr). The contract of `num_valid` is in device_count.h.
 // This header includes no torch header, so that table_operation/kernels.cuh,
 // which the evict fatbin builds with plain nvcc (setup.py), can use it.
 __host__ __device__ __forceinline__ int64_t

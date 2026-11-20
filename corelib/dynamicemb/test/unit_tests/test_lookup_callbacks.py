@@ -16,11 +16,11 @@
 import unittest
 
 import torch
-from dynamicemb._counted_callbacks import (
-    admit_counted,
-    find_counted,
-    initialize_counted,
-    insert_counted,
+from dynamicemb._lookup_callbacks import (
+    admit_keys,
+    find_rows,
+    initialize_rows,
+    insert_rows,
 )
 
 
@@ -53,7 +53,7 @@ class TestCountedCallbacks(unittest.TestCase):
         keys = torch.tensor([19, 23, -9])
         tids = torch.tensor([1, 0, -9])
         n = torch.tensor([2])
-        count, miss, positions, miss_ids, scores, hits, _, values = find_counted(
+        count, miss, positions, miss_ids, scores, hits, _, values = find_rows(
             store, keys, tids, copy_mode=0, num_valid=n
         )
         self.assertEqual(store.keys_seen, [19, 23])
@@ -63,12 +63,30 @@ class TestCountedCallbacks(unittest.TestCase):
         self.assertEqual(hits[:2].tolist(), [False, True])
         self.assertEqual(values.shape, (3, 1))
         self.assertEqual(miss.shape, (3,))
-        insert_counted(
+        insert_rows(
             store, keys, tids, values, keys, preserve_existing=True, num_valid=n
         )
         self.assertEqual(
             store.inserted, ([19, 23], [1, 0], [[19], [23]], [19, 23], True)
         )
+
+    def test_storage_with_mapped_insert_receives_original_rows(self):
+        class MappedStorage:
+            def insert(self, keys, tids, values, *, num_valid=None, input_rows=None):
+                self.values = values
+                self.input_rows = input_rows
+                self.num_valid = num_valid
+
+        storage = MappedStorage()
+        keys = torch.tensor([5, 7, -1])
+        tids = torch.tensor([0, 0, -1])
+        rows = torch.tensor([3, 0, -99])
+        values = torch.arange(8).reshape(4, 2)
+        count = torch.tensor([2])
+        insert_rows(storage, keys, tids, values, num_valid=count, input_rows=rows)
+        self.assertIs(storage.values, values)
+        self.assertIs(storage.input_rows, rows)
+        self.assertIs(storage.num_valid, count)
 
     def test_exact_admission_and_initialization_skip_padding(self):
         class ExactAdmitter:
@@ -80,7 +98,7 @@ class TestCountedCallbacks(unittest.TestCase):
         keys = torch.tensor([11, 12, 13, -99])
         tids = torch.tensor([0, 1, 2, -99])
         n = torch.tensor([3])
-        mask = admit_counted(admission, keys, tids, keys - 10, num_valid=n)
+        mask = admit_keys(admission, keys, tids, keys - 10, num_valid=n)
         self.assertEqual(admission.input, ([11, 12, 13], [0, 1, 2], [1, 2, 3]))
         self.assertEqual(mask[:3].tolist(), [False, False, True])
         self.assertEqual(mask.shape, keys.shape)
@@ -91,7 +109,7 @@ class TestCountedCallbacks(unittest.TestCase):
             self.assertTrue((tids >= 0).all())
             buffer[indices, 0] = keys[indices] + tids[indices]
 
-        initialize_counted(
+        initialize_rows(
             initialize,
             out,
             keys,
@@ -101,7 +119,7 @@ class TestCountedCallbacks(unittest.TestCase):
             num_rows=n,
         )
         self.assertEqual(out.flatten().tolist(), [0, 13, 15, 0])
-        initialize_counted(initialize, out, keys, tids, None, num_valid=n)
+        initialize_rows(initialize, out, keys, tids, None, num_valid=n)
         self.assertEqual(out.flatten().tolist(), [11, 13, 15, 0])
 
     def test_counted_admission_receives_capacity_and_original_count(self):
@@ -114,8 +132,6 @@ class TestCountedCallbacks(unittest.TestCase):
                 return incoming > 0
 
         self.assertEqual(
-            admit_counted(
-                CountedAdmitter(), keys, keys, None, num_valid=count
-            ).tolist(),
+            admit_keys(CountedAdmitter(), keys, keys, None, num_valid=count).tolist(),
             [True, False],
         )

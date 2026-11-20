@@ -21,7 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "ATen/ATen.h"
 #include "ATen/cuda/CUDAContext.h"
 #include "check.h"
-#include "counted_ops.h"
+#include "device_count.h"
 #include "hier_output_dist/common/common.h"
 #include "lookup_backward.h"
 #include "lookup_forward.h"
@@ -80,41 +80,111 @@ std::vector<int64_t> offsets_to_table_features_offsets(
   return table_features_offsets;
 }
 
-// Row i of output (row out_row[i] with out_row, int32 [index.numel()]) gets
-// row index[i] of input.
-void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index,
-                      const std::optional<at::Tensor> &out_row = std::nullopt) {
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto &device_prop = DeviceProp::getDeviceProp(index.device().index());
-  int num_sms = device_prop.num_sms;
-  auto src_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(input.dtype()));
-  auto dst_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(output.dtype()));
-  auto index_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(index.dtype()));
+// API overloads share this implementation. The allocating overload is a
+// gather, and an output row map can place a lookup directly into existing rows.
+using MaybeTensor = std::optional<at::Tensor>;
 
-  int64_t num_total = output.size(0);
-  int64_t dim = output.size(1);
-  if (num_total != index.numel()) {
-    throw std::runtime_error(
-        "Number rows of `output` must match with `index`.");
+static void check_row_vector(const at::Tensor &t, at::Device device,
+                             int64_t size, const char *name) {
+  TORCH_CHECK(t.device() == device && t.dim() == 1 && t.is_contiguous() &&
+                  t.numel() == size,
+              name, " must be a contiguous vector of length ", size,
+              " on the device of the rows");
+}
+
+static void read_row_map(const MaybeTensor &map, int64_t size, at::Device device,
+                         const int64_t *&longs, const int32_t *&ints) {
+  if (!map) return;
+  check_row_vector(*map, device, size, "row index");
+  if (map->scalar_type() == at::kInt) {
+    ints = map->data_ptr<int32_t>();
+  } else {
+    TORCH_CHECK(map->scalar_type() == at::kLong || map->scalar_type() == at::kUInt64,
+                "row index must have int32, int64 or uint64 dtype");
+    longs = static_cast<const int64_t *>(map->data_ptr());
   }
-  if (dim != input.size(1)) {
-    throw std::runtime_error(
-        "Number cols of `output` must match with `input`.");
+}
+
+static bool embedding_dtype(at::ScalarType dtype) {
+  return dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16 ||
+         dtype == at::kFloat8_e4m3fn;
+}
+
+void gather_embedding(at::Tensor input, at::Tensor output,
+                      const MaybeTensor &index, const MaybeTensor &out_row,
+                      const MaybeTensor &num_valid, const MaybeTensor &mask,
+                      const MaybeTensor &found_out, const MaybeTensor &src_aux,
+                      const MaybeTensor &dst_aux) {
+  const auto device = input.device();
+  TORCH_CHECK(input.is_cuda() && output.device() == device,
+              "input and output must be on the same CUDA device");
+  TORCH_CHECK(input.dim() == output.dim() && (input.dim() == 1 || input.dim() == 2),
+              "input and output must both be 1-D or both be 2-D");
+  const int64_t width = input.dim() == 1 ? 1 : input.size(1);
+  TORCH_CHECK(input.dim() == 1 || (output.size(1) == width &&
+                  (width <= 1 || (input.stride(1) == 1 && output.stride(1) == 1))),
+              "input and output must have contiguous rows of the same width");
+  TORCH_CHECK(output.size(0) <= 1 || output.stride(0) >= width,
+              "output rows must not overlap");
+  c10::cuda::CUDAGuard guard(device);
+  RowMapping rows{};
+  rows.input_rows = input.size(0);
+  rows.output_rows = output.size(0);
+  rows.capacity = index ? index->numel() :
+                  (out_row ? out_row->numel() : rows.input_rows);
+  TORCH_CHECK(index || rows.input_rows >= rows.capacity, "input has too few rows");
+  TORCH_CHECK(out_row || rows.output_rows == rows.capacity,
+              "output row count must match the number of entries");
+  rows.num_valid = counted_num_valid_ptr(num_valid, device);
+  read_row_map(index, rows.capacity, device, rows.src64, rows.src32);
+  read_row_map(out_row, rows.capacity, device, rows.dst64, rows.dst32);
+  if (mask) {
+    check_row_vector(*mask, device, rows.capacity, "mask");
+    if (mask->scalar_type() == at::kBool) {
+      rows.mask = mask->data_ptr<bool>();
+    } else {
+      TORCH_CHECK(mask->scalar_type() == at::kLong,
+                  "mask must hold bool flags or int64 slots (negative means missing)");
+      rows.valid_slots = mask->data_ptr<int64_t>();
+    }
   }
-  TORCH_CHECK(!out_row.has_value() ||
-                  (out_row->is_cuda() && out_row->is_contiguous() &&
-                   out_row->scalar_type() == at::kInt &&
-                   out_row->numel() == num_total),
-              "out_row must be a contiguous CUDA int32 tensor of a row per "
-              "index");
-  int64_t src_stride = input.stride(0);
+  if (found_out) {
+    check_row_vector(*found_out, device, rows.output_rows, "found_out");
+    rows.found_out = found_out->data_ptr<bool>();
+  }
+  TORCH_CHECK(src_aux.has_value() == dst_aux.has_value(),
+              "src_aux and dst_aux must be supplied together");
+  if (src_aux) {
+    check_row_vector(*src_aux, device, rows.input_rows, "src_aux");
+    check_row_vector(*dst_aux, device, rows.output_rows, "dst_aux");
+    TORCH_CHECK((src_aux->scalar_type() == at::kLong || src_aux->scalar_type() == at::kUInt64)
+                && src_aux->scalar_type() == dst_aux->scalar_type(),
+                "src_aux and dst_aux must both be int64 or both be uint64");
+    rows.src_aux = static_cast<const uint64_t *>(src_aux->data_ptr());
+    rows.dst_aux = static_cast<uint64_t *>(dst_aux->data_ptr());
+  }
+
+  const bool raw = input.scalar_type() == output.scalar_type();
+  TORCH_CHECK(raw || (embedding_dtype(input.scalar_type()) && embedding_dtype(output.scalar_type())),
+              "dtype conversion is supported only for embedding types");
+  const bool aligned = !(width % 4 || input.stride(0) % 4 || output.stride(0) % 4 ||
+      reinterpret_cast<uintptr_t>(input.data_ptr()) % (4 * input.element_size()) ||
+      reinterpret_cast<uintptr_t>(output.data_ptr()) % (4 * output.element_size()));
   dyn_emb::scatter_fused(
-      input.data_ptr(), output.data_ptr(), index.data_ptr(), num_total, dim,
-      src_stride, src_type, dst_type, index_type, num_sms, stream,
-      out_row.has_value() ? out_row->data_ptr<int32_t>() : nullptr);
+      input.data_ptr(), output.data_ptr(), rows, width, input.stride(0), output.stride(0),
+      raw ? input.element_size() : 0, raw ? DataType::Float32 : get_data_type(input),
+      raw ? DataType::Float32 : get_data_type(output), aligned,
+      DeviceProp::getDeviceProp(device.index()).num_sms, at::cuda::getCurrentCUDAStream());
+}
+
+static at::Tensor gather_embedding_rows(at::Tensor input, at::Tensor index,
+                                        const MaybeTensor &num_valid) {
+  TORCH_CHECK(input.dim() == 1 || input.dim() == 2, "input must be 1-D or 2-D");
+  auto shape = input.sizes().vec();
+  shape[0] = index.numel();
+  auto output = at::empty(shape, input.options());
+  gather_embedding(input, output, index, {}, num_valid, {}, {}, {}, {});
+  return output;
 }
 
 void gather_embedding_pooled(
@@ -253,10 +323,10 @@ generate_grad_infos_sequence_kernel(int64_t num_keys,
 // an fp32 spread over four fp8 bytes or two 16-bit words, least significant
 // first, matching the layout of the row-wise Adagrad accumulator (see
 // RowWiseAdaGradState<weight_t, float>).
-template <typename ValueT>
+template <typename ValueT, typename ScalarT>
 __global__ void
-fill_rows_kernel(int64_t batch, int64_t width, int64_t row_stride,
-                 ValueT *__restrict__ dst, float value,
+fill_rows_kernel(int64_t batch, int64_t num_rows, int64_t width, int64_t row_stride,
+                 ValueT *__restrict__ dst, ScalarT value,
                  int64_t const *__restrict__ indices,
                  int64_t const *__restrict__ num_valid, bool fp32_words) {
   const int64_t num_task = counted_limit(num_valid, batch) * width;
@@ -266,9 +336,11 @@ fill_rows_kernel(int64_t batch, int64_t width, int64_t row_stride,
     const int64_t i = task / width;
     const int64_t col = task - i * width;
     const int64_t row = indices != nullptr ? indices[i] : i;
-    if (row < 0)
+    if (row < 0 || row >= num_rows)
       continue;
-    if (fp32_words) {
+    if constexpr (std::is_integral_v<ValueT>) {
+      dst[row * row_stride + col] = static_cast<ValueT>(value);
+    } else if (fp32_words) {
       const uint32_t bits = __float_as_uint(value);
       if constexpr (sizeof(ValueT) == 1) {
         reinterpret_cast<uint8_t *>(dst)[row * row_stride + col] =
@@ -320,15 +392,15 @@ static RowFillBatch check_row_fill(const at::Tensor &dst,
                                    const std::optional<at::Tensor> &indices,
                                    const char *op) {
   TORCH_CHECK(dst.is_cuda(), op, ": dst must be a CUDA tensor");
-  TORCH_CHECK(dst.dim() == 2, op, ": dst must be 2-D, got ", dst.dim(),
-              " dims");
-  TORCH_CHECK(dst.stride(1) == 1, op, ": dst must be contiguous along dim 1");
-  TORCH_CHECK(dst.scalar_type() == at::kFloat ||
-                  dst.scalar_type() == at::kHalf ||
-                  dst.scalar_type() == at::kBFloat16 ||
-                  dst.scalar_type() == at::kFloat8_e4m3fn,
-              op, ": dst must be float32, float16, bfloat16 or float8_e4m3fn, got ",
-              dst.scalar_type());
+  if (dst.dim() == 1) {
+    TORCH_CHECK(dst.scalar_type() == at::kBool || dst.scalar_type() == at::kLong,
+                op, ": 1-D destinations must be bool or int64");
+    TORCH_CHECK(dst.size(0) <= 1 || dst.stride(0) > 0, op, ": overlapping rows");
+  } else {
+    TORCH_CHECK(dst.dim() == 2 && dst.stride(1) == 1,
+                op, ": dst must have contiguous rows");
+    TORCH_CHECK(embedding_dtype(dst.scalar_type()), op, ": unsupported embedding dtype");
+  }
   if (indices.has_value() && indices.value().defined()) {
     const at::Tensor &idx = indices.value();
     TORCH_CHECK(idx.is_cuda() && idx.device() == dst.device(), op,
@@ -343,35 +415,35 @@ static RowFillBatch check_row_fill(const at::Tensor &dst,
   return RowFillBatch{dst.size(0), nullptr};
 }
 
-static void launch_fill_rows(const at::Tensor &dst, float value,
-                             const RowFillBatch &batch,
-                             const int64_t *num_valid, bool fp32_words) {
-  const int64_t width = dst.size(1);
-  if (batch.size <= 0 || width <= 0)
-    return;
-  constexpr int kBlockSize = 256;
-  const int grid_size = counted_grid(
-      (batch.size * width + kBlockSize - 1) / kBlockSize, kBlockSize);
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  DISPATCH_VALUE_DATATYPE_FUNCTION(get_data_type(dst), ValueType, [&] {
-    fill_rows_kernel<ValueType><<<grid_size, kBlockSize, 0, stream>>>(
-        batch.size, width, dst.stride(0), get_pointer<ValueType>(dst), value,
-        batch.indices, num_valid, fp32_words);
-  });
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-// Fills columns [0, W) of the selected rows of dst[M, W] with `value`.
-void fill_rows(at::Tensor dst, float value,
-               const std::optional<at::Tensor> &num_valid = std::nullopt,
-               const std::optional<at::Tensor> &indices = std::nullopt,
-               bool fp32_words = false) {
+// Fill the live indexed rows of an optimizer-state buffer or persistence mask.
+void fill_rows(at::Tensor dst, py::object value,
+               const MaybeTensor &num_valid = std::nullopt,
+               const MaybeTensor &indices = std::nullopt, bool fp32_words = false) {
   const RowFillBatch batch = check_row_fill(dst, indices, "fill_rows");
-  TORCH_CHECK(!fp32_words || dst.element_size() <= 2,
-              "fill_rows: fp32_words needs an 8-bit or 16-bit dst, got ",
-              dst.scalar_type());
-  launch_fill_rows(dst, value, batch,
-                   counted_num_valid_ptr(num_valid, dst.device()), fp32_words);
+  TORCH_CHECK(!fp32_words || (dst.dim() == 2 && dst.element_size() <= 2),
+              "fill_rows: fp32_words needs an 8-bit or 16-bit embedding dst");
+  c10::cuda::CUDAGuard guard(dst.device());
+  const auto *count = counted_num_valid_ptr(num_valid, dst.device());
+  const int64_t width = dst.dim() == 1 ? 1 : dst.size(1);
+  if (!batch.size || !width) return;
+  constexpr int block = 256;
+  const int grid = counted_grid((batch.size * width + block - 1) / block, block);
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto launch = [&](auto *ptr, auto scalar) {
+    fill_rows_kernel<<<grid, block, 0, stream>>>(
+        batch.size, dst.size(0), width, dst.stride(0), ptr, scalar, batch.indices,
+        count, fp32_words);
+  };
+  if (dst.scalar_type() == at::kBool) {
+    launch(dst.data_ptr<bool>(), value.cast<double>() != 0);
+  } else if (dst.scalar_type() == at::kLong) {
+    launch(dst.data_ptr<int64_t>(), value.cast<int64_t>());
+  } else {
+    DISPATCH_VALUE_DATATYPE_FUNCTION(get_data_type(dst), ValueType, [&] {
+      launch(get_pointer<ValueType>(dst), value.cast<float>());
+    });
+  }
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Resets the FTRL state region dst[M, W] of the selected rows; see
@@ -380,6 +452,7 @@ void reset_ftrl_states(at::Tensor dst, at::Tensor table_ids,
                        at::Tensor emb_dims, float accum,
                        const std::optional<at::Tensor> &num_valid = std::nullopt,
                        const std::optional<at::Tensor> &indices = std::nullopt) {
+  TORCH_CHECK(dst.dim() == 2, "reset_ftrl_states: dst must be 2-D");
   const RowFillBatch batch = check_row_fill(dst, indices, "reset_ftrl_states");
   TORCH_CHECK(table_ids.is_cuda() && table_ids.device() == dst.device() &&
                   table_ids.scalar_type() == at::kLong &&
@@ -740,7 +813,8 @@ __global__ void store_to_flat_table_kernel_vec4(
     int64_t const *__restrict__ table_ptrs,
     int64_t const *__restrict__ table_value_dims,
     int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
-    int64_t scalar_table_id, int64_t const *__restrict__ num_valid) {
+    int64_t scalar_table_id, int64_t const *__restrict__ num_valid,
+    int64_t const *__restrict__ input_rows, int64_t num_input_rows) {
 
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -770,7 +844,10 @@ __global__ void store_to_flat_table_kernel_vec4(
 
     int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[emb_id];
     int64_t vdim = table_value_dims[table_id];
-    ValueT const *src_base = input + emb_id * input_stride;
+    const int64_t row = input_rows ? input_rows[emb_id] : emb_id;
+    if (input_rows && (row < 0 || row >= num_input_rows))
+      continue;
+    ValueT const *src_base = input + row * input_stride;
     ValueT *dst_base = reinterpret_cast<ValueT *>(table_ptrs[table_id]) +
                        static_cast<int64_t>(index) * vdim;
 
@@ -796,7 +873,8 @@ __global__ void store_to_flat_table_kernel(
     int64_t const *__restrict__ table_ptrs,
     int64_t const *__restrict__ table_value_dims,
     int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
-    int64_t scalar_table_id, int64_t const *__restrict__ num_valid) {
+    int64_t scalar_table_id, int64_t const *__restrict__ num_valid,
+    int64_t const *__restrict__ input_rows, int64_t num_input_rows) {
 
   const int64_t n = counted_limit(num_valid, batch);
   for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
@@ -806,7 +884,10 @@ __global__ void store_to_flat_table_kernel(
 
     int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[emb_id];
     int64_t vdim = table_value_dims[table_id];
-    ValueT const *src_base = input + emb_id * input_stride;
+    const int64_t row = input_rows ? input_rows[emb_id] : emb_id;
+    if (input_rows && (row < 0 || row >= num_input_rows))
+      continue;
+    ValueT const *src_base = input + row * input_stride;
     ValueT *dst_base = reinterpret_cast<ValueT *>(table_ptrs[table_id]) +
                        static_cast<int64_t>(index) * vdim;
 
@@ -960,15 +1041,27 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                               at::Tensor table_value_dims,
                               at::Tensor table_emb_dims, int64_t max_emb_dim,
                               bool all_dims_vec4,
-                              const std::optional<at::Tensor> &num_valid) {
+                              const std::optional<at::Tensor> &num_valid,
+                              const std::optional<at::Tensor> &input_rows) {
 
   int64_t num_total = indices.size(0);
   if (num_total == 0)
     return;
 
   TORCH_CHECK(input.dim() == 2, "input must be 2-D");
-  TORCH_CHECK(input.size(0) == num_total,
-              "input.size(0) must match indices.size(0)");
+  TORCH_CHECK(input.stride(1) == 1, "input rows must be contiguous");
+  if (input_rows) {
+    TORCH_CHECK(input_rows->device() == indices.device() &&
+                    input_rows->scalar_type() == at::kLong &&
+                    input_rows->dim() == 1 && input_rows->is_contiguous() &&
+                    input_rows->numel() == num_total,
+                "input_rows must be a contiguous int64 vector on the indices "
+                "device with one entry per destination");
+  } else {
+    TORCH_CHECK(input.size(0) == num_total,
+                "input.size(0) must match indices.size(0)");
+  }
+  const int64_t *rows = input_rows ? input_rows->data_ptr<int64_t>() : nullptr;
 
   int64_t input_dim = input.size(1);
   int64_t input_stride = input.stride(0);
@@ -991,7 +1084,8 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
 
   DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, ValueType, [&] {
     DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
-      if (all_dims_vec4 && input_dim >= 4) {
+      if (all_dims_vec4 && input_dim >= 4 && input_stride % 4 == 0 &&
+          reinterpret_cast<uintptr_t>(input.data_ptr()) % (4 * sizeof(ValueType)) == 0) {
         int grid_size;
         if (num_total / WARP_PER_BLOCK < max_grid_size) {
           grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
@@ -1007,7 +1101,7 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
                 get_pointer<int64_t>(table_value_dims),
                 get_pointer<int64_t>(table_emb_dims), max_emb_dim,
-                scalar_table_id, d_num_valid);
+                scalar_table_id, d_num_valid, rows, input.size(0));
       } else {
         int block_size = input_dim < device_prop.max_thread_per_block
                              ? static_cast<int>(input_dim)
@@ -1024,7 +1118,7 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
                 get_pointer<int64_t>(table_value_dims),
                 get_pointer<int64_t>(table_emb_dims), max_emb_dim,
-                scalar_table_id, d_num_valid);
+                scalar_table_id, d_num_valid, rows, input.size(0));
       }
     });
   });
@@ -1035,20 +1129,23 @@ void store_to_flat_table_contiguous(at::Tensor table_ptrs, at::Tensor indices,
                                     int64_t table_id, at::Tensor input,
                                     at::Tensor table_value_dims,
                                     at::Tensor table_emb_dims,
-                                    int64_t max_emb_dim, bool all_dims_vec4) {
+                                    int64_t max_emb_dim, bool all_dims_vec4,
+                                    const std::optional<at::Tensor> &num_valid = std::nullopt,
+                                    const std::optional<at::Tensor> &input_rows = std::nullopt) {
   store_to_flat_table_impl<0>(table_ptrs, indices, nullptr, table_id, input,
                               table_value_dims, table_emb_dims, max_emb_dim,
-                              all_dims_vec4, std::nullopt);
+                              all_dims_vec4, num_valid, input_rows);
 }
 
 void store_to_flat_table_value(
     at::Tensor table_ptrs, at::Tensor indices, at::Tensor table_ids,
     at::Tensor input, at::Tensor table_value_dims, at::Tensor table_emb_dims,
     int64_t max_emb_dim, bool all_dims_vec4,
-    const std::optional<at::Tensor> &num_valid = std::nullopt) {
+    const std::optional<at::Tensor> &num_valid = std::nullopt,
+    const std::optional<at::Tensor> &input_rows = std::nullopt) {
   store_to_flat_table_impl<2>(
       table_ptrs, indices, get_pointer<int64_t>(table_ids), 0, input,
-      table_value_dims, table_emb_dims, max_emb_dim, all_dims_vec4, num_valid);
+      table_value_dims, table_emb_dims, max_emb_dim, all_dims_vec4, num_valid, input_rows);
 }
 
 template <typename IndexT, typename ValueT>
@@ -1237,11 +1334,18 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("total_D") = 0, py::arg("weights") = py::none(),
         py::arg("feature_dims_vec4") = false, py::arg("grad_rows") = py::none());
 
+  m.def("gather_embedding", &gather_embedding_rows,
+        "Gather the live input rows at index into a new capacity-sized tensor.",
+        py::arg("input"), py::arg("index"), py::kw_only(),
+        py::arg("num_valid") = py::none());
   m.def("gather_embedding", &gather_embedding,
-        "Gather embedding based on index; output row out_row[i] (int32) takes "
-        "index[i] if out_row is given.",
-        py::arg("input"), py::arg("output"), py::arg("index"),
-        py::arg("out_row") = py::none());
+        "Copy live, selected rows into output. Absent row maps are identity. "
+        "found_out and the auxiliary 64-bit field update with the same selected rows.",
+        py::arg("input"), py::arg("output"), py::arg("index") = py::none(),
+        py::arg("out_row") = py::none(), py::kw_only(),
+        py::arg("num_valid") = py::none(), py::arg("mask") = py::none(),
+        py::arg("found_out") = py::none(), py::arg("src_aux") = py::none(),
+        py::arg("dst_aux") = py::none());
 
   m.def("gather_embedding_pooled", &gather_embedding_pooled,
         "Gather embedding with pooling (SUM/MEAN) based on the dedup inverse "
@@ -1284,14 +1388,16 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("table_ptrs"), py::arg("indices"), py::arg("table_id"),
         py::arg("input"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"));
+        py::arg("all_dims_vec4"), py::arg("num_valid") = py::none(),
+        py::arg("input_rows") = py::none());
 
   m.def("store_to_flat_table_value", &store_to_flat_table_value,
         "Store to flat table: 2-region copy (NumRegions=2, VALUE mode).",
         py::arg("table_ptrs"), py::arg("indices"), py::arg("table_ids"),
         py::arg("input"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"), py::arg("num_valid") = py::none());
+        py::arg("all_dims_vec4"), py::arg("num_valid") = py::none(),
+        py::arg("input_rows") = py::none());
 
   m.def("select_insert_failed_values", &select_insert_failed_values,
         "select_insert_failed_values", py::arg("indices"),

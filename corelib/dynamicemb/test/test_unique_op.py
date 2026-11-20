@@ -16,12 +16,10 @@
 import pytest
 import torch
 from dynamicemb_extensions import (
-    counted_gather,
-    counted_scatter,
-    counted_scatter_fill,
-    counted_scatter_pair_,
     expand_table_ids_cuda,
+    fill_rows,
     flagged_compact,
+    gather_embedding,
     segmented_unique_cuda,
 )
 
@@ -568,6 +566,7 @@ INT_OF_SIZE = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 ROW_CASES = [(n, torch.float32, (8,)) for n in NS] + [
     (CAP // 2, torch.bool, ()),
     (CAP // 2, torch.float16, (3,)),
+    (CAP // 2, torch.float8_e4m3fn, (32,)),
     (CAP // 2, torch.float32, (3,)),
     (CAP // 2, torch.int64, ()),
     (CAP // 2, torch.uint64, (40,)),
@@ -591,6 +590,11 @@ def _same(a, b):
 
 
 def _rand(shape, dtype):
+    if dtype == torch.float8_e4m3fn:
+        # FP8 rows can also hold raw optimizer-state bytes.
+        return torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda").view(
+            dtype
+        )
     x = torch.randint(0, 100, shape, dtype=torch.int64, device="cuda")
     if dtype == torch.uint64:
         return x.view(torch.uint64)
@@ -643,17 +647,17 @@ def test_flagged_compact_rejects_a_seventh_input():
 
 
 @pytest.mark.parametrize("n, dtype, inner", ROW_CASES, ids=str)
-def test_counted_gather(n, dtype, inner):
+def test_gather_embedding_with_device_count(n, dtype, inner):
     rows = 600
     src = _rand((rows, *inner), dtype)
     idx, sel = _garbage_idx(n, rows)
-    out = counted_gather(src, idx, _nv(n))
+    out = gather_embedding(src, idx, num_valid=_nv(n))
     assert out.dtype == dtype and out.shape == (CAP, *inner)
     assert torch.equal(_bits(out)[sel], _bits(src)[idx[sel]])
 
 
 @pytest.mark.parametrize("n, dtype, inner", ROW_CASES, ids=str)
-def test_counted_scatter(n, dtype, inner):
+def test_gather_embedding_with_output_rows(n, dtype, inner):
     shape = (CAP + 20, *inner)
     src = _rand((CAP, *inner), dtype)
     idx, sel = _garbage_idx(n, shape[0], unique=True)
@@ -661,22 +665,29 @@ def test_counted_scatter(n, dtype, inner):
     _bits(ref)[idx[sel]] = _bits(src)[sel]
 
     dst = _sentinel(shape, dtype)
-    counted_scatter(dst, idx, src, _nv(n))
+    gather_embedding(src, dst, out_row=idx, num_valid=_nv(n))
     assert _same(dst, ref)  # the garbage tail wrote nothing
     dst = _sentinel(shape, dtype)
-    counted_scatter(dst, idx[:n], src[:n], None)
+    gather_embedding(src[:n], dst, out_row=idx[:n])
     assert _same(dst, ref)
 
 
 @pytest.mark.parametrize("n", [0, 3])
-def test_counted_scatter_pair(n):
+def test_gather_embedding_slot_and_row_outputs(n):
     positions = torch.tensor([4, -1, 0, 2, HUGE], device="cuda")
     new_slots = torch.tensor([17, 18, 19, 20, 21], device="cuda")
     new_rows = torch.tensor([31, 32, 33, 34, 35], device="cuda")
     slots = torch.full((6,), -1, dtype=torch.int64, device="cuda")
     rows = torch.full_like(slots, -2)
 
-    counted_scatter_pair_(slots, rows, positions, new_slots, new_rows, _nv(n))
+    gather_embedding(
+        new_slots,
+        slots,
+        out_row=positions,
+        num_valid=_nv(n),
+        src_aux=new_rows,
+        dst_aux=rows,
+    )
 
     assert slots.tolist() == ([19, -1, -1, -1, 17, -1] if n else [-1] * 6)
     assert rows.tolist() == ([33, -2, -2, -2, 31, -2] if n else [-2] * 6)
@@ -689,16 +700,16 @@ def test_counted_scatter_pair(n):
     + [(CAP // 2, torch.bool, v) for v in (True, 2, 0)],
     ids=str,
 )
-def test_counted_scatter_fill(n, dtype, value):
+def test_fill_rows_with_device_count(n, dtype, value):
     idx, sel = _garbage_idx(n, CAP)
     ref = torch.zeros(CAP, dtype=dtype, device="cuda")
     ref[idx[sel]] = bool(value) if dtype == torch.bool else value
 
     dst = torch.zeros_like(ref)
-    counted_scatter_fill(dst, idx, value, _nv(n))
+    fill_rows(dst, value, indices=idx, num_valid=_nv(n))
     assert _same(dst, ref)  # the garbage tail wrote nothing
     dst = torch.zeros_like(ref)
-    counted_scatter_fill(dst, idx[:n], value, None)
+    fill_rows(dst, value, indices=idx[:n])
     assert _same(dst, ref)
 
 
@@ -709,14 +720,16 @@ def test_count_is_clamped_to_the_capacity(count):
     idx = torch.full((CAP + 16,), 5, device="cuda")
     idx[:CAP] = -1  # skipped
     dst = torch.zeros(CAP, dtype=torch.int64, device="cuda")
-    counted_scatter_fill(dst, idx[:CAP], 1, _nv(count))
+    fill_rows(dst, 1, indices=idx[:CAP], num_valid=_nv(count))
     assert not dst.any()
 
 
-def test_counted_scatter_fill_rejects_other_destinations():
-    with pytest.raises(RuntimeError):  # a destination is a 1-D bool or int64 tensor
-        counted_scatter_fill(
-            torch.zeros(8, 4, device="cuda"), torch.arange(8, device="cuda"), 1, None
+def test_fill_rows_rejects_3d_destination():
+    with pytest.raises(RuntimeError):
+        fill_rows(
+            torch.zeros(8, 4, 2, device="cuda"),
+            1,
+            indices=torch.arange(8, device="cuda"),
         )
 
 
@@ -727,7 +740,7 @@ def test_rows_of_strided_views():
     n, c = CAP // 2, 6
     wide = torch.randn(700, c + 4, device="cuda")
     idx, sel = _garbage_idx(n, 700)
-    out = counted_gather(wide[:, 1 : 1 + c], idx, _nv(n))
+    out = gather_embedding(wide[:, 1 : 1 + c], idx, num_valid=_nv(n))
     assert torch.equal(out[sel], wide[idx[sel], 1 : 1 + c])
 
     idx, sel = _garbage_idx(n, CAP, unique=True)
@@ -735,8 +748,48 @@ def test_rows_of_strided_views():
     dst = torch.full((CAP, c + 4), -1.0, device="cuda")
     ref = dst.clone()
     ref[idx[sel], 1 : 1 + c] = rows[sel]
-    counted_scatter(dst[:, 1 : 1 + c], idx, rows, _nv(n))
+    gather_embedding(rows, dst[:, 1 : 1 + c], out_row=idx, num_valid=_nv(n))
     assert torch.equal(dst, ref)
+
+
+@pytest.mark.parametrize("count", [None, 0, 4])
+def test_gather_embedding_merges_only_found_rows(count):
+    # Source and destination occupy disjoint columns in the same pitched allocation.
+    # The masked-out entry has an invalid destination, and only the exact-length
+    # call may visit the last two entries.
+    columns = 5
+    backing = torch.arange(6 * 13, dtype=torch.float32, device="cuda").view(6, 13)
+    source = backing[:, 1 : 1 + columns]
+    dest = backing[:, 7 : 7 + columns]
+    positions = torch.tensor([4, HUGE, 1, -1, 0, 2], device="cuda")
+    mask = torch.tensor([True, False, True, True, True, True], device="cuda")
+    scores = torch.arange(6, dtype=torch.int64, device="cuda") + (1 << 56)
+    dest_scores = torch.full_like(scores, -7)
+    dest_found = torch.tensor([False, False, False, True, False, False], device="cuda")
+
+    live = positions.numel() if count is None else count
+    selected = (mask[:live] & (positions[:live] >= 0)).nonzero().flatten()
+    rows = positions[selected]
+    expected = backing.clone()
+    expected[rows, 7 : 7 + columns] = source[selected]
+    expected_scores = dest_scores.clone()
+    expected_scores[rows] = scores[selected]
+    expected_found = dest_found.clone()
+    expected_found[rows] = True
+
+    gather_embedding(
+        source,
+        dest,
+        out_row=positions,
+        mask=mask,
+        found_out=dest_found,
+        src_aux=scores,
+        dst_aux=dest_scores,
+        num_valid=None if count is None else _nv(count),
+    )
+    torch.testing.assert_close(backing, expected, rtol=0, atol=0)
+    assert torch.equal(dest_scores, expected_scores)
+    assert torch.equal(dest_found, expected_found)
 
 
 @pytest.mark.parametrize("n", [1, BIG // 2 + 1, BIG])
@@ -752,17 +805,17 @@ def test_glue_ops_over_a_capped_grid(n):
     assert torch.equal(positions[: ref.numel()], ref)
     assert torch.equal(selected[: ref.numel()], keys[ref])
 
-    gathered = counted_gather(keys, idx, num_valid)
+    gathered = gather_embedding(keys, idx, num_valid=num_valid)
     assert torch.equal(gathered[:n], keys[idx[:n]])
 
     scattered = torch.zeros_like(keys)
-    counted_scatter(scattered, idx, keys, num_valid)
+    gather_embedding(keys, scattered, out_row=idx, num_valid=num_valid)
     ref = torch.zeros_like(keys)
     ref[idx[:n]] = keys[:n]
     assert torch.equal(scattered, ref)
 
     filled = torch.zeros_like(keys)
-    counted_scatter_fill(filled, idx, 7, num_valid)
+    fill_rows(filled, 7, indices=idx, num_valid=num_valid)
     ref = torch.zeros_like(keys)
     ref[idx[:n]] = 7
     assert torch.equal(filled, ref)
@@ -779,9 +832,9 @@ def test_ops_do_not_read_the_count():
     try:
         flagged_compact(flags, [keys, None], count)
         flagged_compact(flags, [], count)
-        counted_gather(rows, keys, count)
-        counted_scatter(rows, keys, src, count)
-        counted_scatter_fill(flags, keys, True, count)
+        gather_embedding(rows, keys, num_valid=count)
+        gather_embedding(src, rows, out_row=keys, num_valid=count)
+        fill_rows(flags, True, indices=keys, num_valid=count)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()

@@ -16,7 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
-#include "counted_ops.h"
+#include "device_count.h"
 #include "index_calculation.h"
 #include "utils.h"
 #ifdef DEMB_USE_PYBIND11
@@ -42,8 +42,9 @@ struct CountedFlag {
   bool const *flags;
   int64_t const *num_valid;
   int64_t capacity;
+  bool invert;
   __host__ __device__ __forceinline__ bool operator()(int64_t i) const {
-    return i < counted_limit(num_valid, capacity) && flags[i];
+    return i < counted_limit(num_valid, capacity) && (flags[i] != invert);
   }
 };
 
@@ -148,7 +149,7 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
 // entries from count on are undefined.
 std::tuple<at::Tensor, at::Tensor, std::vector<c10::optional<at::Tensor>>>
 flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
-                c10::optional<at::Tensor> num_valid) {
+                c10::optional<at::Tensor> num_valid, bool invert) {
 
   TORCH_CHECK(flags.is_cuda(), "flags must be on CUDA");
   TORCH_CHECK(flags.dtype() == at::kBool, "flags must be bool");
@@ -211,7 +212,7 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
   // every entry at or past it off.
   auto d_flags = thrust::make_transform_iterator(
       thrust::counting_iterator<int64_t>(0),
-      CountedFlag{flags.data_ptr<bool>(), d_num_valid, num_total});
+      CountedFlag{flags.data_ptr<bool>(), d_num_valid, num_total, invert});
   auto *d_out_idx = out_indices.data_ptr<int64_t>();
   auto *d_num_sel = num_selected.data_ptr<int64_t>();
 
@@ -269,7 +270,8 @@ void bind_index_calculation_op(py::module &m) {
         "Optional[Tensor] in inputs; None passes through. Returns (count[1] "
         "int64 on device, positions[len(flags)], [opt_tensors[len(flags)]...]); "
         "entries from count on are undefined.",
-        py::arg("flags"), py::arg("inputs"), py::arg("num_valid"));
+        py::arg("flags"), py::arg("inputs"), py::arg("num_valid"),
+        py::kw_only(), py::arg("invert") = false);
 
   m.def("segmented_sum_cuda", &dyn_emb::segmented_sum_cuda,
         "Segmented sum: output[i] = sum(data[offsets[i]:offsets[i+1]]). data "

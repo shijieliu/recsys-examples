@@ -45,6 +45,7 @@ from dynamicemb_extensions import (
     table_place_reclaimed_rows,
     table_resolve_rows,
     table_restore_reclaimed_slots,
+    table_rollback_cache_placement,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
     table_update_counter_with_layout,
@@ -175,6 +176,8 @@ class ScoredHashTable(abc.ABC):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         num_valid: Optional[torch.Tensor] = None,
+        *,
+        return_device_count: bool = False,
     ) -> Tuple:
         """
         Keys have to be unique.
@@ -183,7 +186,7 @@ class ScoredHashTable(abc.ABC):
             num_valid: as in :meth:`lookup`.
         Returns:
             (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)
-            With a device count, arrays retain capacity and the eviction count stays
+            With a device count or return_device_count, arrays retain capacity and the eviction count stays
             on device. Otherwise victims are exact slices and the eviction count is an int.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
@@ -725,7 +728,7 @@ class LinearBucketTable(ScoredHashTable):
         return out
 
     @staticmethod
-    def _counted_result(result: Tuple, capacity: int) -> Tuple:
+    def _pad_eviction_result(result: Tuple, capacity: int) -> Tuple:
         """An ``insert_and_evict*`` result computed on exact slices (the
         DEMB_DETERMINISM_MODE code), in the counted form: every array padded to
         ``capacity`` and ``num_evicted`` a device tensor. The count is a host int
@@ -946,51 +949,13 @@ class LinearBucketTable(ScoredHashTable):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         num_valid: Optional[torch.Tensor] = None,
+        *,
+        return_device_count: bool = False,
     ) -> Tuple:
-        """Return exact victims and a host count unless a device count was supplied."""
-        result = self.insert_and_evict_counted(
-            keys, table_ids, score, insert_results, score_out, num_valid
-        )
-        if num_valid is not None:
-            return result
-        indices, num_evicted, *evicted = result
-        n = int(num_evicted.item())
-        return (indices, n, *(v[:n] for v in evicted))
-
-    def insert_and_evict_counted(
-        self,
-        keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        score: ScoreArg,
-        insert_results: Optional[torch.Tensor] = None,
-        score_out: Optional[torch.Tensor] = None,
-        num_valid: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+        """Insert live keys and report evictions. A device input count or
+        `return_device_count` keeps the victim count and buffers on device.
+        Exact-length public calls return a host count and compact victims.
         """
-        Keys have to be unique.
-        Args:
-            table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
-            num_valid: as in :meth:`ScoredHashTable.lookup`; ``insert_results`` /
-                ``score_out`` are not written past ``num_valid``.
-        Returns:
-            (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)
-            in the same form for every call, with nothing read back to the host:
-            ``num_evicted`` is a one-element int64 device tensor, and ``indices``
-            and the evicted_* arrays have the capacity of ``keys``. Only the first
-            ``num_valid`` entries of ``indices`` (all of them for ``None``) and the
-            first ``num_evicted`` entries of the evicted_* arrays are defined.
-        If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
-        Under DEMB_DETERMINISM_MODE the buckets are walked in waves from the host,
-        which waits for the device; the result comes back in the same form.
-        """
-
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
 
@@ -999,22 +964,18 @@ class LinearBucketTable(ScoredHashTable):
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             n = self._host_count(num_valid, keys.numel())
-            return self._evicted_rows_of(
-                self._counted_result(
-                    self._deterministic_insert_and_evict(
-                        keys[:n],
-                        table_ids[:n],
-                        None if score_value is None else score_value[:n],
-                        policy,
-                    ),
-                    keys.numel(),
+            result = self._pad_eviction_result(
+                self._deterministic_insert_and_evict(
+                    keys[:n],
+                    table_ids[:n],
+                    None if score_value is None else score_value[:n],
+                    policy,
                 ),
-                table_ids,
-                num_valid,
+                keys.numel(),
             )
 
-        return self._evicted_rows_of(
-            table_insert_and_evict(
+        else:
+            result = table_insert_and_evict(
                 self.table_storage_,
                 self.table_bucket_offsets_,
                 self.bucket_capacity_,
@@ -1030,10 +991,14 @@ class LinearBucketTable(ScoredHashTable):
                 score_fn_key=self.score_fn_key_,
                 table_global_capacities=self.table_global_capacities_,
                 num_valid=num_valid,
-            ),
-            table_ids,
-            num_valid,
-        )
+            )
+
+        result = self._evicted_rows_of(result, table_ids, num_valid)
+        if num_valid is not None or return_device_count:
+            return result
+        indices, num_evicted, *evicted = result
+        n = int(num_evicted.item())
+        return (indices, n, *(v[:n] for v in evicted))
 
     def insert_carrying_rows(
         self,
@@ -1291,13 +1256,15 @@ class LinearBucketTable(ScoredHashTable):
         report_refused: bool = False,
         *,
         num_valid: Optional[torch.Tensor] = None,
+        backing_rows: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Insert live keys with counter-aware eviction and overflow fallback.
 
         With a device count, the six outputs retain their capacity and the
         eviction count stays on device. Omitting the count or requesting a
         refusal report returns exact slices and host counts. The report appends
-        the number of keys the cache could not place.
+        the number of keys the cache could not place. Supplying backing_rows
+        appends a bool indicating whether any live key also needs a backing row.
         """
         assert (
             self.enable_overflow_
@@ -1305,7 +1272,11 @@ class LinearBucketTable(ScoredHashTable):
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
 
+        if backing_rows is not None and not report_refused:
+            raise ValueError("backing_rows requires report_refused")
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            if backing_rows is not None:
+                raise ValueError("backing_rows requires non-deterministic insertion")
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
@@ -1319,9 +1290,16 @@ class LinearBucketTable(ScoredHashTable):
             )
             if report_refused or num_valid is None:
                 return result
-            return self._counted_result(result, keys.numel())
+            return self._pad_eviction_result(result, keys.numel())
 
-        status = keys.new_empty((3,), dtype=torch.int64) if report_refused else None
+        report_size = 4 if backing_rows is not None else 3
+        status = None
+        if report_refused:
+            # Reserve the transfer buffer before insertion changes cache membership.
+            host_counts = torch.empty(
+                report_size, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            status = keys.new_empty((report_size,), dtype=torch.int64)
         indices, num_evicted, *evicted = table_insert_and_evict(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -1344,27 +1322,60 @@ class LinearBucketTable(ScoredHashTable):
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
             insert_status=status,
+            backing_rows=backing_rows,
         )
         if num_valid is not None and not report_refused:
             return (indices, num_evicted, *evicted)
 
         if status is not None:
-            # The insertion writes the live, eviction and refusal counts together.
-            host_counts = torch.empty(
-                3, dtype=torch.int64, device="cpu", pin_memory=True
-            )
+            # Read the packed status in one stream wait.
             host_counts.copy_(status, non_blocking=True)
             torch.cuda.current_stream(keys.device).synchronize()
-            n, n_evicted, n_refused = host_counts.tolist()
-            return (
+            n, n_evicted, n_refused, *backing_missing = host_counts.tolist()
+            result = (
                 indices[:n],
                 n_evicted,
                 *(v[:n_evicted] for v in evicted),
                 n_refused,
             )
+            if backing_rows is not None:
+                return (*result, bool(backing_missing[0]))
+            return result
 
         n_evicted = int(num_evicted.item())
         return (indices, n_evicted, *(v[:n_evicted] for v in evicted))
+
+    def rollback_cache_placement(
+        self,
+        slots: torch.Tensor,
+        table_ids: torch.Tensor,
+        evicted_keys: torch.Tensor,
+        evicted_slots: torch.Tensor,
+        evicted_scores: torch.Tensor,
+        evicted_table_ids: torch.Tensor,
+    ) -> None:
+        """Undo the reservation of unique cache misses before publishing their values.
+
+        Pass the exact live slots and eviction report under the same table gate
+        as insertion. Refused entries in both lists have negative slots.
+        """
+        if not self.enable_overflow_ or self.num_scores_ != 1:
+            raise ValueError("placement rollback requires a single-score cache")
+        table_rollback_cache_placement(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            self.overflow_table_storage_,
+            self.overflow_bucket_capacity_,
+            self.overflow_bucket_sizes,
+            slots,
+            table_ids,
+            evicted_keys,
+            evicted_slots,
+            evicted_scores,
+            evicted_table_ids,
+        )
 
     def erase(
         self,

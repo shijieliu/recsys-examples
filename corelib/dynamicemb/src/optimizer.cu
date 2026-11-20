@@ -16,7 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
-#include "counted_ops.h"
+#include "device_count.h"
 #include "optimizer.h"
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
@@ -590,7 +590,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
 
 // PYTHON WRAP
 // Every update takes a trailing `num_valid` (default None: all rows are live);
-// see counted_ops.h.
+// see device_count.h.
 void bind_optimizer_kernel_op(py::module &m) {
   m.def("sgd_update_for_flat_table", &dyn_emb::sgd_update_for_flat_table,
         "SGD optimizer for multi-table buffer via table_ptrs", py::arg("grads"),

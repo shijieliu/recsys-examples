@@ -4158,6 +4158,67 @@ def test_caching_ps_spills_storage_evictions():
     torch.testing.assert_close(lookup(first), ref)
 
 
+def test_caching_ps_merges_backing_external_and_new_rows():
+    device = torch.device("cuda:0")
+    dim = 8
+    options = DynamicEmbTableOptions(
+        dim=dim,
+        max_capacity=8192,
+        init_capacity=8192,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+        caching=True,
+        local_hbm_for_values=1024,
+        external_storage=PyDictStorage,
+        initializer_args=DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.DEBUG
+        ),
+    )
+    module = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.1,
+    )
+    # Key 4 hits the cache. Key 22 exists only in the backing table, keys 11
+    # and 44 exist only in the external tier, and key 33 needs initialization.
+    warm = torch.tensor([4], device=device)
+    with torch.no_grad():
+        module(warm, torch.tensor([0, 1], device=device), scores=warm)
+    backing_keys = torch.tensor([22], device=device)
+    back_values = torch.arange(dim, device=device, dtype=torch.float32)[None, :] + 100
+    module._storage.insert(backing_keys, torch.zeros_like(backing_keys), back_values)
+    ps_keys = torch.tensor([11, 44], device=device)
+    ps_values = torch.arange(2 * dim, device=device, dtype=torch.float32).view(2, dim)
+    module._external_storage.insert(ps_keys, torch.zeros_like(ps_keys), ps_values)
+
+    keys = torch.tensor([44, 4, 22, 11, 33, 44, 22], device=device)
+    offsets = torch.tensor([0, keys.numel()], device=device)
+    scores = keys + 1000
+    with torch.no_grad():
+        actual = module(keys, offsets, scores=scores)
+    expected = torch.stack(
+        [
+            ps_values[1],
+            torch.full_like(back_values[0], 4),
+            back_values[0],
+            ps_values[0],
+            torch.full_like(back_values[0], 33),
+            ps_values[1],
+            back_values[0],
+        ]
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    recorded = {}
+    for saved_keys, _, _, saved_scores in module._storage.export_keys_values(device):
+        recorded.update(zip(saved_keys.tolist(), saved_scores.tolist()))
+    assert recorded == dict(zip(keys.tolist(), scores.tolist()))
+
+
 def test_caching_ps_rejects_no_eviction():
     """NO_EVICTION storage expands instead of evicting, so a PS below it is refused."""
     options = DynamicEmbTableOptions(
@@ -4572,6 +4633,7 @@ def test_step_host_sync_budget(layout, optimizer, pooling, admission):
         oracle.admit(keys, offsets)
     assert_tier_overflows(module, oracle)
     torch.cuda.synchronize()
+
     # Check individual steps so an extra wait on one batch cannot be averaged away.
     def check_budget(step, budget):
         for _ in range(profiled):

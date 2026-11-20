@@ -18,7 +18,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #ifndef OPTIMIZER_KERNEL_H
 #define OPTIMIZER_KERNEL_H
 
-#include "counted_limit.cuh"
+#include "device_count.cuh"
 #include "lookup_kernel.cuh"
 #include "utils.h"
 #include <cuda_fp16.h>

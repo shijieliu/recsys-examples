@@ -15,7 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
-#include "counted_ops.h"
+#include "device_count.h"
 #include "initializer.cuh"
 
 namespace py = pybind11;

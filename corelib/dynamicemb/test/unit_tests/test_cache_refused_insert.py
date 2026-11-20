@@ -17,6 +17,7 @@ written shows.
 
 import pytest
 import torch
+import dynamicemb.batched_dynamicemb_function as lookup
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -138,6 +139,50 @@ def test_a_batch_that_fits_is_not_refused():
     assert bool((state.slot_indices >= 0).all())
     counter = model._cache._state.key_index_map._ref_counter
     assert counter.sum().item() == keys.numel()
+
+
+def test_failed_backing_load_preserves_dirty_victim_and_hit_pins(monkeypatch):
+    model = make_model()
+    warm = torch.tensor([1, 10001], device="cuda")
+    offsets = warm.new_tensor([0, 2])
+    model(warm, offsets).sum().backward()  # Both cache rows are now dirty.
+
+    one_row = warm.new_tensor([0, 1])
+    in_flight = model(warm[:1], one_row)  # An earlier batch owns a pin on key 1.
+    counter = model._cache._state.key_index_map._ref_counter
+    pins = counter.clone()
+    assert pins.sum().item() == 1
+
+    # Key 1 is a cache hit. Filling the remaining slots displaces key 10001.
+    keys = torch.arange(1, CACHE_SLOTS + 1, device="cuda")
+    offsets = keys.new_tensor([0, keys.numel()])
+    load_rows = lookup.load_from_flat
+    fail_once = True
+
+    def fail_backing_load(state, *args, **kwargs):
+        nonlocal fail_once
+        if state is model._storage._state and fail_once:
+            fail_once = False
+            raise torch.cuda.OutOfMemoryError("injected backing load failure")
+        return load_rows(state, *args, **kwargs)
+
+    monkeypatch.setattr(lookup, "load_from_flat", fail_backing_load)
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="injected backing load"):
+        model.prefetch(keys, offsets)
+    torch.testing.assert_close(counter, pins)
+    in_flight.backward(torch.zeros_like(in_flight))
+    assert torch.count_nonzero(counter).item() == 0
+
+    # The retry must get fresh rows for the cold keys and the trained values for
+    # both warm keys, including the one displaced during the failed prefetch.
+    with torch.no_grad():
+        recovered = model(keys, offsets)
+        victim = model(warm[1:], one_row)
+    expected = keys.float()
+    expected[0] -= 0.25
+    torch.testing.assert_close(recovered, expected[:, None].expand(-1, DIM))
+    torch.testing.assert_close(victim, torch.full_like(victim, 10001 - 0.25))
+    assert torch.count_nonzero(counter).item() == 0
 
 
 @pytest.mark.parametrize("counted", [False, True])

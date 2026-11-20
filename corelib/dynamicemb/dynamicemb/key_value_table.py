@@ -38,10 +38,10 @@ from typing import (
 import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
-from dynamicemb._counted_callbacks import (
-    find_counted,
-    initialize_counted,
-    insert_counted,
+from dynamicemb._lookup_callbacks import (
+    find_rows,
+    initialize_rows,
+    insert_rows,
 )
 from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
     META_EMBEDDING_DIM,
@@ -94,10 +94,8 @@ from dynamicemb.types import (
 from dynamicemb.utils import checkpoint_dtype, decode_table_values, encode_table_values
 from dynamicemb_extensions import (
     EvictStrategy,
-    counted_gather,
-    counted_scatter,
-    counted_scatter_fill,
     device_timestamp,
+    gather_embedding,
     flagged_compact,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
@@ -1488,9 +1486,12 @@ def store_to_flat(
     values: torch.Tensor,
     *,
     num_valid: Optional[torch.Tensor] = None,
+    input_rows: Optional[torch.Tensor] = None,
 ) -> None:
-    """Write ``values`` into the rows ``indices``; a negative index is skipped. With
-    ``num_valid`` only the first ``num_valid`` rows are written."""
+    """Write the live values into nonnegative table rows.
+
+    With ``input_rows``, table row ``indices[i]`` takes ``values[input_rows[i]]``.
+    """
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_value(
@@ -1503,6 +1504,7 @@ def store_to_flat(
         state.emb_dim,
         state.all_dims_vec4,
         num_valid=num_valid,
+        input_rows=input_rows,
     )
 
 
@@ -1751,6 +1753,7 @@ def _find_keys(
     *,
     const_lookup: bool = False,
     return_slots: bool = False,
+    miss_inputs: Tuple[Optional[torch.Tensor], ...] = (),
 ) -> Tuple:
     """Key-only find: look up the first ``num_valid`` keys in the hash table and pick
     out the missing ones.
@@ -1764,7 +1767,7 @@ def _find_keys(
     ``founds``, ``score_out`` and ``indices`` have one entry per key (see
     :func:`_lookup_keys` for ``indices``).
 
-    ``score_input``: see :func:`_lookup_keys`.
+    Any ``miss_inputs`` are compacted with the keys and appended to the result.
     """
     if keys.dtype != state.key_index_map.key_type:
         keys = keys.to(state.key_index_map.key_type)
@@ -1784,8 +1787,11 @@ def _find_keys(
             missing_keys,
             missing_table_ids,
             missing_scores,
+            *miss_outputs,
         ),
-    ) = flagged_compact(~founds, [keys, table_ids, score_arg.value], num_valid)
+    ) = flagged_compact(
+        founds, [keys, table_ids, score_arg.value, *miss_inputs], num_valid, invert=True
+    )
     return (
         num_missing,
         missing_keys,
@@ -1796,6 +1802,7 @@ def _find_keys(
         score_out,
         indices,
         *((slots,) * return_slots),
+        *miss_outputs,
     )
 
 
@@ -1922,6 +1929,8 @@ def _insert_key_values(
     scores: Optional[torch.Tensor],
     preserve_existing: bool,
     num_valid: Optional[torch.Tensor],
+    *,
+    input_rows: Optional[torch.Tensor] = None,
 ) -> None:
     """Insert the first ``num_valid`` keys (``None``: all of them) with their
     ``values``; nothing is read back, except the count of the keys evicted when the
@@ -1943,7 +1952,9 @@ def _insert_key_values(
         indices = state.key_index_map.insert(
             keys, table_ids, score_arg, num_valid=num_valid
         )
-    store_to_flat(state, indices, table_ids, values, num_valid=num_valid)
+    store_to_flat(
+        state, indices, table_ids, values, num_valid=num_valid, input_rows=input_rows
+    )
 
 
 def _insert_and_evict_keys(
@@ -1969,8 +1980,8 @@ def _insert_and_evict_keys(
         evicted_indices,
         evicted_scores,
         evicted_table_ids,
-    ) = state.key_index_map.insert_and_evict_counted(
-        keys, table_ids, score_arg, num_valid=num_valid
+    ) = state.key_index_map.insert_and_evict(
+        keys, table_ids, score_arg, num_valid=num_valid, return_device_count=True
     )
     return (
         indices,
@@ -2858,8 +2869,11 @@ class DynamicEmbCache(Cache):
         report_refused: bool = False,
         *,
         num_valid: Optional[torch.Tensor] = None,
+        backing_rows: Optional[torch.Tensor] = None,
     ) -> Tuple:
-        """Insert live keys, optionally returning an exact refusal count (see Cache)."""
+        """Insert live keys. A placement report with backing_rows appends a bool
+        indicating whether any of those live keys still needs a backing row.
+        """
         state = self._state
         score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
         result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
@@ -2868,6 +2882,7 @@ class DynamicEmbCache(Cache):
             score_arg,
             report_refused=report_refused,
             num_valid=num_valid,
+            backing_rows=backing_rows,
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = (
@@ -3251,6 +3266,7 @@ class DynamicEmbStorage(Storage):
         preserve_existing: bool = False,
         *,
         num_valid: Optional[torch.Tensor] = None,
+        input_rows: Optional[torch.Tensor] = None,
     ) -> None:
         """Insert the first ``num_valid`` keys with their values (see
         :func:`_insert_key_values`)."""
@@ -3262,6 +3278,7 @@ class DynamicEmbStorage(Storage):
             scores,
             preserve_existing,
             num_valid,
+            input_rows=input_rows,
         )
 
     def dump(
@@ -3873,18 +3890,20 @@ class HybridStorage(Storage):
         (
             num_missing_both,
             missing_keys_both,
-            missing_indices_both,
+            _,
             missing_table_ids_both,
             missing_scores_both,
             founds_host,
             scores_host,
             indices_host,
+            global_missing_indices,
         ) = _find_keys(
             self._host,
             missing_keys_hbm,
             missing_table_ids_hbm,
             num_missing_hbm,
             missing_scores_hbm,
+            miss_inputs=(missing_indices_hbm,),
         )
         host_values = load_from_flat(
             self._host,
@@ -3893,16 +3912,16 @@ class HybridStorage(Storage):
             copy_mode=copy_mode,
             num_valid=num_missing_hbm,
         )
-        # Where (among the unique keys) the host tier had a key the HBM tier lacked.
-        found_at = torch.where(founds_host, missing_indices_hbm, -1)
-        counted_scatter(values, found_at, host_values, num_missing_hbm)
-        # What the HBM tier answered, completed with the host tier's answers, in place:
-        # the lookup allocated these tensors for this call.
-        counted_scatter_fill(founds_hbm, found_at, True, num_missing_hbm)
-        # The caller sees the score the key has, wherever it was found.
-        counted_scatter(scores_hbm, found_at, scores_host, num_missing_hbm)
-        global_missing_indices = counted_gather(
-            missing_indices_hbm, missing_indices_both, num_missing_both
+        # Update the original rows, hit flags and scores together for host-tier hits.
+        gather_embedding(
+            host_values,
+            values,
+            out_row=missing_indices_hbm,
+            num_valid=num_missing_hbm,
+            mask=founds_host,
+            found_out=founds_hbm,
+            src_aux=scores_host,
+            dst_aux=scores_hbm,
         )
         return _find_result(
             (
@@ -3958,7 +3977,10 @@ class HybridStorage(Storage):
                     missing_scores,
                 ),
             ) = flagged_compact(
-                ~founds_hbm, [unique_keys, table_ids, score_arg.value], num_valid
+                founds_hbm,
+                [unique_keys, table_ids, score_arg.value],
+                num_valid,
+                invert=True,
             )
             _, _, _, rows_host, _ = _lookup_keys(
                 self._host,
@@ -3971,8 +3993,9 @@ class HybridStorage(Storage):
                 self._host,
                 rows_host,
                 missing_table_ids,
-                counted_gather(unique_values, missing_pos, num_missing),
+                unique_values,
                 num_valid=num_missing,
+                input_rows=missing_pos,
             )
             return
 
@@ -4516,15 +4539,16 @@ def _write_back_evicted(
     if next_tier is None and EvictedItemMode.RETAIN_KEY not in st.evicted_item_mode:
         return
     num_gone, gone_pos, (gone_keys, gone_table_ids) = flagged_compact(
-        ~founds, [keys, table_ids], num_valid
+        founds, [keys, table_ids], num_valid, invert=True
     )
     if next_tier is not None:
-        insert_counted(
+        insert_rows(
             next_tier,
             gone_keys,
             gone_table_ids,
-            counted_gather(values, gone_pos, num_gone),
+            values,
             num_valid=num_gone,
+            input_rows=gone_pos,
         )
     else:
         _append_evicted(st, gone_keys, gone_table_ids, num_gone)
@@ -4571,10 +4595,10 @@ def _eval_lookup_storage(
     initializer: Callable,
     num_valid: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    (num_missing, _, missing_indices, _, _, _, _, embs) = find_counted(
+    (num_missing, _, missing_indices, _, _, _, _, embs) = find_rows(
         storage, keys, table_ids, copy_mode=CopyMode.EMBEDDING, num_valid=num_valid
     )
-    initialize_counted(
+    initialize_rows(
         initializer,
         embs,
         keys,
@@ -4606,7 +4630,7 @@ def _eval_lookup_cached(
         num_miss,
         miss_positions,
         (missing_keys, missing_table_ids),
-    ) = flagged_compact(~founds, [keys, table_ids], num_valid)
+    ) = flagged_compact(founds, [keys, table_ids], num_valid, invert=True)
     (
         num_missing_in_storage,
         _,
@@ -4616,14 +4640,14 @@ def _eval_lookup_cached(
         _,
         _,
         storage_embs,
-    ) = find_counted(
+    ) = find_rows(
         storage,
         missing_keys,
         missing_table_ids,
         copy_mode=CopyMode.EMBEDDING,
         num_valid=num_miss,
     )
-    initialize_counted(
+    initialize_rows(
         initializer,
         storage_embs,
         missing_keys,
@@ -4632,7 +4656,7 @@ def _eval_lookup_cached(
         num_valid=num_missing_in_storage,
         num_rows=num_miss,
     )
-    counted_scatter(embs, miss_positions, storage_embs, num_miss)
+    gather_embedding(storage_embs, embs, out_row=miss_positions, num_valid=num_miss)
     return embs
 
 

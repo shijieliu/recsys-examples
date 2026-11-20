@@ -17,7 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "counted_limit.cuh"
+#include "device_count.cuh"
 #include "jit/evict_comparators.cuh"
 #include "types.cuh"
 #include <cub/cub.cuh>
@@ -29,7 +29,7 @@ namespace cg = cooperative_groups;
 
 namespace dyn_emb {
 
-// PackedStatus is [live, evicted, refused].
+// PackedStatus holds [live, evicted, refused] and an optional missing-backing flag.
 enum class RefusedOutput { PinnedFlag, DeviceCount, PackedStatus };
 
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
@@ -354,7 +354,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
 // (an existing key pushed out) is collected, never Busy. Default false keeps the
 // plain-insert path (drops the victim) byte-for-byte unchanged (if constexpr).
 // `num_valid` (null: all `batch`) is the device count of live leading entries;
-// see counted_ops.h.
+// see device_count.h.
 template <typename Table, typename KernelTraits,
           typename Evictor = DefaultEvictor, bool CollectEvicted = false>
 __device__ __forceinline__ void
@@ -543,7 +543,8 @@ __device__ __forceinline__ void insert_and_evict_body(
     int32_t *__restrict__ ovf_counter,
     int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts,
     int64_t const *__restrict__ num_valid, int64_t *refused = nullptr,
-    RefusedOutput refused_output = RefusedOutput::PinnedFlag) {
+    RefusedOutput refused_output = RefusedOutput::PinnedFlag,
+    const int64_t *backing_rows = nullptr) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -577,7 +578,11 @@ __device__ __forceinline__ void insert_and_evict_body(
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
+  bool backing_missing = false;
   for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
+    if constexpr (KernelTraits::ReportRefused) {
+      if (backing_rows && backing_rows[i] < 0) backing_missing = true;
+    }
 
     KeyType key = input_keys[i];
     ScoreType score = Policy::get(score_input, i);
@@ -652,6 +657,8 @@ __device__ __forceinline__ void insert_and_evict_body(
             // Newly occupied overflow slot (locked until table_unlock_kernel):
             // clear the whole score block so LruLfu frequency restarts at 0,
             // then write the score words via the policy.
+            if (ovf_result == InsertResult::Evict)
+              final_evict_score = *ovf_bucket.reduction_score(local);
             for (int64_t s = 0; s < ovf_bucket.num_scores(); ++s)
               *ovf_bucket.scores(local, s) = ScoreType();
             score = Policy::update(ovf_bucket.scores(local), score);
@@ -739,6 +746,14 @@ __device__ __forceinline__ void insert_and_evict_body(
       insert_results[i] = UseOverflow ? final_result : result;
     }
   }
+  if constexpr (KernelTraits::ReportRefused) {
+    // The fourth status word follows the refusal count. One atomic per warp
+    // suffices even when many cache misses also need a new backing row.
+    if (backing_rows && __any_sync(0xffffffffu, backing_missing) &&
+        threadIdx.x % 32 == 0) {
+      ::atomicExch(reinterpret_cast<unsigned long long *>(refused + 1), 1ULL);
+    }
+  }
 }
 
 // AoT entry: the existing insert-and-evict kernel, using the score-word reduce
@@ -763,13 +778,13 @@ __global__ void table_insert_and_evict_kernel(
     int32_t *__restrict__ ovf_counter,
     int64_t const *__restrict__ ovf_output_offsets,
     int64_t const *__restrict__ num_valid, int64_t *refused,
-    RefusedOutput refused_output) {
+    RefusedOutput refused_output, const int64_t *backing_rows) {
   insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       evicted_counter, evicted_keys, evicted_scores, evicted_indices,
       evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
-      ovf_output_offsets, /*cur_ts=*/0, num_valid, refused, refused_output);
+      ovf_output_offsets, /*cur_ts=*/0, num_valid, refused, refused_output, backing_rows);
 }
 
 template <typename Table>
@@ -1060,8 +1075,15 @@ __forceinline__ __device__ void overflow_insert_and_evict(
       return;
     }
 
-    if (k == Bucket::empty_key()) {
-      KeyType expected = Bucket::empty_key();
+    if (k == Bucket::empty_key() || k == Bucket::reclaimed_key()) {
+      // A tombstone preserves a probe chain. Check the rest of that chain
+      // before reusing it, in case this key already lives farther along.
+      if (k == Bucket::reclaimed_key() &&
+          overflow_find(bucket, key, output_offset, pos, iter_out)) {
+        *result_out = InsertResult::Assign;
+        return;
+      }
+      KeyType expected = k;
       if (bucket.try_lock(pos, expected)) {
         *bucket.digests(pos) = Bucket::key_to_digest(key);
         atomicAdd(&bucket_sizes[bucket_id], 1);
@@ -1078,7 +1100,7 @@ __forceinline__ __device__ void overflow_insert_and_evict(
       continue;
     }
 
-    if (k == Bucket::LockedKey || k == Bucket::reclaimed_key())
+    if (k == Bucket::LockedKey)
       continue;
 
     if (counter[pos] == 0) {

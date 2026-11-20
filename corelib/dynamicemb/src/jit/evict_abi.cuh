@@ -102,7 +102,7 @@ struct EvictParams {
   // nullptr == every table hashes within its own capacity.
   const int64_t *table_global_capacities;
   // Device count of the live leading entries of the per-key arrays (nullable;
-  // null: all `batch`); see counted_ops.h.
+  // null: all `batch`); see device_count.h.
   const int64_t *num_valid;
 };
 

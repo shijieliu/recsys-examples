@@ -234,7 +234,7 @@ void demb_launch_evict(CUfunction fn, EvictParams params, int64_t batch,
   int64_t blocks = (batch + BLOCK - 1) / BLOCK;
   if (params.num_valid != nullptr) {
     // The live count sits on the device, so the grid is sized by the capacity
-    // `batch`; cap it as the AoT launches do (counted_grid in counted_ops.h,
+    // `batch`; cap it as the AoT launches do (counted_grid in device_count.h,
     // num_sms * (max_threads_per_sm / block) * 4; this file has no torch, so it
     // asks the driver) so that a short or empty batch is one cheap launch. The
     // kernels stride over the entries.

@@ -22,20 +22,20 @@ import torch
 
 
 @lru_cache(maxsize=128)
-def _declares_count(implementation):
+def _parameters(implementation):
     try:
-        return "num_valid" in inspect.signature(implementation).parameters
+        return frozenset(inspect.signature(implementation).parameters)
     except (TypeError, ValueError):
-        return False
+        return frozenset()
 
 
-def _accepts_count(callback):
+def _accepts(callback, name="num_valid"):
     # Cache the implementation so the lookup does not retain a table instance.
     if inspect.ismethod(callback):
         callback = callback.__func__
     elif not (inspect.isroutine(callback) or isinstance(callback, partial)):
         callback = type(callback).__call__
-    return _declares_count(callback)
+    return name in _parameters(callback)
 
 
 def _length(count, capacity):
@@ -54,7 +54,7 @@ def _pad(value, capacity):
     return result
 
 
-def find_counted(
+def find_rows(
     storage,
     keys,
     table_ids,
@@ -62,11 +62,11 @@ def find_counted(
     lfu_accumulated_frequency=None,
     key_scores=None,
     *,
-    num_valid
+    num_valid,
 ):
     capacity = keys.numel()
     options = {"copy_mode": copy_mode}
-    if _accepts_count(storage.find):
+    if _accepts(storage.find):
         # Built-in find preserves its exact-length public result when called
         # without a count. Lookup needs its capacity-sized device result.
         if num_valid is None:
@@ -92,18 +92,39 @@ def find_counted(
     return (count, *(_pad(value, capacity) for value in values))
 
 
-def insert_counted(
-    storage, keys, table_ids, values, scores=None, *, num_valid, preserve_existing=False
+def insert_rows(
+    storage,
+    keys,
+    table_ids,
+    values,
+    scores=None,
+    *,
+    num_valid,
+    preserve_existing=False,
+    input_rows=None,
 ):
     options = {}
-    if _accepts_count(storage.insert):
+    if _accepts(storage.insert):
         options["num_valid"] = num_valid
     else:
         n = _length(num_valid, keys.numel())
         if not n:
             return
-        keys, table_ids, values = keys[:n], table_ids[:n], values[:n]
+        keys, table_ids = keys[:n], table_ids[:n]
         scores = _prefix(scores, n)
+        if input_rows is None:
+            values = values[:n]
+        else:
+            input_rows = input_rows[:n]
+        num_valid = None
+    if input_rows is not None:
+        if _accepts(storage.insert, "input_rows"):
+            options["input_rows"] = input_rows
+        else:
+            # An external store expects dense values in the order of the keys.
+            from dynamicemb_extensions import gather_embedding
+
+            values = gather_embedding(values, input_rows, num_valid=num_valid)
     if preserve_existing:
         options["preserve_existing"] = True
     if scores is None:
@@ -111,8 +132,8 @@ def insert_counted(
     return storage.insert(keys, table_ids, values, scores, **options)
 
 
-def admit_counted(admitter, keys, table_ids, frequency, *, num_valid):
-    if _accepts_count(admitter.admit):
+def admit_keys(admitter, keys, table_ids, frequency, *, num_valid):
+    if _accepts(admitter.admit):
         return admitter.admit(keys, table_ids, frequency, num_valid=num_valid)
     capacity = keys.numel()
     n = _length(num_valid, capacity)
@@ -122,10 +143,10 @@ def admit_counted(admitter, keys, table_ids, frequency, *, num_valid):
     return _pad(mask, capacity)
 
 
-def initialize_counted(
+def initialize_rows(
     initializer, buffer, keys, table_ids, indices, *, num_valid, num_rows=None
 ):
-    if _accepts_count(initializer):
+    if _accepts(initializer):
         return initializer(buffer, keys, table_ids, indices, num_valid=num_valid)
     # indices select rows of buffer; keys and table_ids describe the entire
     # live buffer, including rows this call does not initialize.
