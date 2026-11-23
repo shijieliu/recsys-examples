@@ -14,10 +14,10 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Dict, List, Optional, Set, Type, Union, cast
+from typing import Dict, List, Optional, Set, Tuple, Type, Union, cast
 
 import torch
-from dynamicemb_extensions import DynamicEmbDataType
+from dynamicemb_extensions import DynamicEmbDataType, flagged_compact
 
 # from torchrec.distributed import ModuleShardingPlan
 from torchrec.modules.embedding_modules import (
@@ -47,6 +47,15 @@ FP8_STORAGE_SCALE = 256.0
 _FP8_E4M3_MAX = 448.0
 # The largest weight an fp8 table holds; a larger one saturates to it, silently.
 FP8_MAX_VALUE = _FP8_E4M3_MAX / FP8_STORAGE_SCALE
+
+
+def materialize_compact(
+    flags: torch.Tensor, inputs: List[Optional[torch.Tensor]], *, invert: bool = False
+) -> Tuple[int, torch.Tensor, List[Optional[torch.Tensor]]]:
+    """Return exact slices for a caller that uses the selected length on the host."""
+    count, indices, outputs = flagged_compact(flags, inputs, None, invert=invert)
+    n = int(count.item()) if indices.numel() else 0
+    return n, indices[:n], [None if t is None else t[:n] for t in outputs]
 
 
 def decode_table_values(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

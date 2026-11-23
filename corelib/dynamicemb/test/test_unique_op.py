@@ -528,18 +528,80 @@ def test_flagged_compact(setup_device, N, flag_mode, input_spec):
                 torch.randint(0, 2**60, (N,), dtype=torch.int64, device=device)
             )
 
-    h_count, indices, outputs = flagged_compact(flags, inputs)
+    count, indices, outputs = flagged_compact(flags, inputs, None)
+    assert count.device == flags.device and count.dtype == torch.int64
+    assert count.shape == (1,)
+    h_count = count.item()
     ref_count, ref_idx, ref_outputs = _flagged_compact_reference(flags, inputs)
 
     assert h_count == ref_count, f"count mismatch: {h_count} vs {ref_count}"
-    assert torch.equal(indices, ref_idx), "indices mismatch"
+    assert indices.shape == (N,)
+    assert torch.equal(indices[:h_count], ref_idx), "indices mismatch"
     assert len(outputs) == len(ref_outputs)
     for i, (out, ref) in enumerate(zip(outputs, ref_outputs)):
         if ref is None:
             assert out is None, f"output {i} should be None"
         else:
-            assert torch.equal(out, ref), f"output {i} mismatch"
+            assert out.shape == (N,)
+            assert torch.equal(out[:h_count], ref), f"output {i} mismatch"
             assert out.dtype == torch.int64, f"output {i} dtype mismatch"
+
+
+@pytest.mark.parametrize("n", [-3, 0, 1, 31, 64, 80])
+@pytest.mark.parametrize("invert", [False, True])
+def test_flagged_compact_ignores_the_tail(setup_device, n, invert):
+    capacity = 64
+    live = min(max(n, 0), capacity)
+    keys = torch.arange(capacity, device=setup_device)
+    flags = keys % 3 == 0
+    flags[live:] = not invert  # Every entry in the unused tail would be selected.
+    num_valid = torch.tensor([-1, n, -1], device=setup_device)[1:2]
+
+    count, positions, (selected, skip) = flagged_compact(
+        flags, [keys.view(torch.uint64), None], num_valid, invert=invert
+    )
+
+    ref = (flags[:live] != invert).nonzero().flatten()
+    assert count.item() == ref.numel()
+    assert torch.equal(positions[: ref.numel()], ref)
+    assert skip is None and selected.dtype == torch.uint64
+    assert torch.equal(selected[: ref.numel()].view(torch.int64), keys[ref])
+
+
+@pytest.mark.parametrize("n", [1, 2**21 + 1, 2**22])
+def test_flagged_compact_large_prefix(setup_device, n):
+    capacity = 2**22
+    keys = torch.randint(0, 1 << 40, (capacity,), device=setup_device)
+    flags = torch.rand(capacity, device=setup_device) < 0.3
+    count, positions, (selected,) = flagged_compact(
+        flags, [keys], torch.tensor([n], device=setup_device)
+    )
+    ref = flags[:n].nonzero().flatten()
+    assert count.item() == ref.numel()
+    assert torch.equal(positions[: ref.numel()], ref)
+    assert torch.equal(selected[: ref.numel()], keys[ref])
+
+
+def test_flagged_compact_rejects_a_seventh_input(setup_device):
+    flags = torch.ones(8, dtype=torch.bool, device=setup_device)
+    with pytest.raises(RuntimeError, match="at most 6"):
+        flagged_compact(flags, [torch.arange(8, device=setup_device)] * 7, None)
+
+
+def test_flagged_compact_does_not_read_the_count(setup_device):
+    keys = torch.arange(64, device=setup_device)
+    flags = keys % 2 == 0
+    n = torch.tensor([37], device=setup_device)
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        count, positions, _ = flagged_compact(flags, [keys, None], n)
+        chained, _, _ = flagged_compact(flags, [], count, invert=True)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+    assert count.item() == 19 and chained.item() == 9
+    assert torch.equal(positions[:19], keys[:37:2])
 
 
 if __name__ == "__main__":

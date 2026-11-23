@@ -85,8 +85,13 @@ from dynamicemb.types import (
     Storage,
     torch_dtype_to_np_dtype,
 )
-from dynamicemb.utils import checkpoint_dtype, decode_table_values, encode_table_values
-from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
+from dynamicemb.utils import (
+    checkpoint_dtype,
+    decode_table_values,
+    encode_table_values,
+    materialize_compact,
+)
+from dynamicemb_extensions import EvictStrategy, device_timestamp
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
@@ -1643,6 +1648,35 @@ def get_insert_score_arg(
     return ScoreArg(name=state.score_policy.name, value=scores, policy=policy)
 
 
+def _lookup_keys(
+    state: DynamicEmbTableState,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    score_input: Optional[torch.Tensor] = None,
+    *,
+    const_lookup: bool = False,
+    return_slots: bool = False,
+) -> Tuple[ScoreArg, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Look up keys and resolve their rows, optionally returning hash slots for pinning."""
+    if keys.dtype != state.key_index_map.key_type:
+        keys = keys.to(state.key_index_map.key_type)
+    score_arg = get_find_score_arg(
+        state, keys.size(0), keys.device, score_input, const_lookup=const_lookup
+    )
+    km = state.key_index_map
+    slots = None
+    if getattr(km, "enable_overflow_", False):
+        score_out, founds, indices = km.lookup_with_overflow(keys, table_ids, score_arg)
+        slots = indices  # a cache keeps slot == row
+    elif return_slots:
+        score_out, founds, indices, slots = km.lookup(
+            keys, table_ids, score_arg, return_slots=True
+        )
+    else:
+        score_out, founds, indices = km.lookup(keys, table_ids, score_arg)
+    return score_arg, score_out, founds, indices, slots
+
+
 def _find_keys(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
@@ -1663,55 +1697,39 @@ def _find_keys(
     """
     if unique_keys.dtype != state.key_index_map.key_type:
         unique_keys = unique_keys.to(state.key_index_map.key_type)
-
-    batch = unique_keys.size(0)
-    device = unique_keys.device
-
-    score_arg = get_find_score_arg(
+    score_arg, score_out, founds, indices, slots = _lookup_keys(
         state,
-        batch,
-        device,
+        unique_keys,
+        table_ids,
         score_input,
         const_lookup=const_lookup,
+        return_slots=return_slots,
     )
-
-    if batch == 0:
+    if unique_keys.numel() == 0:
+        # Empty find returns the same score dtype for all scoring policies.
+        missing_scores = (
+            torch.empty_like(unique_keys, dtype=torch.uint64)
+            if score_arg.value is not None
+            else None
+        )
         return (
             0,
-            torch.empty_like(unique_keys),
-            torch.empty(batch, dtype=torch.long, device=device),
-            torch.empty_like(table_ids),
-            torch.empty(batch, dtype=torch.uint64, device=device)
-            if score_arg.value is not None
-            else None,
-            torch.empty(batch, dtype=torch.bool, device=device),
-            torch.empty(batch, dtype=torch.int64, device=device),
-            torch.empty(batch, dtype=torch.int64, device=device),
-            *((torch.empty(batch, dtype=torch.int64, device=device),) * return_slots),
+            unique_keys,
+            indices,
+            table_ids,
+            missing_scores,
+            founds,
+            score_out,
+            indices,
+            *((slots,) * return_slots),
         )
 
-    km = state.key_index_map
-    slots = None
-    if getattr(km, "enable_overflow_", False):
-        score_out, founds, indices = km.lookup_with_overflow(
-            unique_keys, table_ids, score_arg
-        )
-        slots = indices  # a cache keeps slot == row
-    elif return_slots:
-        score_out, founds, indices, slots = km.lookup(
-            unique_keys, table_ids, score_arg, return_slots=True
-        )
-    else:
-        score_out, founds, indices = km.lookup(unique_keys, table_ids, score_arg)
-
-    missing = torch.logical_not(founds)
     (
         h_num_missing,
         missing_indices,
         (missing_keys, missing_table_ids, missing_scores),
-    ) = flagged_compact(
-        missing,
-        [unique_keys, table_ids, score_arg.value],
+    ) = materialize_compact(
+        founds, [unique_keys, table_ids, score_arg.value], invert=True
     )
 
     return (
@@ -4443,9 +4461,9 @@ def _write_back_evicted(
     evicted key when storage retains them.
     """
     st = storage._state
-    in_storage = _find_keys(st, keys, table_ids, const_lookup=True)[5]
+    _, _, in_storage, _, _ = _lookup_keys(st, keys, table_ids, const_lookup=True)
     with torch.cuda.nvtx.range("op:flagged_compact"):
-        num_present, present, (present_keys, present_tids) = flagged_compact(
+        num_present, present, (present_keys, present_tids) = materialize_compact(
             in_storage, [keys, table_ids]
         )
     with torch.cuda.nvtx.range("op:storage_insert"):
@@ -4462,8 +4480,8 @@ def _write_back_evicted(
             gone_keys, gone_tids, gone_values = keys, table_ids, values
         else:
             with torch.cuda.nvtx.range("op:flagged_compact"):
-                _, gone, (gone_keys, gone_tids) = flagged_compact(
-                    ~in_storage, [keys, table_ids]
+                _, gone, (gone_keys, gone_tids) = materialize_compact(
+                    in_storage, [keys, table_ids], invert=True
                 )
             gone_values = values[gone]
         if next_tier is not None:
@@ -4544,10 +4562,11 @@ def _eval_lookup_cached(
         cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
-    missing_mask = ~founds
-    h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(
-        missing_mask, [keys, table_ids]
-    )
+    (
+        h_num_miss,
+        miss_compact_idx,
+        (missing_keys, missing_table_ids),
+    ) = materialize_compact(founds, [keys, table_ids], invert=True)
 
     if h_num_miss == 0:
         return embs

@@ -30,6 +30,7 @@ from dynamicemb.key_value_table import (
     _append_evicted,
     _find_keys,
     _insert_and_evict_keys,
+    _lookup_keys,
     _select,
     _write_back_evicted,
     eval_lookup,
@@ -42,11 +43,10 @@ from dynamicemb.key_value_table import (
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import CopyMode, MultiTableAdmitter
-from dynamicemb.utils import decode_table_values, gradient_dtype
+from dynamicemb.utils import decode_table_values, gradient_dtype, materialize_compact
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
-    flagged_compact,
     gather_embedding,
     gather_embedding_pooled,
     get_table_range,
@@ -96,7 +96,7 @@ def segmented_unique(
     segment_range: torch.Tensor,
     evict_strategy: Optional[EvictStrategy] = None,
     frequency_counts: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Perform segmented unique operation on keys with segment_range.
 
@@ -112,10 +112,9 @@ def segmented_unique(
 
     Returns:
         Tuple of (unique_keys, reverse_indices, unique_keys_table_range,
-                  output_scores, unique_size_per_table).
-        unique_size_per_table is a CPU tensor of shape (num_tables,) with
-        per-table unique counts; total unique count is its sum or
-        unique_keys_table_range[-1].
+                  output_scores). Unique keys and any scores have input capacity.
+        Only their first unique_keys_table_range[-1] entries are live. The
+        per-table offsets and the final count are on the input device.
     """
     with torch.cuda.nvtx.range("op:segmented_unique"):
         num_keys = keys.size(0)
@@ -128,16 +127,7 @@ def segmented_unique(
             d_table_range = torch.zeros(
                 num_tables + 1, dtype=torch.int64, device=device
             )
-            unique_size_per_table = torch.zeros(
-                num_tables, dtype=torch.int64, device="cpu"
-            )
-            return (
-                empty_keys,
-                empty_reverse_indices,
-                d_table_range,
-                None,
-                unique_size_per_table,
-            )
+            return empty_keys, empty_reverse_indices, d_table_range, None
 
         is_lfu_enabled = (
             evict_strategy == EvictStrategy.KLfu if evict_strategy else False
@@ -158,25 +148,8 @@ def segmented_unique(
             freq_counters,
         ) = segmented_unique_cuda(keys, segment_range, num_tables, input_frequencies)
 
-        table_offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(table_offsets)
-        total_unique = table_offsets_cpu[num_tables].item()
-        unique_size_per_table = (
-            table_offsets_cpu[1 : num_tables + 1] - table_offsets_cpu[0:num_tables]
-        )
-
-        unique_keys_out = unique_keys[:total_unique]
-
-        output_scores = None
-        if need_frequency_output and total_unique > 0:
-            output_scores = freq_counters[:total_unique]
-
-        return (
-            unique_keys_out,
-            reverse_indices,
-            table_offsets,
-            output_scores,
-            unique_size_per_table,
-        )
+        output_scores = freq_counters if need_frequency_output else None
+        return unique_keys, reverse_indices, table_offsets, output_scores
 
 
 def largest_score_per_unique_key(
@@ -266,7 +239,7 @@ def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
         "a rehash since the prefetch is only handled for a table that stores a "
         "value row per key (DynamicEmbStorage); a cache does not rehash"
     )
-    slots = _find_keys(
+    slots = _lookup_keys(
         state,
         batch.unique_keys,
         batch.unique_table_ids,
@@ -336,10 +309,9 @@ def _apply_admission(
             missing_scores = freq_for_admission
         non_admitted_initializer = admitter.non_admitted_initializer
 
-        non_admitted_mask = ~admit_mask
         with torch.cuda.nvtx.range("op:flagged_compact"):
-            _, _, (non_admitted_indices,) = flagged_compact(
-                non_admitted_mask, [missing_indices]
+            _, _, (non_admitted_indices,) = materialize_compact(
+                admit_mask, [missing_indices], invert=True
             )
         if non_admitted_initializer is not None and non_admitted_indices.numel() > 0:
             with torch.cuda.nvtx.range("op:initializer"):
@@ -363,7 +335,7 @@ def _apply_admission(
                     table_ids_to_insert,
                     scores_to_insert,
                 ),
-            ) = flagged_compact(
+            ) = materialize_compact(
                 admit_mask,
                 [missing_keys, missing_indices, missing_table_ids, missing_scores],
             )
@@ -417,8 +389,8 @@ def _lookup_next_tier(
     if next_tier is None:
         return in_next
     with torch.cuda.nvtx.range("op:flagged_compact"):
-        num_asked, asked, (asked_keys, asked_tids) = flagged_compact(
-            ~in_storage, [miss_keys, miss_tids]
+        num_asked, asked, (asked_keys, asked_tids) = materialize_compact(
+            in_storage, [miss_keys, miss_tids], invert=True
         )
     if num_asked == 0:
         return in_next
@@ -553,7 +525,7 @@ def _prefetch_cache_path(
         # is only for admission below.
         score_input = score_source(storage._state, accumulated_frequency, key_scores)
         with torch.cuda.nvtx.range("op:storage_find"):
-            (_, _, _, _, _, st_founds, _, st_slots) = _find_keys(
+            _, _, st_founds, st_slots, _ = _lookup_keys(
                 storage._state,
                 unique_keys,
                 unique_table_ids,
@@ -572,8 +544,8 @@ def _prefetch_cache_path(
                     miss_score_input,
                     miss_slots,
                 ),
-            ) = flagged_compact(
-                ~founds,
+            ) = materialize_compact(
+                founds,
                 [
                     unique_keys,
                     unique_table_ids,
@@ -581,6 +553,7 @@ def _prefetch_cache_path(
                     score_input,
                     st_slots,
                 ],
+                invert=True,
             )
         if num_miss == 0:
             return slot_indices, None
@@ -603,7 +576,9 @@ def _prefetch_cache_path(
                     num_new,
                     new_rows,
                     (new_keys, new_tids, new_freq, new_pos),
-                ) = flagged_compact(is_new, [miss_keys, miss_tids, miss_freq, miss_pos])
+                ) = materialize_compact(
+                    is_new, [miss_keys, miss_tids, miss_freq, miss_pos]
+                )
             if num_new > 0:
                 admit_mask = admitter.admit(new_keys, new_tids, new_freq)
                 if (
@@ -616,8 +591,8 @@ def _prefetch_cache_path(
                     miss_score_input[new_rows] = new_freq
                 admitted[new_rows] = admit_mask
                 with torch.cuda.nvtx.range("op:flagged_compact"):
-                    num_refused, _, (refused_pos,) = flagged_compact(
-                        ~admit_mask, [new_pos]
+                    num_refused, _, (refused_pos,) = materialize_compact(
+                        admit_mask, [new_pos], invert=True
                     )
                 if num_refused > 0:
                     non_admitted_positions = refused_pos
@@ -629,14 +604,14 @@ def _prefetch_cache_path(
                 num_cache,
                 into_cache,
                 (cache_keys, cache_tids, cache_pos),
-            ) = flagged_compact(to_cache, [miss_keys, miss_tids, miss_pos])
+            ) = materialize_compact(to_cache, [miss_keys, miss_tids, miss_pos])
         if num_cache == 0:
             return slot_indices, non_admitted_positions
 
         # 6. Initialize the admitted-new rows, and put everything storage lacks
         # into it -- with its score -- before the cache sees it.
         with torch.cuda.nvtx.range("op:flagged_compact"):
-            num_adm, adm_rows, (adm_keys, adm_tids) = flagged_compact(
+            num_adm, adm_rows, (adm_keys, adm_tids) = materialize_compact(
                 admitted, [miss_keys, miss_tids]
             )
         if num_adm > 0:
@@ -650,7 +625,11 @@ def _prefetch_cache_path(
                 emb_dtype,
             )
         with torch.cuda.nvtx.range("op:flagged_compact"):
-            num_st, into_storage, (st_keys, st_tids, st_score_input) = flagged_compact(
+            (
+                num_st,
+                into_storage,
+                (st_keys, st_tids, st_score_input),
+            ) = materialize_compact(
                 to_cache & ~in_storage, [miss_keys, miss_tids, miss_score_input]
             )
         if num_st > 0:
@@ -944,13 +923,24 @@ def dynamicemb_prefetch(
             reverse_indices,
             unique_indices_table_range,
             lfu_accumulated_frequency,
-            unique_size_per_table,
         ) = segmented_unique(
             indices,
             indices_table_range,
             evict_strat,
             frequency_counts_int64,
         )
+        # Lookup takes exact-size arrays and storage growth uses per-table counts.
+        if indices.numel():
+            offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(unique_indices_table_range)
+            num_unique = offsets_cpu[-1].item()
+            unique_size_per_table = offsets_cpu[1:] - offsets_cpu[:-1]
+            unique_keys = unique_keys[:num_unique]
+            if lfu_accumulated_frequency is not None:
+                lfu_accumulated_frequency = lfu_accumulated_frequency[:num_unique]
+        else:
+            unique_size_per_table = torch.zeros(
+                table_num, dtype=torch.int64, device="cpu"
+            )
         unique_scores = (
             None
             if scores is None
@@ -1107,14 +1097,17 @@ def dynamicemb_eval_forward(
             unique_indices,
             reverse_indices,
             unique_indices_table_range,
-            lfu_accumulated_frequency,
-            unique_size_per_table,
+            _,
         ) = segmented_unique(
             indices,
             indices_table_range,
             evict_strat,
             frequency_counts_int64,
         )
+
+        if indices.numel():
+            num_unique = _scalar_item(unique_indices_table_range[-1])
+            unique_indices = unique_indices[:num_unique]
 
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
@@ -1265,7 +1258,7 @@ def _generic_forward_path(
             )
         key_persisted[positions_in_unique] = True
         with torch.cuda.nvtx.range("op:flagged_compact"):
-            _, persisted_unique_indices, _ = flagged_compact(
+            _, persisted_unique_indices, _ = materialize_compact(
                 key_persisted, [unique_keys]
             )
         return unique_values, persisted_unique_indices

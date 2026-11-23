@@ -37,7 +37,7 @@ from dynamicemb.types import (
     MultiTableAdmitter,
     group_key_of,
 )
-from dynamicemb_extensions import flagged_compact
+from dynamicemb.utils import materialize_compact
 
 
 class KVCounter:
@@ -299,7 +299,7 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         # This repeats a compaction the caller also makes over the same mask;
         # one pass over the missing keys is worth keeping the counter's whole
         # lifecycle in the one place that knows the counter exists.
-        _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
+        _, _, (admitted_keys, admitted_table_ids) = materialize_compact(
             admit_mask, [keys, table_ids]
         )
         if admitted_keys.numel() > 0:

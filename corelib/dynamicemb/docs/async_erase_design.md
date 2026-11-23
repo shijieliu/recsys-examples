@@ -208,19 +208,14 @@ mechanism predicts.
 ### 4.7 The GIL
 
 None of the older `dynamicemb_extensions` bindings releases the GIL. A binding that only
-**launches** holds it for microseconds. A binding that **waits for the GPU inside C++**
-(`flagged_compact`, `index_calculation.cu`: `num_selected.cpu().item<int64_t>()`) would
-hold it for as long as the stream's queued work takes, and the training thread could not
-launch a kernel meanwhile. PyTorch's own ops (`.item()`, `.cpu()`, `Event.synchronize()`)
-release it themselves.
+**launches** holds it for microseconds. The `flagged_compact` binding
+returns its selected count on the device. Callers that need exact slices read the
+count with PyTorch's `.item()`, which releases the GIL during the wait.
 
-Rules, kept by this work: every **new** binding the erase uses (`table_erase_by_score`)
-releases the GIL (`py::call_guard<py::gil_scoped_release>()`; they take only tensors and
-integers), and the worker calls only launch-only bindings and PyTorch ops. Existing
-bindings are not changed; the scan needs none of the blocking ones (counts come from
-device-side atomics, the worker waits with `Event.synchronize()`). A later change that
-makes the worker call a blocking binding (e.g. `flagged_compact` for `RETAIN_KEY`) must
-give it the same guard first.
+The erase binding `table_erase_by_score` releases the GIL with
+`py::call_guard<py::gil_scoped_release>()`. The worker gets its counts from
+device-side atomics and waits with `Event.synchronize()`. A binding that waits
+inside C++ must also release the GIL so training can keep submitting kernels.
 
 The worker's Python between two chunks still needs the GIL. Measured per chunk with
 nothing else running: 14.6 µs of worker CPU (two `.item()` of a CPU tensor, 1.0 µs each;
@@ -329,7 +324,8 @@ the way a cached copy of any key storage has evicted does.
 Why that is safe (checked, not assumed):
 
 - **Scores live only in storage.** The cache ranks by timestamp, and prefetch
-  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_cache_path`).
+  uses `_lookup_keys` for every key in storage, hits included (step 2 of
+  `_prefetch_cache_path`).
   "Score below the threshold" is decided on storage.
 - **"In storage but not in cache" and "in cache but not in storage" are both already
   legal states.** `_write_back_evicted` looks each key the cache evicts up in storage: one
