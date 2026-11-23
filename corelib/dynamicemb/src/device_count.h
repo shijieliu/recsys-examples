@@ -20,6 +20,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "device_count.cuh"
 
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <optional>
@@ -48,6 +50,23 @@ inline const int64_t *counted_num_valid_ptr(const OptionalTensor &num_valid,
   TORCH_CHECK(t.scalar_type() == at::kLong && t.numel() == 1,
               "num_valid must be a one-element int64 tensor");
   return t.data_ptr<int64_t>();
+}
+
+// Blocks of a grid-stride launch that wants `blocks` of them (to cover its
+// threads, or one per row): the same number, but capped the way the vec4
+// kernels cap theirs (4 waves of resident blocks), so that an empty batch costs
+// one cheap launch, not a block per capacity entry.
+inline int counted_grid(int64_t blocks, int block_size) {
+  const cudaDeviceProp *prop = at::cuda::getCurrentDeviceProperties();
+  // The hardware keeps at most 32 blocks of a kernel resident on one SM (a
+  // block-per-row kernel can have a block of a few threads).
+  const int64_t blocks_per_sm = std::min(
+      32, std::max(1, prop->maxThreadsPerMultiProcessor /
+                          std::max(1, block_size)));
+  const int64_t max_grid =
+      static_cast<int64_t>(prop->multiProcessorCount) * blocks_per_sm * 4;
+  return static_cast<int>(
+      std::max<int64_t>(1, std::min<int64_t>(blocks, max_grid)));
 }
 
 } // namespace dyn_emb

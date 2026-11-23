@@ -485,6 +485,75 @@ def test_hybrid_storage_export_scores_and_embeddings(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_hybrid_mapped_insert_and_refresh():
+    dim = 8
+    storage = _build_storage(
+        8192, dim, DynamicEmbScoreStrategy.TIMESTAMP, 0.125, EmbOptimType.SGD
+    )
+    storage.training = True
+    storage.set_score(1)
+    # Force both tiers to hold keys, including incoming rows the HBM tier refused.
+    n = storage._hbm.key_index_map.capacity(0) + 16
+    keys = torch.arange(1, n + 2, device="cuda")
+    tids = torch.zeros_like(keys)
+    keys[-1] = tids[-1] = -99
+    rows = torch.arange(n + 1, 0, -1, device="cuda")
+    rows[-1] = 1_000_000
+    values = torch.arange((n + 2) * dim, dtype=torch.float32, device="cuda").view(
+        -1, dim
+    )
+    storage.insert(keys, tids, values, input_rows=rows, num_valid=keys.new_tensor([n]))
+
+    held_keys, held_values, slots, _, _ = storage.incremental_dump(0, 0, None)
+    held_keys = held_keys.to(keys.device)
+    held_values = held_values.to(values.device)
+    slots = slots.to(keys.device)
+    torch.testing.assert_close(held_keys.sort().values, keys[:n])
+    torch.testing.assert_close(held_values, values[rows[held_keys - 1]])
+    hbm = held_keys[slots >= 0]
+    host = held_keys[slots < 0]
+    assert hbm.numel() >= 2 and host.numel() >= 2
+
+    # The first host hit is at input position 1 and draws from value row 6.
+    # The refresh also includes a key absent from both tiers and a poisoned tail.
+    absent = keys.new_tensor([n + 2])
+    query = torch.cat((hbm[:1], host[:1], absent, host[1:2], hbm[1:2], keys[-1:]))
+    table_ids = torch.zeros_like(query)
+    table_ids[-1] = -99
+    live = query.new_tensor([5])
+    source_rows = query.new_tensor([9, 6, 8, 0, 4, 1_000_000])
+    refreshed = -torch.arange(1, 10 * dim + 1, dtype=torch.float32, device="cuda").view(
+        10, dim
+    )
+    storage.insert(
+        query,
+        table_ids,
+        refreshed,
+        num_valid=live,
+        input_rows=source_rows,
+        preserve_existing=True,
+    )
+    storage.insert(
+        query[-1:],
+        table_ids[-1:],
+        refreshed,
+        num_valid=query.new_tensor([0]),
+        input_rows=source_rows[-1:],
+        preserve_existing=True,
+    )
+
+    count, missing, indices, _, _, found, _, result = storage.find(
+        query, table_ids, CopyMode.VALUE, num_valid=live
+    )
+    assert count.tolist() == [1] and count.is_cuda and count.dtype == torch.int64
+    assert missing.shape == query.shape and indices.shape == query.shape
+    assert missing[0].item() == n + 2 and indices[0].item() == 2
+    hits = found[:5]
+    assert hits.tolist() == [True, True, False, True, True]
+    torch.testing.assert_close(result[:5][hits], refreshed[source_rows[:5][hits]])
+
+
 def test_hybrid_incremental_dump_slot_index_tier():
     """HybridStorage.incremental_dump packs a tier bit (bit 63) into slot_index so
     the HBM and host tiers' independent key_index_map slot spaces stay

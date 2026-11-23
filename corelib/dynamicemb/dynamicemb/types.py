@@ -16,7 +16,7 @@
 import abc
 import enum
 from dataclasses import dataclass
-from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
+from typing import Generic, Iterator, List, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import torch
@@ -221,6 +221,20 @@ class ReplayStats:
 
 # make it standalone to avoid recursive references.
 class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
+    """Storage for embedding keys, scores and values.
+
+    With a device count, find and insert operate on the live prefix of every
+    per-key tensor. The count is one int64 CUDA value on the device of the
+    inputs. The unused tail may contain invalid keys, indices or table IDs.
+    Counted find returns capacity-sized arrays and a device count of misses.
+    Contiguous keys, scores, table IDs, indices and flags can feed the counted
+    compaction, gather and scatter kernels directly.
+
+    With num_valid=None every input is live. The built-in find returns a
+    Python int and exact slices for its four missing-key arrays. During lookup
+    the module passes num_valid directly to each storage implementation.
+    """
+
     @abc.abstractmethod
     def find(
         self,
@@ -229,31 +243,66 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[
-        int,
+        Union[int, torch.Tensor],
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
     ]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
-        founds: torch.Tensor
-        output_scores: torch.Tensor
-        values: torch.Tensor
-        return (
-            num_missing,
-            missing_keys,
-            missing_indices,
-            missing_scores,
-            founds,
-            output_scores,
-            values,
-        )
+        """Look up the live keys: which of them the store holds, and their values.
+
+        Args:
+            unique_keys (torch.Tensor): ``[N]`` keys. A training step passes the unique
+                keys of the batch, unique within each table; the evaluation of a table
+                that is not pooled passes its raw ids, repeats included, so answer
+                every entry, a repeat as any other.
+            table_ids (torch.Tensor): ``[N]`` int64, the table each key belongs to.
+            copy_mode (CopyMode): which columns of a row ``values`` holds: the
+                embedding only (``EMBEDDING``) or the whole row, the embedding and its
+                optimizer states (``VALUE``).
+            lfu_accumulated_frequency (Optional[torch.Tensor]): ``[N]`` how many times
+                the batch had each key, for a store that ranks its keys by frequency.
+            key_scores (Optional[torch.Tensor]): ``[N]`` the score the input gave each
+                key, for a store that ranks its keys by the score of the input;
+                ``None`` for a table that takes no score per key.
+            num_valid (Optional[torch.Tensor]): how many leading entries of the
+                ``[N]`` arrays are live; ``None``: all of them.
+
+        Returns:
+            A tuple of eight. Of the ``[N]`` arrays only the first ``num_valid``
+            entries are defined, and of the ``missing_*`` ones only the first
+            ``num_missing``.
+
+            - num_missing (torch.Tensor): one-element int64 CUDA tensor, how many of
+              the live keys were not found. With an exact-length call this is a
+              Python int and all four missing arrays are sliced to that length.
+            - missing_keys (torch.Tensor): ``[N]`` the keys that were not found, in the
+              order of the input.
+            - missing_indices (torch.Tensor): ``[N]`` int64, where those keys are in
+              ``unique_keys``.
+            - missing_table_ids (torch.Tensor): ``[N]`` int64, their table ids.
+            - missing_scores (Optional[torch.Tensor]): ``[N]`` the score each of them
+              is to be inserted with (what the store ranks by), or ``None`` when there
+              is none for the caller to carry.
+            - founds (torch.Tensor): ``[N]`` bool, True where the key was found.
+            - output_scores (torch.Tensor): ``[N]`` int64, the score a found key has
+              after this lookup.
+            - values (torch.Tensor): ``[N, max_dim]`` of ``embedding_dtype()``, the rows
+              of the keys that were found: ``max_dim`` is ``max_embedding_dim()`` for
+              ``CopyMode.EMBEDDING`` and ``max_value_dim()`` for ``CopyMode.VALUE``,
+              and the columns are laid out as :class:`CopyMode` says, each region
+              padded whatever a table's own ``embedding_dim``. The row of a key that
+              was not found is not written. The step writes into this tensor (it
+              initializes the rows of the new keys, resets their optimizer states and,
+              in the backward, applies the gradients to the rows), so it has to be a
+              tensor of its own, not a view of the store's memory.
+        """
 
     @abc.abstractmethod
     def insert(
@@ -263,8 +312,30 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
+        input_rows: Optional[torch.Tensor] = None,
     ) -> None:
-        pass
+        """Insert the live keys with their values, or refresh the rows they have.
+
+        Args:
+            keys (torch.Tensor): ``[N]`` keys, unique within each table.
+            table_ids (torch.Tensor): ``[N]`` int64, the table each key belongs to.
+            values (torch.Tensor): source rows of width ``max_value_dim`` in
+                ``CopyMode.VALUE`` layout. The buffer belongs to the caller.
+            input_rows (Optional[torch.Tensor]): ``[N]`` int64 source row indices.
+                Live key ``i`` takes ``values[input_rows[i]]``, or ``values[i]``
+                when omitted. Only the first ``num_valid`` indices are live.
+                Their values can refer to any row in the source buffer.
+            scores (Optional[torch.Tensor]): ``[N]`` the score to insert each key with,
+                as :meth:`find` handed it out in ``missing_scores``; ``None``: the
+                store's own default.
+            preserve_existing (bool): the keys are ones the store already holds and
+                this writes their updated rows back: it keeps the scores they have
+                instead of assigning new ones. A key it does not hold may be ignored.
+            num_valid (Optional[torch.Tensor]): how many leading entries of the
+                ``[N]`` arrays are live; ``None``: all of them.
+        """
 
     @abc.abstractmethod
     def dump(
@@ -376,21 +447,44 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
 
 
 class Cache(abc.ABC):
+    """The slot-addressed cache in front of the backing storage.
+
+    Lookup and insertion accept a device count of live entries in
+    capacity-sized key and table ID arrays. Omitting the count means every
+    entry is live. The prefetch pins and releases slots using DynamicEmbCache's
+    reference counters.
+    """
+
     @abc.abstractmethod
     def lookup(
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lookup with overflow fallback.
 
+        Args:
+            unique_keys (torch.Tensor): ``[N]`` keys. A training step passes the unique
+                keys of the batch, unique within each table; the evaluation of a table
+                that is not pooled passes its raw ids, repeats included, so answer
+                every entry, a repeat as any other.
+            table_ids (torch.Tensor): ``[N]`` int64, the table each key belongs to.
+            lfu_accumulated_frequency (Optional[torch.Tensor]): ``[N]`` how many times
+                the batch had each key.
+            num_valid (Optional[torch.Tensor]): how many leading entries of the
+                ``[N]`` arrays are live; ``None``: all of them.
+
         Returns:
-            score_out: Output scores.
-            founds: Boolean tensor indicating which keys were found.
-            indices: Slot indices (``-1`` for keys not found).
+            Three ``[N]`` arrays, of which only the first ``num_valid`` entries are
+            defined.
+
+            - score_out (torch.Tensor): int64, output scores.
+            - founds (torch.Tensor): bool, True for the keys that were found.
+            - indices (torch.Tensor): int64, slot indices (``-1`` for keys not found).
         """
-        ...
 
     @abc.abstractmethod
     def insert_and_evict(
@@ -399,16 +493,30 @@ class Cache(abc.ABC):
         table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
         report_refused: bool = False,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Insert with counter-aware eviction and overflow fallback.
 
+        Args:
+            keys (torch.Tensor): ``[N]`` keys, unique within each table.
+            table_ids (torch.Tensor): ``[N]`` int64, the table each key belongs to.
+            scores (Optional[torch.Tensor]): ``[N]`` the score to insert each key with;
+                ``None``: the cache's own ranking.
+            num_valid (Optional[torch.Tensor]): how many leading entries of the
+                ``[N]`` arrays are live; ``None``: all of them.
+
         Returns:
-            indices, num_evicted, evicted_keys, evicted_indices,
-            evicted_scores, evicted_table_ids; with ``report_refused``, then
-            num_refused: the keys it could not place (among the evicted ones,
-            with a negative index), known on the host once num_evicted is.
+            (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores,
+            evicted_table_ids). A negative victim index means the incoming key
+            could not be placed. With a device count, arrays retain capacity and
+            num_evicted stays on device. Without a count, the victims are
+            sliced to their exact length and num_evicted is an int.
+            Requesting report_refused also returns exact slices, including
+            the live prefix of indices, and appends an exact refusal count.
+            The normal path reads the live length, evictions, and refusals in one
+            host wait.
         """
-        ...
 
     @abc.abstractmethod
     def reset(
@@ -416,11 +524,16 @@ class Cache(abc.ABC):
     ) -> None:
         pass
 
+    @property
     @abc.abstractmethod
-    def cache_metrics(
-        self,
-    ) -> torch.Tensor:
-        pass
+    def cache_metrics(self) -> Optional[torch.Tensor]:
+        """Host tensor of lookup keys, lookup hits, insert keys and evictions.
+
+        Returns None while metrics are disabled. Enabling metrics reads the
+        hit count during lookup. Insert records the counts already read for
+        exact results or a refusal report, and reads them for counted results.
+        Accessing this property only returns the recorded values.
+        """
 
     @abc.abstractmethod
     def set_record_cache_metrics(self, record: bool) -> None:
@@ -431,6 +544,11 @@ class Counter(abc.ABC):
     """
     Interface of a counter table which maps a key to a counter.
     Supports multi-table via table_ids parameter.
+
+    ``add`` and ``erase`` are called with the arrays of a step: per-key arrays of a
+    capacity ``N`` and ``num_valid``, the number of live leading entries, under the
+    rules of :class:`Storage` (what lies past ``num_valid`` is undefined and never
+    read; no wait for the device).
     """
 
     @abc.abstractmethod
@@ -439,28 +557,42 @@ class Counter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Add keys with frequencies to the `Counter` and get accumulated counter of each key.
 
         Args:
-            keys (torch.Tensor): The input keys, should be unique keys.
-            table_ids (torch.Tensor): The table id for each key.
-            frequencies (torch.Tensor): The input frequencies.
+            keys (torch.Tensor): The input keys, ``[N]``, should be unique keys.
+            table_ids (torch.Tensor): The table id for each key, ``[N]``.
+            frequencies (torch.Tensor): The input frequencies, ``[N]``.
+            num_valid (Optional[torch.Tensor]): One-element int64 CUDA tensor, how
+                many leading entries of the three arrays are live; ``None``: all.
 
         Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state for the input keys.
+            accumulated_frequencies (torch.Tensor): the frequencies' state for the
+                input keys, ``[N]`` int64; the entries past ``num_valid`` are undefined.
         """
         ...
 
     @abc.abstractmethod
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
+    ) -> None:
         """
         Erase keys from the `Counter`.
 
         Args:
-            keys (torch.Tensor): The input keys to be erased.
-            table_ids (torch.Tensor): The table id for each key.
+            keys (torch.Tensor): The input keys to be erased, ``[N]``.
+            table_ids (torch.Tensor): The table id for each key, ``[N]``.
+            num_valid (Optional[torch.Tensor]): One-element int64 CUDA tensor, how
+                many leading entries of ``keys`` and ``table_ids`` are live; the others
+                are not erased and not read. ``None``: all.
         """
 
     @abc.abstractmethod
@@ -582,13 +714,19 @@ class MultiTableAdmitter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
+        The arrays are those of a step: per-key arrays of a capacity ``N`` and
+        ``num_valid``, the number of live leading entries, under the rules of
+        :class:`Storage`.
+
         Args:
-            keys (torch.Tensor): The keys to decide on, deduplicated.
-            table_ids (torch.Tensor): The table each key belongs to. One module
-                spans several, so a decision may be made per table.
+            keys (torch.Tensor): The keys to decide on, deduplicated, ``[N]``.
+            table_ids (torch.Tensor): The table each key belongs to, ``[N]``. One
+                module spans several, so a decision may be made per table.
             frequencies (Optional[torch.Tensor]): How often each key occurred in
                 *this batch*, where the module counts occurrences at all; None
                 means treat each key as one occurrence. On input an increment,
@@ -600,9 +738,14 @@ class MultiTableAdmitter(abc.ABC):
                 then takes as the score the key is inserted with. An admitter
                 that keeps no count leaves it as it is. Overwrite it with
                 nothing but that total.
+            num_valid (Optional[torch.Tensor]): One-element int64 CUDA tensor, how
+                many leading entries of the arrays are live; ``None``: all of them.
+                What lies past them is undefined: it must not be read or used as an
+                index, and the call must not wait for the device.
 
         Returns:
-            torch.Tensor: Boolean mask over `keys`, True where admitted.
+            torch.Tensor: Boolean mask over `keys`, ``[N]``, True where admitted. Only
+            its first ``num_valid`` entries are read; the others may hold anything.
         """
 
     def state(self) -> Optional[Counter]:
@@ -625,5 +768,8 @@ class MultiTableAdmitter(abc.ABC):
         The module does the calling, so buffer layout stays out of an
         admitter's business, and which of the two writes them is settled once,
         when the admitter is built, and not renegotiated on every batch.
+
+        The module calls initializer(buffer, keys, table_ids, indices,
+        num_valid=count). Only the first count indices select rows to initialize.
         """
         return None

@@ -63,3 +63,16 @@ def test_without_frequencies_each_key_counts_once_and_nothing_is_handed_back():
     keys, table_ids = _tensor([1, 2]), _tensor([0, 0])
     assert admitter.admit(keys, table_ids).tolist() == [False, False]
     assert admitter.admit(keys, table_ids).tolist() == [True, True]
+
+
+def test_admission_writes_running_totals_only_to_live_frequencies():
+    admitter = _admitter(threshold=3)
+    keys = _tensor([11, 22, 33])
+    table_ids = _tensor([0, 0, 0])
+    live = _tensor([2])
+    admitter.admit(keys, table_ids, _tensor([1, 2, 0]), num_valid=live)
+
+    frequencies = _tensor([2, 2, -17])
+    admitted = admitter.admit(keys, table_ids, frequencies, num_valid=live)
+    assert admitted[:2].tolist() == [True, True]
+    assert frequencies.tolist() == [3, 4, -17]
