@@ -45,6 +45,7 @@ from dynamicemb_extensions import (
     table_place_reclaimed_rows,
     table_resolve_rows,
     table_restore_reclaimed_slots,
+    table_rollback_cache_placement,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
     table_update_counter_with_layout,
@@ -1255,13 +1256,15 @@ class LinearBucketTable(ScoredHashTable):
         report_refused: bool = False,
         *,
         num_valid: Optional[torch.Tensor] = None,
+        backing_rows: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Insert live keys with counter-aware eviction and overflow fallback.
 
         With a device count, the six outputs retain their capacity and the
         eviction count stays on device. Omitting the count or requesting a
         refusal report returns exact slices and host counts. The report appends
-        the number of keys the cache could not place.
+        the number of keys the cache could not place. Supplying backing_rows
+        appends a bool indicating whether any live key also needs a backing row.
         """
         assert (
             self.enable_overflow_
@@ -1269,7 +1272,11 @@ class LinearBucketTable(ScoredHashTable):
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
 
+        if backing_rows is not None and not report_refused:
+            raise ValueError("backing_rows requires report_refused")
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            if backing_rows is not None:
+                raise ValueError("backing_rows requires non-deterministic insertion")
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
@@ -1285,13 +1292,14 @@ class LinearBucketTable(ScoredHashTable):
                 return result
             return self._pad_eviction_result(result, keys.numel())
 
+        report_size = 4 if backing_rows is not None else 3
         status = None
         if report_refused:
             # Reserve the transfer buffer before insertion changes cache membership.
             host_counts = torch.empty(
-                3, dtype=torch.int64, device="cpu", pin_memory=True
+                report_size, dtype=torch.int64, device="cpu", pin_memory=True
             )
-            status = keys.new_empty((3,), dtype=torch.int64)
+            status = keys.new_empty((report_size,), dtype=torch.int64)
         indices, num_evicted, *evicted = table_insert_and_evict(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -1314,6 +1322,7 @@ class LinearBucketTable(ScoredHashTable):
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
             insert_status=status,
+            backing_rows=backing_rows,
         )
         if num_valid is not None and not report_refused:
             return (indices, num_evicted, *evicted)
@@ -1322,16 +1331,51 @@ class LinearBucketTable(ScoredHashTable):
             # Read the packed status in one stream wait.
             host_counts.copy_(status, non_blocking=True)
             torch.cuda.current_stream(keys.device).synchronize()
-            n, n_evicted, n_refused = host_counts.tolist()
-            return (
+            n, n_evicted, n_refused, *backing_missing = host_counts.tolist()
+            result = (
                 indices[:n],
                 n_evicted,
                 *(v[:n_evicted] for v in evicted),
                 n_refused,
             )
+            if backing_rows is not None:
+                return (*result, bool(backing_missing[0]))
+            return result
 
         n_evicted = int(num_evicted.item())
         return (indices, n_evicted, *(v[:n_evicted] for v in evicted))
+
+    def rollback_cache_placement(
+        self,
+        slots: torch.Tensor,
+        table_ids: torch.Tensor,
+        evicted_keys: torch.Tensor,
+        evicted_slots: torch.Tensor,
+        evicted_scores: torch.Tensor,
+        evicted_table_ids: torch.Tensor,
+    ) -> None:
+        """Undo the reservation of unique cache misses before publishing their values.
+
+        Pass the exact live slots and eviction report under the same table gate
+        as insertion. Refused entries in both lists have negative slots.
+        """
+        if not self.enable_overflow_ or self.num_scores_ != 1:
+            raise ValueError("placement rollback requires a single-score cache")
+        table_rollback_cache_placement(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            self.overflow_table_storage_,
+            self.overflow_bucket_capacity_,
+            self.overflow_bucket_sizes,
+            slots,
+            table_ids,
+            evicted_keys,
+            evicted_slots,
+            evicted_scores,
+            evicted_table_ids,
+        )
 
     def erase(
         self,

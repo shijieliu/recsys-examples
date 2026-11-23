@@ -84,13 +84,18 @@ std::vector<int64_t> offsets_to_table_features_offsets(
 // gather, and an output row map can place a lookup directly into existing rows.
 using MaybeTensor = std::optional<at::Tensor>;
 
+static void check_row_vector(const at::Tensor &t, at::Device device,
+                             int64_t size, const char *name) {
+  TORCH_CHECK(t.device() == device && t.dim() == 1 && t.is_contiguous() &&
+                  t.numel() == size,
+              name, " must be a contiguous vector of length ", size,
+              " on the device of the rows");
+}
+
 static void read_row_map(const MaybeTensor &map, int64_t size, at::Device device,
                          const int64_t *&longs, const int32_t *&ints) {
   if (!map) return;
-  TORCH_CHECK(map->device() == device && map->dim() == 1 && map->is_contiguous() &&
-                  map->numel() == size,
-              "row index must be a contiguous vector of length ", size,
-              " on the device of the rows");
+  check_row_vector(*map, device, size, "row index");
   if (map->scalar_type() == at::kInt) {
     ints = map->data_ptr<int32_t>();
   } else {
@@ -107,7 +112,9 @@ static bool embedding_dtype(at::ScalarType dtype) {
 
 void gather_embedding(at::Tensor input, at::Tensor output,
                       const MaybeTensor &index, const MaybeTensor &out_row,
-                      const MaybeTensor &num_valid) {
+                      const MaybeTensor &num_valid, const MaybeTensor &mask,
+                      const MaybeTensor &found_out, const MaybeTensor &src_aux,
+                      const MaybeTensor &dst_aux) {
   const auto device = input.device();
   TORCH_CHECK(input.is_cuda() && output.device() == device,
               "input and output must be on the same CUDA device");
@@ -131,6 +138,31 @@ void gather_embedding(at::Tensor input, at::Tensor output,
   rows.num_valid = counted_num_valid_ptr(num_valid, device);
   read_row_map(index, rows.capacity, device, rows.src64, rows.src32);
   read_row_map(out_row, rows.capacity, device, rows.dst64, rows.dst32);
+  if (mask) {
+    check_row_vector(*mask, device, rows.capacity, "mask");
+    if (mask->scalar_type() == at::kBool) {
+      rows.mask = mask->data_ptr<bool>();
+    } else {
+      TORCH_CHECK(mask->scalar_type() == at::kLong,
+                  "mask must hold bool flags or int64 slots (negative means missing)");
+      rows.valid_slots = mask->data_ptr<int64_t>();
+    }
+  }
+  if (found_out) {
+    check_row_vector(*found_out, device, rows.output_rows, "found_out");
+    rows.found_out = found_out->data_ptr<bool>();
+  }
+  TORCH_CHECK(src_aux.has_value() == dst_aux.has_value(),
+              "src_aux and dst_aux must be supplied together");
+  if (src_aux) {
+    check_row_vector(*src_aux, device, rows.input_rows, "src_aux");
+    check_row_vector(*dst_aux, device, rows.output_rows, "dst_aux");
+    TORCH_CHECK((src_aux->scalar_type() == at::kLong || src_aux->scalar_type() == at::kUInt64)
+                && src_aux->scalar_type() == dst_aux->scalar_type(),
+                "src_aux and dst_aux must both be int64 or both be uint64");
+    rows.src_aux = static_cast<const uint64_t *>(src_aux->data_ptr());
+    rows.dst_aux = static_cast<uint64_t *>(dst_aux->data_ptr());
+  }
 
   const bool raw = input.scalar_type() == output.scalar_type();
   TORCH_CHECK(raw || (embedding_dtype(input.scalar_type()) && embedding_dtype(output.scalar_type())),
@@ -151,7 +183,7 @@ static at::Tensor gather_embedding_rows(at::Tensor input, at::Tensor index,
   auto shape = input.sizes().vec();
   shape[0] = index.numel();
   auto output = at::empty(shape, input.options());
-  gather_embedding(input, output, index, {}, num_valid);
+  gather_embedding(input, output, index, {}, num_valid, {}, {}, {}, {});
   return output;
 }
 
@@ -1307,10 +1339,13 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("input"), py::arg("index"), py::kw_only(),
         py::arg("num_valid") = py::none());
   m.def("gather_embedding", &gather_embedding,
-        "Copy live rows into output. Absent row maps are identity.",
+        "Copy live, selected rows into output. Absent row maps are identity. "
+        "found_out and the auxiliary 64-bit field update with the same selected rows.",
         py::arg("input"), py::arg("output"), py::arg("index") = py::none(),
         py::arg("out_row") = py::none(), py::kw_only(),
-        py::arg("num_valid") = py::none());
+        py::arg("num_valid") = py::none(), py::arg("mask") = py::none(),
+        py::arg("found_out") = py::none(), py::arg("src_aux") = py::none(),
+        py::arg("dst_aux") = py::none());
 
   m.def("gather_embedding_pooled", &gather_embedding_pooled,
         "Gather embedding with pooling (SUM/MEAN) based on the dedup inverse "

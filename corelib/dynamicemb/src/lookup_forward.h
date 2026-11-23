@@ -87,16 +87,31 @@ void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
 }
 
 // Source and destination row maps are optional. A null map is the identity.
+// A mask applies to the input sequence before either map is read.
 struct RowMapping {
   int64_t capacity, input_rows, output_rows;
   const int64_t *num_valid;
   const int64_t *src64, *dst64;
   const int32_t *src32, *dst32;
+  const bool *mask;
+  const int64_t *valid_slots;
+  bool *found_out;
+  const uint64_t *src_aux;
+  uint64_t *dst_aux;
 
-  DEVICE_INLINE bool resolve(int64_t i, int64_t &src, int64_t &dst) const {
+  DEVICE_INLINE bool resolve(int64_t i, bool first_lane, int64_t &src,
+                             int64_t &dst) const {
+    if ((mask && !mask[i]) || (valid_slots && valid_slots[i] < 0))
+      return false;
     src = src64 ? src64[i] : (src32 ? src32[i] : i);
     dst = dst64 ? dst64[i] : (dst32 ? dst32[i] : i);
-    return src >= 0 && src < input_rows && dst >= 0 && dst < output_rows;
+    if (src < 0 || src >= input_rows || dst < 0 || dst >= output_rows)
+      return false;
+    if (first_lane) {
+      if (found_out) found_out[dst] = true;
+      if (dst_aux) dst_aux[dst] = src_aux[src];
+    }
+    return true;
   }
 };
 

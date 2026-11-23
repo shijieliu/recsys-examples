@@ -4706,7 +4706,7 @@ def test_step_host_sync_budget(layout, optimizer, pooling, admission):
             counts = blocking_syncs(step, 1)
             assert sum(counts.values()) <= budget, counts
 
-    budget = int(layout == "cache")
+    budget = int(layout in ("hbm", "cache"))
     check_budget(train_step, budget)
 
     def no_grad_step() -> None:

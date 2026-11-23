@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, ContextManager, Optional, Tuple
@@ -20,7 +21,7 @@ from typing import Callable, ContextManager, Optional, Tuple
 import torch
 from dynamicemb.async_erase import table_section
 from dynamicemb.dynamicemb_config import EvictedItemMode
-from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb.initializer import _INITIALIZERS, MultiTableInitializer
 from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
@@ -246,10 +247,9 @@ def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
     )[-1]
     # Rejected keys keep their negative slots, even if a later prefetch admitted
     # them. Only slots refreshed for this batch participate in unpinning.
-    num_pinned, pinned, (refreshed,) = flagged_compact(
-        batch.slot_indices >= 0, [slots], batch.num_unique
+    gather_embedding(
+        slots, batch.slot_indices, mask=batch.slot_indices, num_valid=batch.num_unique
     )
-    gather_embedding(refreshed, batch.slot_indices, out_row=pinned, num_valid=num_pinned)
     batch.key_map_generation = state.key_map_generation
 
 
@@ -399,10 +399,15 @@ def _lookup_next_tier(
             num_valid=num_asked,
         )
     found, found_values = result[5], result[7]
-    # Match the lower tier's hit rows to their positions in the miss buffer.
-    num_hits, hit_rows, (miss_rows,) = flagged_compact(found, [asked], num_asked)
-    gather_embedding(found_values, values, hit_rows, miss_rows, num_valid=num_hits)
-    fill_rows(in_next, True, indices=miss_rows, num_valid=num_hits)
+    # A lower-tier hit supplies both the value and the presence flag at asked[j].
+    gather_embedding(
+        found_values,
+        values,
+        out_row=asked,
+        num_valid=num_asked,
+        mask=found,
+        found_out=in_next,
+    )
     return in_next
 
 
@@ -519,7 +524,7 @@ def _prefetch_cache_path(
             )
         cache.increment_counter(slot_indices, unique_table_ids, num_valid=num_unique)
 
-        placing = False
+        placement = None
         try:
             # 2. Storage is the only place scores live: a key-only lookup of *every*
             # key -- hits included, and even when nothing missed -- updates its score
@@ -558,6 +563,36 @@ def _prefetch_cache_path(
                     invert=True,
                 )
 
+            # With no admission or external callbacks, every miss needs a cache slot.
+            # A cache hit already has its pin, and the backing lookup updated its score.
+            # Reserve before row handling so this one wait can also skip that work.
+            needs_backing_insert = True
+            cache_tids = miss_tids
+            if (
+                admitter is None
+                and external_storage is None
+                and type(storage) is DynamicEmbStorage
+                and type(initializer) in _INITIALIZERS.values()
+                and os.environ.get("DEMB_DETERMINISM_MODE") is None
+            ):
+                with torch.cuda.nvtx.range("op:cache_insert_evict"):
+                    *placement, needs_backing_insert = cache.insert_and_evict(
+                        miss_keys,
+                        miss_tids,
+                        report_refused=True,
+                        num_valid=num_miss,
+                        backing_rows=miss_rows,
+                    )
+                attempted = placement[0].numel()
+                if attempted == 0:
+                    return slot_indices, None, None
+                miss_keys = miss_keys[:attempted]
+                miss_tids = miss_tids[:attempted]
+                miss_rows = miss_rows[:attempted]
+                miss_pos = miss_pos[:attempted]
+                if miss_score_input is not None:
+                    miss_score_input = miss_score_input[:attempted]
+
             num_cache, cache_keys, cache_tids, cache_pos = (
                 num_miss,
                 miss_keys,
@@ -578,121 +613,128 @@ def _prefetch_cache_path(
                 copy_mode=CopyMode.VALUE,
                 num_valid=num_miss,
             )
-            # A missing backing row is -1. With no lower tier this mask selects both
-            # the rows to initialize and the keys to insert into storage.
-            in_next = None
-            admitted = miss_rows < 0
-            if external_storage is not None:
-                in_next = _lookup_next_tier(
-                    external_storage,
-                    miss_keys,
-                    miss_tids,
-                    admitted,
-                    values,
-                    num_miss,
-                )
-                admitted = admitted & ~in_next
-
-            # 5. Existing keys were previously admitted. Ask only about new ones.
-            if admitter is not None:
-                with torch.cuda.nvtx.range("op:compact"):
-                    (
-                        num_new,
-                        new_rows,
-                        (new_keys, new_tids, new_freq, new_pos),
-                    ) = flagged_compact(
+            if needs_backing_insert:
+                # A missing backing row is -1. With no lower tier this mask selects both
+                # the rows to initialize and the keys to insert into storage.
+                in_next = None
+                admitted = miss_rows < 0
+                if external_storage is not None:
+                    in_next = _lookup_next_tier(
+                        external_storage,
+                        miss_keys,
+                        miss_tids,
                         admitted,
-                        [miss_keys, miss_tids, miss_freq, miss_pos],
+                        values,
                         num_miss,
                     )
-                admit_mask = admitter.admit(
-                    new_keys, new_tids, new_freq, num_valid=num_new
-                )
-                held = ~admitted
-                gather_embedding(admit_mask, admitted, out_row=new_rows, num_valid=num_new)
-                if (
-                    storage._state.evict_strategy == EvictStrategy.KLfu
-                    and new_freq is not None
-                    and miss_score_input is not None
-                ):
+                    admitted = admitted & ~in_next
+
+                # 5. Existing keys were previously admitted. Ask only about new ones.
+                if admitter is not None:
+                    with torch.cuda.nvtx.range("op:compact"):
+                        (
+                            num_new,
+                            new_rows,
+                            (new_keys, new_tids, new_freq, new_pos),
+                        ) = flagged_compact(
+                            admitted,
+                            [miss_keys, miss_tids, miss_freq, miss_pos],
+                            num_miss,
+                        )
+                    admit_mask = admitter.admit(
+                        new_keys, new_tids, new_freq, num_valid=num_new
+                    )
+                    held = ~admitted
+                    # Publish admission decisions and the LFU totals for the same new rows.
+                    carry_frequency = (
+                        storage._state.evict_strategy == EvictStrategy.KLfu
+                        and new_freq is not None
+                        and miss_score_input is not None
+                    )
                     gather_embedding(
-                        new_freq, miss_score_input, out_row=new_rows, num_valid=num_new
+                        admit_mask,
+                        admitted,
+                        out_row=new_rows,
+                        num_valid=num_new,
+                        src_aux=new_freq if carry_frequency else None,
+                        dst_aux=miss_score_input if carry_frequency else None,
                     )
-                with torch.cuda.nvtx.range("op:compact"):
-                    num_refused, _, (refused_pos,) = flagged_compact(
-                        admit_mask, [new_pos], num_new, invert=True
-                    )
-                non_admitted_positions = refused_pos
+                    with torch.cuda.nvtx.range("op:compact"):
+                        num_refused, _, (refused_pos,) = flagged_compact(
+                            admit_mask, [new_pos], num_new, invert=True
+                        )
+                    non_admitted_positions = refused_pos
 
-                with torch.cuda.nvtx.range("op:compact"):
-                    (
-                        num_cache,
-                        into_cache,
-                        (cache_keys, cache_tids, cache_pos),
-                    ) = flagged_compact(
-                        held | admitted, [miss_keys, miss_tids, miss_pos], num_miss
-                    )
+                    with torch.cuda.nvtx.range("op:compact"):
+                        (
+                            num_cache,
+                            into_cache,
+                            (cache_keys, cache_tids, cache_pos),
+                        ) = flagged_compact(
+                            held | admitted, [miss_keys, miss_tids, miss_pos], num_miss
+                        )
 
-            # 6. Initialize newly admitted rows before inserting them into storage.
-            with torch.cuda.nvtx.range("op:compact"):
-                storage_inputs = [miss_keys, miss_tids, miss_score_input]
-                num_adm, adm_rows, new_inputs = flagged_compact(
-                    admitted, storage_inputs if in_next is None else [], num_miss
-                )
-            with torch.cuda.nvtx.range("op:initializer"):
-                initializer(
-                    values[:, :max_emb_dim],
-                    miss_keys,
-                    miss_tids,
-                    adm_rows,
-                    num_valid=num_adm,
-                )
-            if max_val_dim != max_emb_dim:
-                state.optimizer.reset_optimizer_states(
-                    values[:, max_emb_dim:],
-                    indices=adm_rows,
-                    table_ids=miss_tids,
-                    table_emb_dims=state.table_emb_dims,
-                    num_valid=num_adm,
-                )
-            if in_next is None:
-                num_st, into_storage = num_adm, adm_rows
-                st_keys, st_tids, st_score_input = new_inputs
-            else:
+                # 6. Initialize newly admitted rows before inserting them into storage.
                 with torch.cuda.nvtx.range("op:compact"):
-                    (
+                    storage_inputs = [miss_keys, miss_tids, miss_score_input]
+                    num_adm, adm_rows, new_inputs = flagged_compact(
+                        admitted, storage_inputs if in_next is None else [], num_miss
+                    )
+                with torch.cuda.nvtx.range("op:initializer"):
+                    initializer(
+                        values[:, :max_emb_dim],
+                        miss_keys,
+                        miss_tids,
+                        adm_rows,
+                        num_valid=num_adm,
+                    )
+                if max_val_dim != max_emb_dim:
+                    state.optimizer.reset_optimizer_states(
+                        values[:, max_emb_dim:],
+                        indices=adm_rows,
+                        table_ids=miss_tids,
+                        table_emb_dims=state.table_emb_dims,
+                        num_valid=num_adm,
+                    )
+                if in_next is None:
+                    num_st, into_storage = num_adm, adm_rows
+                    st_keys, st_tids, st_score_input = new_inputs
+                else:
+                    with torch.cuda.nvtx.range("op:compact"):
+                        (
+                            num_st,
+                            into_storage,
+                            (st_keys, st_tids, st_score_input),
+                        ) = flagged_compact(
+                            in_next | admitted, storage_inputs, num_miss
+                        )
+                with torch.cuda.nvtx.range("op:storage_insert"):
+                    _insert_into_storage(
+                        storage,
+                        external_storage,
+                        st_keys,
+                        st_tids,
+                        values,
+                        st_score_input,
                         num_st,
                         into_storage,
-                        (st_keys, st_tids, st_score_input),
-                    ) = flagged_compact(
-                        in_next | admitted, storage_inputs, num_miss
                     )
-            with torch.cuda.nvtx.range("op:storage_insert"):
-                _insert_into_storage(
-                    storage,
-                    external_storage,
-                    st_keys,
-                    st_tids,
-                    values,
-                    st_score_input,
-                    num_st,
-                    into_storage,
-                )
 
-            # Reserve slots after preparing the backing rows and applying admission.
-            with torch.cuda.nvtx.range("op:cache_insert_evict"):
-                placing = True
-                (
-                    cache_slots,
-                    num_evicted,
-                    evicted_keys,
-                    evicted_slots,
-                    _,
-                    evicted_tids,
-                    placement_refused,
-                ) = cache.insert_and_evict(
-                    cache_keys, cache_tids, report_refused=True, num_valid=num_cache
-                )
+            if placement is None:
+                # Admission may have removed candidates. Reserve only the accepted keys.
+                with torch.cuda.nvtx.range("op:cache_insert_evict"):
+                    placement = cache.insert_and_evict(
+                        cache_keys, cache_tids, report_refused=True, num_valid=num_cache
+                    )
+            (
+                cache_slots,
+                num_evicted,
+                evicted_keys,
+                evicted_slots,
+                _,
+                evicted_tids,
+                placement_refused,
+            ) = placement
 
             num_attempted = cache_slots.numel()
             if num_attempted == 0:
@@ -741,11 +783,23 @@ def _prefetch_cache_path(
                     else into_cache[:num_attempted],
                 )
         except Exception:
-            # Placement can publish a key before its row has been installed or
-            # its dirty victim has reached storage. Block future reads and flushes.
-            if placing:
-                cache._placement_failed = True
-            cache.decrement_counter(slot_indices, unique_table_ids, num_valid=num_unique)
+            # Reservation precedes row preparation. Until the store above is
+            # enqueued, a victim's original value is still in its cache slot.
+            try:
+                if placement is not None and placement[0].numel():
+                    slots, _, old_keys, old_slots, old_scores, old_tids, _ = placement
+                    cache.key_index_map.rollback_cache_placement(
+                        slots,
+                        cache_tids[: slots.numel()],
+                        old_keys,
+                        old_slots,
+                        old_scores,
+                        old_tids,
+                    )
+            finally:
+                cache.decrement_counter(
+                    slot_indices, unique_table_ids, num_valid=num_unique
+                )
             raise
 
         if placement_refused:
@@ -777,6 +831,8 @@ def _prefetch_hbm_direct_path(
     accumulated_frequency: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
     key_scores: Optional[torch.Tensor] = None,
+    *,
+    may_grow: bool,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
     """HBM-direct prefetch with counter protection.
 
@@ -828,6 +884,26 @@ def _prefetch_hbm_direct_path(
         # per key, so these are different tensors and both are kept up to date. A key
         # that was not found has slot -1, which the counter kernel skips.
         storage.increment_counter(slot_indices, unique_table_ids, num_valid=num_unique)
+
+        if (
+            not may_grow
+            and type(storage) is DynamicEmbStorage
+            and type(initializer) in _INITIALIZERS.values()
+            and admitter is None
+            and key_scores is None
+            and EvictedItemMode.RETAIN_KEY not in state.evicted_item_mode
+            and os.environ.get("DEMB_DETERMINISM_MODE") is None
+        ):
+            # The hit slots are already pinned. Spend the one wait on the miss
+            # count here; an all-hit batch needs no initialization or insertion.
+            capacity = int(num_missing.item())
+            if capacity == 0:
+                return slot_indices, None, None, rows
+            missing_keys = missing_keys[:capacity]
+            missing_indices = missing_indices[:capacity]
+            missing_table_ids = missing_table_ids[:capacity]
+            if missing_scores is not None:
+                missing_scores = missing_scores[:capacity]
 
         non_admitted_positions: Optional[torch.Tensor] = None
         num_refused: Optional[torch.Tensor] = None
@@ -927,12 +1003,13 @@ def _prefetch_hbm_direct_path(
         storage.increment_counter(new_slots, admitted_tids, num_valid=num_admitted)
 
         gather_embedding(
-            new_slots, slot_indices, out_row=admitted_unique_positions, num_valid=num_admitted
+            new_slots,
+            slot_indices,
+            out_row=admitted_unique_positions,
+            num_valid=num_admitted,
+            src_aux=new_rows,
+            dst_aux=rows,
         )
-        if rows is not slot_indices:
-            gather_embedding(
-                new_rows, rows, out_row=admitted_unique_positions, num_valid=num_admitted
-            )
         return slot_indices, non_admitted_positions, num_refused, rows
 
 
@@ -1077,6 +1154,7 @@ def dynamicemb_prefetch(
                     lfu_accumulated_frequency,
                     admitter,
                     key_scores=unique_scores,
+                    may_grow=may_grow,
                 )
                 key_map_generation = storage._state.key_map_generation
 

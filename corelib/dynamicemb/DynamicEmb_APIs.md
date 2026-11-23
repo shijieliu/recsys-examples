@@ -1962,16 +1962,17 @@ DynamicEmb's Python lookup carries the number of live entries as a one-element C
 
 For a fixed-capacity training lookup using the built-in storage and default diagnostics, the wait depends on the layout.
 
-| Layout | Blocking host waits per lookup | How DynamicEmb uses the counts |
+| Layout | Blocking host waits per lookup | What Python does with the result |
 | --- | --- | --- |
-| HBM, hybrid, or host storage | Zero | Lookup, admission, initialization, and updates use the live lengths on the device. |
-| HBM cache over built-in storage | At most one | Cache insertion copies the number of placement attempts, evictions, and refusals together. Python uses those counts to write back victims and report a refused placement. |
+| HBM only, built-in initializer, no admission or per-key scores | At most one | Pins hits and reads the miss count. An all-hit lookup returns immediately. On misses, it sizes the remaining work to the miss count. |
+| Other fixed-capacity HBM, hybrid or host storage | Zero | Keeps counts on the device. HBM updates the hash-slot and value-row maps together using one indexed scatter. |
+| HBM cache over built-in storage | At most one, including an all-hit batch | Updates backing scores for all keys. With the built-in initializer and no admission or external store, insertion reports placement, refusals and whether any backing row is new in a single transfer. An all-hit batch returns immediately. When every miss has a backing row, Python skips initialization and backing insertion. A refused batch releases its hit pins and raises before returning a prefetch state. |
 
-Read-only evaluation keeps the counts on the device for all layouts. Table growth, recording cache metrics, retaining evicted keys, deterministic or debug checks, and host-backed custom callbacks can introduce additional waits. The profiler regression checks each training, no-grad, and evaluation step through the module API.
+Read-only evaluation uses device counts. Table growth, recording cache metrics, retaining evicted keys, deterministic or debug checks, and host-backed custom callbacks can introduce additional waits. The profiler regression exercises training, no-grad and evaluation through the module API.
 
 ## Writing a Storage, Counter or MultiTableAdmitter
 
-Each implementation accepts `num_valid` and processes the first `num_valid` entries of each per-key tensor. An omitted count denotes an exact-length input. The unused tail may contain invalid keys, table IDs and indices. Each returned per-key tensor has the capacity of the input. A compacted result supplies its own one-element int64 CUDA count. The existing `flagged_compact`, `gather_embedding` and flat-table operations accept a device count.
+Each implementation accepts `num_valid` and processes the first `num_valid` entries of each per-key tensor. An omitted count denotes an exact-length input. The unused tail may contain invalid keys, table IDs and indices. Each returned per-key tensor has the capacity of the input. A compacted result supplies its own one-element int64 CUDA count. The existing `flagged_compact`, `gather_embedding` and flat-table operations accept a device count. A row copy can apply a hit mask and update the destination hit flag and score in the same launch.
 
 | Class | Method | Result |
 | --- | --- | --- |

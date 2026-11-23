@@ -1378,6 +1378,89 @@ def test_cache_placement_report_live_prefix(capacity, count, live):
     assert int(table.bucket_sizes.sum()) == live
 
 
+@pytest.mark.parametrize(
+    "capacity,count,missing,expected",
+    [(0, 0, None, False), (8, 0, 0, False), (8, 4, 6, False), (8, 4, 3, True)],
+)
+def test_cache_placement_report_missing_backing_row(capacity, count, missing, expected):
+    table = _table(caps=(128,), enable_overflow=True)
+    keys = torch.arange(1, capacity + 1, device="cuda")
+    backing_rows = keys.clone()
+    if missing is not None:
+        backing_rows[missing] = -1
+    (
+        slots,
+        evicted,
+        *victims,
+        refused,
+        needs_backing,
+    ) = table.insert_and_evict_with_counter_and_overflow(
+        keys,
+        torch.zeros_like(keys),
+        _arg(keys.to(torch.uint64)),
+        report_refused=True,
+        num_valid=_nv(count),
+        backing_rows=backing_rows,
+    )
+    assert slots.numel() == count
+    assert evicted == refused == 0
+    assert len(victims) == 4 and all(v.numel() == 0 for v in victims)
+    assert needs_backing is expected
+
+
+def test_rollback_cache_reservation_restores_main_and_overflow_victims():
+    table = _table(caps=(128,), enable_overflow=True)
+    main = torch.arange(1, 129, device="cuda")
+    overflow = torch.arange(129, 509, device="cuda")  # Leave four free overflow slots.
+    ids = torch.zeros_like(main)
+    main_slots = table.insert(main, ids, _arg(main.to(torch.uint64)))
+    table.increment_counter(main_slots, ids)
+    overflow_slots, evictions, *_ = table.insert_and_evict_with_counter_and_overflow(
+        overflow, torch.zeros_like(overflow), _arg(overflow.to(torch.uint64))
+    )
+    assert evictions == 0 and (overflow_slots >= 128).all()
+    table.decrement_counter(main_slots[:1], ids[:1])
+
+    # Reservations evict from both regions, occupy four free slots, and refuse
+    # the leftovers. A failure at this point has not touched any value rows.
+    new = torch.arange(1000, 1400, device="cuda")
+    new_ids = torch.zeros_like(new)
+    (
+        slots,
+        _,
+        keys,
+        victim_slots,
+        scores,
+        tids,
+        refused,
+    ) = table.insert_and_evict_with_counter_and_overflow(
+        new, new_ids, _arg(new.to(torch.uint64)), report_refused=True
+    )
+    assert refused == new.numel() - (1 + table.overflow_bucket_capacity_)
+    assert (victim_slots == main_slots[0]).any() and (victim_slots >= 128).any()
+    table.rollback_cache_placement(slots, new_ids, keys, victim_slots, scores, tids)
+
+    old = torch.cat((main, overflow))
+    saved_slots = torch.cat((main_slots, overflow_slots))
+    old_scores, found, restored_slots = table.lookup_with_overflow(
+        old, torch.zeros_like(old), _arg(None, CONST)
+    )
+    assert found.all() and torch.equal(restored_slots, saved_slots)
+    assert torch.equal(old_scores, old)
+    assert not table.lookup_with_overflow(new, new_ids, _arg(None, CONST))[1].any()
+    assert table.bucket_sizes.tolist() == [128]
+    assert table.overflow_bucket_sizes.tolist() == [380]
+
+    # With all restored residents pinned, only the four tombstones are available.
+    table.increment_counter(main_slots[:1], ids[:1])
+    table.increment_counter(overflow_slots, torch.zeros_like(overflow))
+    retried = table.insert_and_evict_with_counter_and_overflow(
+        new, new_ids, _arg(new.to(torch.uint64)), report_refused=True
+    )
+    assert retried[-1] == new.numel() - 4
+    assert table.overflow_bucket_sizes.tolist() == [384]
+
+
 @FEW
 def test_overflow(n):
     a, b = (_table(caps=(128,), enable_overflow=True) for _ in range(2))
