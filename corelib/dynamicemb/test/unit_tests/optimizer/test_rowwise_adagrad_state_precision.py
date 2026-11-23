@@ -28,6 +28,7 @@ path to the old behaviour and check that checkpoints move between the two.
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb.optimizer import (
     AdamDynamicEmbeddingOptimizer,
     OptimizerArgs,
@@ -87,7 +88,9 @@ def _train_padded_buffer(
 
     values = torch.empty(NUM_ROWS, value_dim, dtype=value_type, device=device)
     values[:, :emb_dim] = init.to(device=device, dtype=value_type)
-    optimizer.reset_optimizer_states(values[:, emb_dim:], emb_dims=emb_dim)
+    optimizer.reset_optimizer_states(
+        values[:, emb_dim:], emb_dims=emb_dim, num_valid=full_count(values)
+    )
 
     table_ids = torch.zeros(NUM_ROWS, dtype=torch.int64, device=device)
     table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
@@ -100,6 +103,7 @@ def _train_padded_buffer(
             emb_dim,
             value_dim,
             all_dims_vec4,
+            num_valid=full_count(grad),
         )
     torch.cuda.synchronize()
 
@@ -143,7 +147,9 @@ def _flat_table(value_type: torch.dtype, emb_dim: int, seed: int = 0, state_dtyp
     table[:, :emb_dim] = (torch.rand(NUM_ROWS, emb_dim, generator=generator) * 0.1).to(
         device="cuda", dtype=value_type
     )
-    optimizer.reset_optimizer_states(table[:, emb_dim:], emb_dims=emb_dim)
+    optimizer.reset_optimizer_states(
+        table[:, emb_dim:], emb_dims=emb_dim, num_valid=full_count(table)
+    )
     return optimizer, table
 
 
@@ -158,6 +164,7 @@ def _flat_update(optimizer, table, grads, indices, emb_dim, all_dims_vec4):
         emb_dim,
         all_dims_vec4,
         table.dtype,
+        num_valid=full_count(grads),
     )
 
 
@@ -303,8 +310,11 @@ def test_reset_writes_fp32_initial_value(value_type):
     rows = torch.zeros(
         4, emb_dim + optimizer.get_state_dim(emb_dim), dtype=value_type, device="cuda"
     )
+    # The counted form: only the first two of the three indices are live.
     optimizer.reset_optimizer_states(
-        rows[:, emb_dim:], indices=torch.tensor([1, 3], device="cuda")
+        rows[:, emb_dim:],
+        indices=torch.tensor([1, 3, 0], device="cuda"),
+        num_valid=torch.tensor([2], device="cuda"),
     )
 
     accumulator = optimizer.states_for_checkpoint(rows[:, emb_dim:], emb_dim)

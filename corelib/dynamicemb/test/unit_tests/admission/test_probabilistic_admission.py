@@ -62,7 +62,7 @@ def _admitter(probability, initializer_args=None):
 def _inputs(num_keys=NUM_KEYS, device="cuda"):
     keys = torch.arange(num_keys, dtype=torch.int64, device=device)
     table_ids = torch.zeros(num_keys, dtype=torch.int64, device=device)
-    return keys, table_ids
+    return keys, keys.new_tensor([num_keys]), table_ids
 
 
 def _assert_fraction(admitted: torch.Tensor, expected: float):
@@ -98,36 +98,36 @@ def _assert_fraction(admitted: torch.Tensor, expected: float):
 
 def test_admits_at_the_configured_rate():
     probability = 0.3
-    keys, table_ids = _inputs()
+    keys, num_valid, table_ids = _inputs()
     # Each key once: a key seen k times gets 1 - (1 - p)^k, so the configured
     # rate is the one for k = 1.
     frequencies = torch.ones_like(keys)
-    admitted = _admitter(probability).admit(keys, table_ids, frequencies)
+    admitted = _admitter(probability).admit(keys, num_valid, table_ids, frequencies)
     _assert_fraction(admitted, probability)
 
 
 def test_the_frequencies_given_are_left_as_they_were():
     """It keeps no count, so what it was given goes back untouched."""
-    keys, table_ids = _inputs()
+    keys, num_valid, table_ids = _inputs()
     frequencies = torch.arange(
         1, keys.shape[0] + 1, dtype=torch.int64, device=keys.device
     )
     expected_frequencies = frequencies.clone()
-    _admitter(0.3).admit(keys, table_ids, frequencies)
+    _admitter(0.3).admit(keys, num_valid, table_ids, frequencies)
     assert torch.equal(frequencies, expected_frequencies)
 
 
 def test_probability_zero_admits_nothing():
     # torch.rand can return exactly 0.0, so this only holds if the comparison
     # is strict. It is also the case log1p(-p) has no value for, at the far end.
-    keys, table_ids = _inputs()
-    admitted = _admitter(0.0).admit(keys, table_ids)
+    keys, num_valid, table_ids = _inputs()
+    admitted = _admitter(0.0).admit(keys, num_valid, table_ids)
     assert not bool(admitted.any())
 
 
 def test_probability_one_admits_everything():
-    keys, table_ids = _inputs()
-    admitted = _admitter(1.0).admit(keys, table_ids)
+    keys, num_valid, table_ids = _inputs()
+    admitted = _admitter(1.0).admit(keys, num_valid, table_ids)
     assert bool(admitted.all())
 
 
@@ -138,9 +138,9 @@ def test_repeats_within_a_batch_count_as_separate_tosses(occurrences):
     threshold reaches p through log1p/expm1 and lands within a float32 ulp of
     it, so the two paths disagree on a draw in that last ulp now and then."""
     probability = 0.1
-    keys, table_ids = _inputs()
+    keys, num_valid, table_ids = _inputs()
     frequencies = torch.full_like(keys, occurrences)
-    admitted = _admitter(probability).admit(keys, table_ids, frequencies)
+    admitted = _admitter(probability).admit(keys, num_valid, table_ids, frequencies)
     _assert_fraction(admitted, 1.0 - (1.0 - probability) ** occurrences)
 
 
@@ -152,9 +152,9 @@ def test_compounding_survives_a_probability_too_small_for_float32():
     all here, so this separates the two without needing a large sample.
     """
     probability, occurrences = 1e-8, 10**9
-    keys, table_ids = _inputs()
+    keys, num_valid, table_ids = _inputs()
     frequencies = torch.full_like(keys, occurrences)
-    admitted = _admitter(probability).admit(keys, table_ids, frequencies)
+    admitted = _admitter(probability).admit(keys, num_valid, table_ids, frequencies)
     # Asserted coarsely on purpose. The true rate is 1 - e^-10 = 0.99995, which
     # leaves about nine rejections out of NUM_KEYS -- too few for the normal
     # approximation _assert_fraction rests on. Telling 0.99995 from 0 needs no

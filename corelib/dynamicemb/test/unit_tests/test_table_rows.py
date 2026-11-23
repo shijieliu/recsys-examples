@@ -12,6 +12,7 @@ rehash can carry them along instead of moving values.
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb.key_ownership import murmur3_hash_64bits
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import ScorePolicy
@@ -53,16 +54,16 @@ def test_rows_are_dense_and_stable():
     table = _table(1024)
     keys = _keys(0, 300)
     tids, score = _args(table, keys)
-    rows = table.insert(keys, tids, score)
+    rows = table.insert(keys, tids, score, num_valid=full_count(keys))
 
     assert sorted(rows.tolist()) == list(range(300))
     assert table.num_rows(0) == 300
-    _, founds, looked_up = table.lookup(keys, tids, score)
+    _, founds, looked_up = table.lookup(keys, tids, score, num_valid=full_count(keys))
     assert bool(founds.all())
     assert torch.equal(looked_up, rows)
 
     # Re-inserting existing keys neither moves nor allocates.
-    assert torch.equal(table.insert(keys, tids, score), rows)
+    assert torch.equal(table.insert(keys, tids, score, num_valid=full_count(keys)), rows)
     assert table.num_rows(0) == 300
 
 
@@ -71,7 +72,7 @@ def test_rows_are_per_table():
     k0, k1 = _keys(0, 40), _keys(1000, 1050)
     for tid, keys in ((0, k0), (1, k1)):
         tids, score = _args(table, keys, tid)
-        rows = table.insert(keys, tids, score)
+        rows = table.insert(keys, tids, score, num_valid=full_count(keys))
         assert sorted(rows.tolist()) == list(range(keys.numel()))
     assert (table.num_rows(0), table.num_rows(1)) == (40, 50)
 
@@ -82,12 +83,14 @@ def test_eviction_reuses_the_victims_row():
     table = _table(BUCKET)
     first = _keys(0, BUCKET)
     tids, score = _args(table, first, score=1)
-    table.insert(first, tids, score)
+    table.insert(first, tids, score, num_valid=full_count(first))
     assert table.num_rows(0) == BUCKET
 
     newcomers = _keys(100, 100 + BUCKET // 2)
     tids, score = _args(table, newcomers, score=10)
-    rows, num_evicted, _, ev_rows, _, _ = table.insert_and_evict(newcomers, tids, score)
+    rows, num_evicted, _, ev_rows, _, _ = table.insert_and_evict(
+        newcomers, tids, score, num_valid=full_count(newcomers)
+    )
     assert num_evicted == newcomers.numel()
     assert table.num_rows(0) == BUCKET, "eviction must not allocate"
     # The victims held exactly the rows the newcomers now hold.
@@ -100,24 +103,24 @@ def test_erased_slot_keeps_its_row_for_the_next_key():
     table = _table(BUCKET)
     keys = _keys(0, BUCKET)
     tids, score = _args(table, keys)
-    rows = table.insert(keys, tids, score)
+    rows = table.insert(keys, tids, score, num_valid=full_count(keys))
     assert table.num_rows(0) == BUCKET
 
     gone = keys[:4]
     gone_tids, _ = _args(table, gone)
-    present = table.erase(gone, gone_tids, return_indices=True)
+    present = table.erase(gone, gone_tids, return_indices=True, num_valid=full_count(gone))
     assert bool((present >= 0).all())
     assert table.num_rows(0) == BUCKET, "erase does not hand rows back"
     # An erased slot holds ReclaimKey, so it carries that key's digest, not the empty
     # one: the same as after an erase by score.
     for slot in present.tolist():
         assert int(table.digests_[0][slot]) == _digest_of(RECLAIM_KEY)
-    again = table.erase(gone, gone_tids, return_indices=True)
+    again = table.erase(gone, gone_tids, return_indices=True, num_valid=full_count(gone))
     assert bool((again < 0).all()), "erasing a missing key reports -1"
 
     fresh = _keys(100, 104)
     tids, score = _args(table, fresh)
-    fresh_rows = table.insert(fresh, tids, score)
+    fresh_rows = table.insert(fresh, tids, score, num_valid=full_count(fresh))
     assert sorted(fresh_rows.tolist()) == sorted(rows[:4].tolist())
     assert table.num_rows(0) == BUCKET, "reclaimed rows are reused, not re-allocated"
 
@@ -127,11 +130,11 @@ def test_copy_table_from_keeps_rows_in_place():
     src = _table([BUCKET * 4, BUCKET * 4])
     keys = _keys(0, 30)
     tids, score = _args(src, keys, table_id=1)
-    rows = src.insert(keys, tids, score)
+    rows = src.insert(keys, tids, score, num_valid=full_count(keys))
 
     dst = _table([BUCKET * 4, BUCKET * 4])
     dst.copy_table_from(src, 1)
-    _, founds, copied = dst.lookup(keys, tids, score)
+    _, founds, copied = dst.lookup(keys, tids, score, num_valid=full_count(keys))
     assert bool(founds.all())
     assert torch.equal(copied, rows)
     assert dst.num_rows(1) == src.num_rows(1) == 30
@@ -146,12 +149,12 @@ def test_rehash_carries_rows_and_reclaimed_slots(erased):
     old = _table(BUCKET * 64)
     keys = _keys(0, BUCKET * 16)
     tids, score = _args(old, keys)
-    rows = old.insert(keys, tids, score)
+    rows = old.insert(keys, tids, score, num_valid=full_count(keys))
     gone, live = keys[:erased], keys[erased:]
     if erased:
-        old.erase(gone, _args(old, gone)[0])
+        old.erase(gone, _args(old, gone)[0], num_valid=full_count(gone))
     live_tids, live_score = _args(old, live)
-    _, _, live_rows = old.lookup(live, live_tids, live_score)
+    _, _, live_rows = old.lookup(live, live_tids, live_score, num_valid=full_count(live))
 
     new = _table(BUCKET * 128)
     new.insert_carrying_rows(live, 0, live_score, live_rows)
@@ -174,13 +177,13 @@ def test_rehash_carries_rows_and_reclaimed_slots(erased):
     assert new.num_rows(0) == old.num_rows(0)
 
     # The live keys keep their rows ...
-    _, founds, new_rows = new.lookup(live, live_tids, live_score)
+    _, founds, new_rows = new.lookup(live, live_tids, live_score, num_valid=full_count(live))
     assert bool(founds.all()) and torch.equal(new_rows, live_rows)
 
     # ... and new keys never collide with them: every row is handed to one key.
     fresh = _keys(10_000, 10_000 + 50)
     tids, score = _args(new, fresh)
-    fresh_rows = new.insert(fresh, tids, score)
+    fresh_rows = new.insert(fresh, tids, score, num_valid=full_count(fresh))
     all_rows = fresh_rows.tolist() + live_rows.tolist()
     assert len(all_rows) == len(set(all_rows))
     assert max(all_rows) < new.num_rows(0)
@@ -201,7 +204,7 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     table = _table(BUCKET)
     keys = _keys(0, 8)
     tids, score = _args(table, keys)
-    rows = table.insert(keys, tids, score)
+    rows = table.insert(keys, tids, score, num_valid=full_count(keys))
     key_col = table.keys_.view(torch.int64)[0]
     size = int(table.bucket_sizes.sum())
 
@@ -228,7 +231,14 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     victim_slot = int((key_col == int(victim)).nonzero()[0])
     victim_row = int(rows[0])
     assert int(table.rows_[victim_slot]) == victim_row
-    assert int(table.erase(victim, tids[:1], return_indices=True)) >= 0
+    assert (
+        int(
+            table.erase(
+                victim, tids[:1], return_indices=True, num_valid=full_count(victim)
+            )
+        )
+        >= 0
+    )
     assert int(key_col[victim_slot]) == -2
     assert int(table.rows_[victim_slot]) == victim_row, "erase must keep the row"
     table.restore_reclaimed_slots(pack(victim_slot, victim_row), 0)

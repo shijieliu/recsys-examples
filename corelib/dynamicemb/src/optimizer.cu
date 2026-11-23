@@ -16,12 +16,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
+#include "device_count.h"
 #include "optimizer.h"
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
 #include <cmath>
 #include <functional>
+#include <optional>
 #include <type_traits>
 
 namespace dyn_emb {
@@ -38,6 +40,7 @@ void launch_update_kernel_for_flat_table(
     int64_t *table_ids, int64_t *table_value_dims, int64_t *table_emb_dims,
     OptimizerType opt, int64_t const ev_nums, uint32_t const grad_stride,
     uint32_t const max_emb_dim, bool all_dims_vec4, int device_id,
+    const int64_t *num_valid,
     std::function<float(int)> smem_size_f = [](int block_size) { return 0; }) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(device_id);
@@ -61,17 +64,17 @@ void launch_update_kernel_for_flat_table(
                                              OptimizerType>;
     kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
         ev_nums, grad_stride, grads, table_ptrs, indices, table_ids,
-        table_value_dims, table_emb_dims, opt);
+        table_value_dims, table_emb_dims, opt, num_valid);
   } else {
     int block_size =
         max_emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : max_emb_dim;
-    int grid_size = ev_nums;
+    const int grid_size = counted_grid(ev_nums, block_size);
 
     auto kernel = update_with_index_flat_table_kernel<GradType, WeightType,
                                                       IndexType, OptimizerType>;
     kernel<<<grid_size, block_size, smem_size_f(block_size), stream>>>(
         ev_nums, grad_stride, grads, table_ptrs, indices, table_ids,
-        table_value_dims, table_emb_dims, opt);
+        table_value_dims, table_emb_dims, opt, num_valid);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -81,7 +84,9 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                at::Tensor table_value_dims,
                                at::Tensor table_emb_dims, int64_t max_emb_dim,
                                bool all_dims_vec4, float const lr,
-                               int64_t table_dtype) {
+                               int64_t table_dtype,
+                               const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -110,7 +115,8 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
+            d_num_valid);
       });
     });
   });
@@ -123,7 +129,9 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta1, const float beta2,
                                 const float eps, const float weight_decay,
                                 const uint32_t iter_num, int64_t max_emb_dim,
-                                bool all_dims_vec4, int64_t table_dtype) {
+                                bool all_dims_vec4, int64_t table_dtype,
+                                const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -153,7 +161,8 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
+            d_num_valid);
       });
     });
   });
@@ -164,7 +173,9 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                    at::Tensor table_value_dims,
                                    at::Tensor table_emb_dims, const float lr,
                                    const float eps, int64_t max_emb_dim,
-                                   bool all_dims_vec4, int64_t table_dtype) {
+                                   bool all_dims_vec4, int64_t table_dtype,
+                                   const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -193,7 +204,8 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
+            d_num_valid);
       });
     });
   });
@@ -221,13 +233,13 @@ void dispatch_rowwise_adagrad_state_type(DataType state_type,
   }
 }
 
-void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                    at::Tensor table_ptrs, at::Tensor table_ids,
-                                    at::Tensor table_value_dims,
-                                    at::Tensor table_emb_dims, const float lr,
-                                    const float eps, int64_t max_emb_dim,
-                                    bool all_dims_vec4, int64_t table_dtype,
-                                    int64_t state_dtype) {
+void rowwise_adagrad_for_flat_table(
+    at::Tensor grads, at::Tensor indices, at::Tensor table_ptrs,
+    at::Tensor table_ids, at::Tensor table_value_dims,
+    at::Tensor table_emb_dims, const float lr, const float eps,
+    int64_t max_emb_dim, bool all_dims_vec4, int64_t table_dtype,
+    int64_t state_dtype, const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -262,7 +274,7 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
                                                   decltype(opt)>(
                   grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr,
                   ted_ptr, opt, ev_nums, grad_stride, max_emb_dim_u32,
-                  all_dims_vec4, device_id,
+                  all_dims_vec4, device_id, d_num_valid,
                   [](int block_size) { return block_size * sizeof(float); });
             });
           });
@@ -289,7 +301,9 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta, const float l1_reg,
                                 const float l2_reg, int64_t max_emb_dim,
                                 bool all_dims_vec4, int64_t table_dtype,
-                                const float group_lasso_reg) {
+                                const float group_lasso_reg,
+                                const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -330,7 +344,7 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
             ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
-            [use_group](int block_size) {
+            d_num_valid, [use_group](int block_size) {
               return use_group ? block_size * sizeof(float) : 0;
             });
       });
@@ -344,6 +358,7 @@ void launch_update_kernel_for_padded_buffer(
     int64_t const num_rows, uint32_t const grad_stride,
     uint32_t const value_stride, uint32_t const emb_dim, bool all_dims_vec4,
     int device_id, int64_t const *table_ids, int64_t const *table_emb_dims,
+    const int64_t *num_valid,
     std::function<float(int)> smem_size_f = [](int block_size) { return 0; }) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(device_id);
@@ -363,15 +378,15 @@ void launch_update_kernel_for_padded_buffer(
     update4_padded_buffer_kernel<GradType, WeightType, OptimizerType>
         <<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
             num_rows, grad_stride, value_stride, emb_dim, grads, values,
-            table_ids, table_emb_dims, opt);
+            table_ids, table_emb_dims, opt, num_valid);
   } else {
     int block_size =
         emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : emb_dim;
-    int grid_size = num_rows;
+    const int grid_size = counted_grid(num_rows, block_size);
     update_padded_buffer_kernel<GradType, WeightType, OptimizerType>
         <<<grid_size, block_size, smem_size_f(block_size), stream>>>(
             num_rows, grad_stride, value_stride, emb_dim, grads, values,
-            table_ids, table_emb_dims, opt);
+            table_ids, table_emb_dims, opt, num_valid);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -380,7 +395,9 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                   at::Tensor table_ids,
                                   at::Tensor table_emb_dims, int64_t emb_dim,
                                   int64_t value_dim, bool all_dims_vec4,
-                                  float lr) {
+                                  float lr,
+                                  const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -403,7 +420,7 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
-          tid_ptr, ted_ptr);
+          tid_ptr, ted_ptr, d_num_valid);
     });
   });
 }
@@ -414,7 +431,9 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    int64_t value_dim, bool all_dims_vec4,
                                    float lr, float beta1, float beta2,
                                    float eps, float weight_decay,
-                                   uint32_t iter_num) {
+                                   uint32_t iter_num,
+                                   const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -438,16 +457,17 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
-          tid_ptr, ted_ptr);
+          tid_ptr, ted_ptr, d_num_valid);
     });
   });
 }
 
-void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                      at::Tensor table_ids,
-                                      at::Tensor table_emb_dims,
-                                      int64_t emb_dim, int64_t value_dim,
-                                      bool all_dims_vec4, float lr, float eps) {
+void adagrad_update_for_padded_buffer(
+    at::Tensor grads, at::Tensor values, at::Tensor table_ids,
+    at::Tensor table_emb_dims, int64_t emb_dim, int64_t value_dim,
+    bool all_dims_vec4, float lr, float eps,
+    const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -470,17 +490,17 @@ void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
-          tid_ptr, ted_ptr);
+          tid_ptr, ted_ptr, d_num_valid);
     });
   });
 }
 
-void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                       at::Tensor table_ids,
-                                       at::Tensor table_emb_dims,
-                                       int64_t emb_dim, int64_t value_dim,
-                                       bool all_dims_vec4, float lr,
-                                       float eps, int64_t state_dtype) {
+void rowwise_adagrad_for_padded_buffer(
+    at::Tensor grads, at::Tensor values, at::Tensor table_ids,
+    at::Tensor table_emb_dims, int64_t emb_dim, int64_t value_dim,
+    bool all_dims_vec4, float lr, float eps, int64_t state_dtype,
+    const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -507,7 +527,7 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
             launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
                 get_pointer<g_t>(grads), get_pointer<w_t>(values), opt,
                 num_rows, grad_stride, value_stride, emb_dim_u32,
-                all_dims_vec4, device_id, tid_ptr, ted_ptr,
+                all_dims_vec4, device_id, tid_ptr, ted_ptr, d_num_valid,
                 [](int block_size) { return block_size * sizeof(float); });
           });
     });
@@ -520,7 +540,9 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    int64_t value_dim, bool all_dims_vec4,
                                    float lr, float learning_rate_power,
                                    float beta, float l1_reg, float l2_reg,
-                                   float group_lasso_reg) {
+                                   float group_lasso_reg,
+                                   const at::Tensor &num_valid) {
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -551,7 +573,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
-          tid_ptr, ted_ptr, [use_group](int block_size) {
+          tid_ptr, ted_ptr, d_num_valid, [use_group](int block_size) {
             return use_group ? block_size * sizeof(float) : 0;
           });
     });
@@ -561,13 +583,14 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
 } // namespace dyn_emb
 
 // PYTHON WRAP
+// Every update reads the live gradient row count on the device.
 void bind_optimizer_kernel_op(py::module &m) {
   m.def("sgd_update_for_flat_table", &dyn_emb::sgd_update_for_flat_table,
         "SGD optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
         py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),
         py::arg("table_value_dims"), py::arg("table_emb_dims"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("lr"),
-        py::arg("table_dtype"));
+        py::arg("table_dtype"), py::arg("num_valid"));
 
   m.def("adam_update_for_flat_table", &dyn_emb::adam_update_for_flat_table,
         "Adam optimizer for multi-table buffer via table_ptrs",
@@ -576,7 +599,7 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("beta1"),
         py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"),
         py::arg("iter_num"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"));
+        py::arg("table_dtype"), py::arg("num_valid"));
 
   m.def(
       "adagrad_update_for_flat_table", &dyn_emb::adagrad_update_for_flat_table,
@@ -584,7 +607,8 @@ void bind_optimizer_kernel_op(py::module &m) {
       py::arg("grads"), py::arg("indices"), py::arg("table_ptrs"),
       py::arg("table_ids"), py::arg("table_value_dims"),
       py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
-      py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("table_dtype"));
+      py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("table_dtype"),
+      py::arg("num_valid"));
 
   m.def("rowwise_adagrad_for_flat_table",
         &dyn_emb::rowwise_adagrad_for_flat_table,
@@ -593,7 +617,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_ids"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"), py::arg("state_dtype"));
+        py::arg("table_dtype"), py::arg("state_dtype"),
+        py::arg("num_valid"));
 
   m.def("ftrl_update_for_flat_table", &dyn_emb::ftrl_update_for_flat_table,
         "FTRL optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
@@ -601,13 +626,14 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_value_dims"), py::arg("table_emb_dims"), py::arg("lr"),
         py::arg("learning_rate_power"), py::arg("beta"), py::arg("l1_reg"),
         py::arg("l2_reg"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"), py::arg("group_lasso_reg") = 0.0f);
+        py::arg("table_dtype"), py::arg("group_lasso_reg") = 0.0f, py::kw_only(),
+        py::arg("num_valid"));
 
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
-        py::arg("lr"));
+        py::arg("lr"), py::arg("num_valid"));
 
   m.def("adam_update_for_padded_buffer",
         &dyn_emb::adam_update_for_padded_buffer,
@@ -615,14 +641,15 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
         py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
-        py::arg("weight_decay"), py::arg("iter_num"));
+        py::arg("weight_decay"), py::arg("iter_num"),
+        py::arg("num_valid"));
 
   m.def("adagrad_update_for_padded_buffer",
         &dyn_emb::adagrad_update_for_padded_buffer,
         "Adagrad optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
-        py::arg("lr"), py::arg("eps"));
+        py::arg("lr"), py::arg("eps"), py::arg("num_valid"));
 
   m.def("rowwise_adagrad_for_padded_buffer",
         &dyn_emb::rowwise_adagrad_for_padded_buffer,
@@ -630,7 +657,7 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("grads"), py::arg("values"), py::arg("table_ids"),
         py::arg("table_emb_dims"), py::arg("emb_dim"), py::arg("value_dim"),
         py::arg("all_dims_vec4"), py::arg("lr"), py::arg("eps"),
-        py::arg("state_dtype"));
+        py::arg("state_dtype"), py::arg("num_valid"));
 
   m.def("ftrl_update_for_padded_buffer",
         &dyn_emb::ftrl_update_for_padded_buffer,
@@ -638,5 +665,6 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
         py::arg("lr"), py::arg("learning_rate_power"), py::arg("beta"),
-        py::arg("l1_reg"), py::arg("l2_reg"), py::arg("group_lasso_reg") = 0.0f);
+        py::arg("l1_reg"), py::arg("l2_reg"), py::arg("group_lasso_reg") = 0.0f, py::kw_only(),
+        py::arg("num_valid"));
 }

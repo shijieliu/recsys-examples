@@ -13,22 +13,7 @@ TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
 }
 
 
-// forward declaration
 namespace dyn_emb {
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
-             int64_t bucket_capacity, at::Tensor keys,
-             at::Tensor table_ids,
-             std::optional<at::Tensor> score_input,
-             ScorePolicyType policy_type,
-             std::optional<at::Tensor> ovf_storage,
-             int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets,
-             // Defaults live in table.cuh, which this file includes; repeating
-             // them here would be a redefinition.
-             int64_t num_scores,
-             std::optional<at::Tensor> table_global_capacities);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets,
@@ -58,7 +43,7 @@ table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, static_cast<ScorePolicyType>(policy),
         ovf_storage, ovf_bucket_capacity, ovf_output_offsets, /*num_scores=*/1,
-        table_global_capacities);
+        table_global_capacities, at::full({1}, keys.size(0), keys.options().dtype(at::kLong)));
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>

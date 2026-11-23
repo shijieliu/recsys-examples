@@ -21,6 +21,7 @@ looked at. The scores are written with ``scatter_score_blocks``, in the physical
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
 from dynamicemb.key_ownership import murmur3_hash_64bits
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
@@ -65,6 +66,7 @@ def fill(table, keys, timestamps, frequencies, device, table_id=0):
         keys,
         torch.full_like(keys, table_id),
         ScoreArg(name=SCORE, value=ones, policy=ScorePolicy.LRU_LFU),
+        num_valid=full_count(keys),
     )
     assert bool((slots >= 0).all())
     blocks = torch.tensor(
@@ -77,7 +79,9 @@ def fill(table, keys, timestamps, frequencies, device, table_id=0):
 def found_in(table, keys, device, table_id=0):
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
     arg = ScoreArg(name=SCORE, value=None, policy=ScorePolicy.CONST)
-    _, founds, _ = table.lookup(keys, torch.full_like(keys, table_id), arg)
+    _, founds, _ = table.lookup(
+        keys, torch.full_like(keys, table_id), arg, num_valid=full_count(keys)
+    )
     return founds
 
 
@@ -201,7 +205,9 @@ def test_a_pinned_slot_is_spared_whatever_its_scores(device, score_word):
     below = [i for i, s in enumerate(scores) if s < threshold]
     pinned = below[::4]
     pin_slots = slots[torch.tensor(pinned, device=device)]
-    table.increment_counter(pin_slots, torch.zeros_like(pin_slots))
+    table.increment_counter(
+        pin_slots, torch.zeros_like(pin_slots), num_valid=full_count(pin_slots)
+    )
 
     counts = new_counts(device)
     table.erase_by_score(0, threshold, counts, score_word=score_word)
@@ -233,7 +239,7 @@ def set_score_words(module, keys, timestamps, frequencies, device):
     """Give ``keys`` of table 0 these score words, in the physical order."""
     key_map = module._storage.key_index_map
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
-    slots = key_map.slots_of(keys, torch.zeros_like(keys))
+    slots = key_map.slots_of(keys, torch.zeros_like(keys), num_valid=full_count(keys))
     assert bool((slots >= 0).all())
     blocks = torch.tensor(
         list(zip(timestamps, frequencies)), dtype=torch.int64, device=device

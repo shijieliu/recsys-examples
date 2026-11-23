@@ -24,6 +24,7 @@ import sys
 import dynamicemb
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbScoreStrategy, device_timestamp, erase_by_score_async
 from helpers import build_de_table, found, size, train_step
 from torch import nn
@@ -52,7 +53,7 @@ def age(module, table_id, now, device):
     keeping its frequency."""
     key_map = module._storage.key_index_map
     keys = torch.tensor(KEYS, dtype=torch.int64, device=device)
-    slots = key_map.slots_of(keys, torch.full_like(keys, table_id))
+    slots = key_map.slots_of(keys, torch.full_like(keys, table_id), num_valid=full_count(keys))
     assert bool((slots >= 0).all())
     blocks = key_map.gather_score_blocks(table_id, slots).clone()
     blocks[:, 0] = torch.tensor([now - a for a in AGES], device=device)

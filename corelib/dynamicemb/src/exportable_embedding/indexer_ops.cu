@@ -23,7 +23,10 @@ at::Tensor embedding_collection_index_cuda(const at::Tensor& marker,
     auto result = dyn_emb::table_lookup(
         snapshot->table_storage, snapshot->table_bucket_offsets,
         snapshot->bucket_capacity, feature_ids, table_ids, std::nullopt,
-        dyn_emb::ScorePolicyType::Const);
+        dyn_emb::ScorePolicyType::Const, /*ovf_storage=*/std::nullopt,
+        /*ovf_bucket_capacity=*/0, /*ovf_output_offsets=*/std::nullopt,
+        /*num_scores=*/1, /*table_global_capacities=*/std::nullopt,
+        at::full({1}, feature_ids.size(0), feature_ids.options().dtype(at::kLong)));
     auto& fused_keys = std::get<0>(result);
     auto& found = std::get<1>(result);
     auto misses = at::index_select(snapshot->miss_storage_indices, 0, table_ids);

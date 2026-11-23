@@ -37,7 +37,21 @@ from dynamicemb.types import (
     MultiTableAdmitter,
     group_key_of,
 )
-from dynamicemb_extensions import flagged_compact
+from dynamicemb_extensions import flagged_compact, gather_embedding
+
+
+def _check_num_valid(keys: torch.Tensor, num_valid: torch.Tensor) -> None:
+    if not isinstance(num_valid, torch.Tensor):
+        raise TypeError("num_valid must be a tensor")
+    if (
+        not num_valid.is_cuda
+        or num_valid.device != keys.device
+        or num_valid.dtype != torch.int64
+        or num_valid.numel() != 1
+    ):
+        raise ValueError(
+            "num_valid must be a one-element int64 CUDA tensor on the keys' device"
+        )
 
 
 class KVCounter:
@@ -102,16 +116,30 @@ class MultiTableKVCounter(Counter):
     def add(
         self,
         keys: torch.Tensor,
+        num_valid: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
     ) -> torch.Tensor:
+        _check_num_valid(keys, num_valid)
         self.score_arg_.value = frequencies
         scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
-        self.table_.insert(keys, table_ids, self.score_arg_, score_out=scores_out)
+        self.table_.insert(
+            keys,
+            table_ids,
+            self.score_arg_,
+            score_out=scores_out,
+            num_valid=num_valid,
+        )
         return scores_out
 
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
-        self.table_.erase(keys, table_ids)
+    def erase(
+        self,
+        keys: torch.Tensor,
+        num_valid: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        _check_num_valid(keys, num_valid)
+        self.table_.erase(keys, table_ids, num_valid=num_valid)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)
@@ -273,6 +301,7 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
     def admit(
         self,
         keys: torch.Tensor,
+        num_valid: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -287,23 +316,26 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
                 f"{keys.shape[0]} and {frequencies.shape[0]}"
             )
 
-        accumulated = self._counter.add(keys, table_ids, frequencies)
+        accumulated = self._counter.add(keys, num_valid, table_ids, frequencies)
         admit_mask = accumulated >= self._threshold
         # What the caller gave is a per-batch increment; what it gets back is the
         # running total, which an LFU table takes as the admitted key's score.
         # With no frequencies given there is nothing to hand back to.
         if given:
-            frequencies.copy_(accumulated)
+            gather_embedding(
+                accumulated.to(frequencies.dtype),
+                output=frequencies,
+                num_valid=num_valid,
+            )
 
         # A key that got in is no longer waiting, so it stops taking up room.
         # This repeats a compaction the caller also makes over the same mask;
         # one pass over the missing keys is worth keeping the counter's whole
         # lifecycle in the one place that knows the counter exists.
-        _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
-            admit_mask, [keys, table_ids]
+        num_admitted, _, (admitted_keys, admitted_table_ids) = flagged_compact(
+            admit_mask, [keys, table_ids], num_valid
         )
-        if admitted_keys.numel() > 0:
-            self._counter.erase(admitted_keys, admitted_table_ids)
+        self._counter.erase(admitted_keys, num_admitted, admitted_table_ids)
         return admit_mask
 
     def state(self) -> Optional[Counter]:
@@ -335,9 +367,11 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
     Notes
     -----
     The draws come from ``torch.rand``, so they follow ``torch.manual_seed``
-    and survive CUDA graph capture. A seeded run repeats, but the draws are
-    consumed in the order keys go missing, so changing the batch size or the
-    data order changes which keys get in.
+    and survive CUDA graph capture. A seeded run repeats, but every step draws
+    one number per entry of the arrays it is given (one per key of the batch's
+    capacity, whatever the number of keys that are missing), and the keys that
+    go missing take the first of them in the order they go missing, so changing
+    the batch size or the data order changes which keys get in.
     """
 
     def __init__(
@@ -384,9 +418,13 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
     def admit(
         self,
         keys: torch.Tensor,
+        num_valid: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        _check_num_valid(keys, num_valid)
+        # One draw per entry of the arrays, not per live key (see the Notes of
+        # ProbabilisticAdmissionStrategy).
         num_keys = keys.shape[0]
         if self._probability <= 0.0:
             return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)

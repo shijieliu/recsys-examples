@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.device_count import full_count
 from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -337,7 +338,7 @@ class InferenceEmbedding(torch.nn.Module):
                         scores = torch.zeros_like(keys, dtype=torch.uint64)
 
                         self._dynamic_embedding_collection._embedding_tables.tables.insert(
-                            keys, table_ids, embeddings, scores
+                            keys, table_ids, embeddings, scores, num_valid=full_count(keys)
                         )
 
                         weight_offset += emb_table_size

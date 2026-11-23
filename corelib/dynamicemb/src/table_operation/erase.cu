@@ -20,11 +20,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
+// Erase the live prefix of keys and table_ids and write the corresponding
+// entries of indices when requested.
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores,
-                 std::optional<at::Tensor> table_global_capacities) {
+                 std::optional<at::Tensor> table_global_capacities,
+                 const at::Tensor &num_valid) {
+  const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   int64_t num_total = keys.size(0);
   if (num_total == 0)
@@ -59,9 +63,10 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                        global_caps_ptr);
 
     table_erase_kernel<Table, 1>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-            table_ids_ptr, indices_);
+        <<<table_grid_size(num_total, BLOCK_SIZE),
+           BLOCK_SIZE, 0, stream>>>(table, table_bucket_offsets_ptr,
+                                    bucket_sizes_, num_total, keys_,
+                                    table_ids_ptr, indices_, num_valid_ptr);
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

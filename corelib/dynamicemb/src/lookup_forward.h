@@ -86,12 +86,25 @@ void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
   copy_multi_to_one(desc, feature_dims_vec4, stream);
 }
 
-// Row i of dst (row out_row[i] with out_row, int32) gets row inverse_idx[i]
-// of src.
-void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, int src_stride, DataType src_type,
-                   DataType dst_type, DataType offset_type, int device_num_sms,
-                   cudaStream_t stream, const int32_t *out_row = nullptr);
+// Source and destination row maps are optional. A null map is the identity.
+struct RowMapping {
+  int64_t capacity, input_rows, output_rows;
+  const int64_t *num_valid;
+  const int64_t *src64, *dst64;
+  const int32_t *src32, *dst32;
+
+  DEVICE_INLINE bool resolve(int64_t i, int64_t &src, int64_t &dst) const {
+    src = src64 ? src64[i] : (src32 ? src32[i] : i);
+    dst = dst64 ? dst64[i] : (dst32 ? dst32[i] : i);
+    return src >= 0 && src < input_rows && dst >= 0 && dst < output_rows;
+  }
+};
+
+void scatter_fused(const void *src, void *dst, const RowMapping &rows,
+                   int64_t width, int64_t src_stride, int64_t dst_stride,
+                   size_t raw_element_bytes, DataType src_type,
+                   DataType dst_type, bool vec4_aligned, int num_sms,
+                   cudaStream_t stream);
 
 void get_new_length_and_offsets(uint64_t *d_unique_offsets,
                                 int64_t *d_table_offsets_in_feature,

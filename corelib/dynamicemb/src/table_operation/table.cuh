@@ -15,11 +15,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+#pragma once
+
 #include "../check.h"
+#include "device_count.h"
 #include "torch_utils.h"
 #include "types.cuh"
 
 #include <iostream>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -87,15 +91,24 @@ global_capacities_ptr(const std::optional<at::Tensor> &table_global_capacities,
   return t.data_ptr<int64_t>();
 }
 
+// Cap the grid of a kernel that strides over the live prefix.
+inline int64_t table_grid_size(int64_t num_total, int block_size) {
+  const int64_t grid = (num_total + block_size - 1) / block_size;
+  return counted_grid(grid, block_size);
+}
+
+// Per-key outputs at or past the device count are undefined.
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
-             std::optional<at::Tensor> ovf_storage = std::nullopt,
-             int64_t ovf_bucket_capacity = 0,
-             std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
-             int64_t num_scores = 1,
-             std::optional<at::Tensor> table_global_capacities = std::nullopt);
+             std::optional<at::Tensor> ovf_storage,
+             int64_t ovf_bucket_capacity,
+             std::optional<at::Tensor> ovf_output_offsets,
+             int64_t num_scores,
+             std::optional<at::Tensor> table_global_capacities,
+             const at::Tensor &num_valid);
 
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
@@ -103,10 +116,11 @@ at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor keys, at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type, std::optional<at::Tensor> counter,
-                        std::optional<at::Tensor> insert_results = std::nullopt,
-                        std::optional<at::Tensor> score_output = std::nullopt,
-                        int64_t num_scores = 1, int64_t score_fn_key = 0,
-    std::optional<at::Tensor> table_global_capacities = std::nullopt);
+                        std::optional<at::Tensor> insert_results,
+                        std::optional<at::Tensor> score_output,
+                        int64_t num_scores, int64_t score_fn_key,
+                        std::optional<at::Tensor> table_global_capacities,
+                        const at::Tensor &num_valid);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
 // (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids); the
@@ -117,10 +131,11 @@ table_insert_collect_evicted(
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, std::optional<at::Tensor> score_input,
     ScorePolicyType policy_type, std::optional<at::Tensor> counter,
-    std::optional<at::Tensor> insert_results = std::nullopt,
-    std::optional<at::Tensor> score_output = std::nullopt,
-    int64_t num_scores = 1, int64_t score_fn_key = 0,
-    std::optional<at::Tensor> table_global_capacities = std::nullopt);
+    std::optional<at::Tensor> insert_results,
+    std::optional<at::Tensor> score_output,
+    int64_t num_scores, int64_t score_fn_key,
+    std::optional<at::Tensor> table_global_capacities,
+    const at::Tensor &num_valid);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -129,16 +144,18 @@ table_insert_and_evict(
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, std::optional<at::Tensor> score_input,
     ScorePolicyType policy_type, std::optional<at::Tensor> counter,
-    std::optional<at::Tensor> insert_results = std::nullopt,
-    std::optional<at::Tensor> score_output = std::nullopt,
-    std::optional<at::Tensor> ovf_storage = std::nullopt,
-    int64_t ovf_bucket_capacity = 0,
-    std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
-    std::optional<at::Tensor> ovf_counter = std::nullopt,
-    std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
-    int64_t num_scores = 1, int64_t score_fn_key = 0,
-    std::optional<at::Tensor> refused = std::nullopt,
-    std::optional<at::Tensor> table_global_capacities = std::nullopt);
+    std::optional<at::Tensor> insert_results,
+    std::optional<at::Tensor> score_output,
+    std::optional<at::Tensor> ovf_storage,
+    int64_t ovf_bucket_capacity,
+    std::optional<at::Tensor> ovf_bucket_sizes,
+    std::optional<at::Tensor> ovf_counter,
+    std::optional<at::Tensor> ovf_output_offsets,
+    int64_t num_scores, int64_t score_fn_key,
+    std::optional<at::Tensor> refused,
+    std::optional<at::Tensor> table_global_capacities,
+    const at::Tensor &num_valid,
+    std::optional<at::Tensor> insert_status);
 
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -150,9 +167,9 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices, int64_t num_scores = 1,
-                 std::optional<at::Tensor> table_global_capacities =
-                     std::nullopt);
+                 std::optional<at::Tensor> indices, int64_t num_scores,
+                 std::optional<at::Tensor> table_global_capacities,
+                 const at::Tensor &num_valid);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
@@ -216,7 +233,8 @@ void table_update_counter_with_layout(
     int64_t main_capacity, int64_t num_tables,
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity);
+    int64_t overflow_bucket_capacity,
+    const at::Tensor &num_valid);
 
 // Resolve table-relative hash slots to the value rows they own, taking the
 // next row of the slot's table for a slot that has none yet when `allocate`;
@@ -225,7 +243,8 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor row_limits,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
-                              at::Tensor table_ids, bool allocate);
+                              at::Tensor table_ids, bool allocate,
+                              const at::Tensor &num_valid);
 
 // Rehash support. table_collect_reclaimed_rows returns the rows owned by the
 // reclaimed slots of buckets [bkt_begin, bkt_end) as int64[num_rows], where

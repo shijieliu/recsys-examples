@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
 
@@ -38,11 +39,12 @@ def test_multitable_reference_protection(
     keys = torch.arange(1, 2 * bucket_capacity + 1, device=device).to(key_type)
     tids = torch.arange(2, device=device).repeat_interleave(bucket_capacity)
     results = torch.empty(keys.numel(), dtype=table.result_type, device=device)
-    slots = table.insert(keys, tids, score(keys.numel()), results)
+    slots = table.insert(keys, tids, score(keys.numel()), results, num_valid=full_count(keys))
     assert (results == InsertResult.INSERT.value).all()
     assert ((slots >= 0) & (slots < bucket_capacity)).all()
     held = tids == protected_table
-    table.increment_counter(slots[held], tids[held])
+    held_slots = slots[held]
+    table.increment_counter(held_slots, tids[held], num_valid=full_count(held_slots))
     main_counters = table._ref_counter[: 2 * bucket_capacity].reshape(2, -1)
     assert (main_counters[protected_table] == 1).all()
     assert (main_counters[1 - protected_table] == 0).all()
@@ -51,10 +53,13 @@ def test_multitable_reference_protection(
     new_tid = torch.ones(1, dtype=torch.int64, device=device)
     result = torch.empty(1, dtype=table.result_type, device=device)
     if operation == "insert":
-        new_slot = table.insert(new_key, new_tid, score(1, 2), result)
+        new_slot = table.insert(
+            new_key, new_tid, score(1, 2), result, num_valid=full_count(new_key)
+        )
     elif operation == "collect":
         new_slot, count, victims, victim_tids = table.insert(
-            new_key, new_tid, score(1, 2), result, collect_evicted=True
+            new_key, new_tid, score(1, 2), result, collect_evicted=True,
+            num_valid=full_count(new_key),
         )
         assert count.item() == (0 if protected_table == 1 else 1)
         if count.item():
@@ -97,7 +102,9 @@ def test_multitable_reference_protection(
         assert new_slot.item() == -1
 
     lookup_score = ScoreArg(name="score", policy=ScorePolicy.CONST)
-    _, found, retained_slots = table.lookup(keys, tids, lookup_score)
+    _, found, retained_slots = table.lookup(
+        keys, tids, lookup_score, num_valid=full_count(keys)
+    )
     assert found[held].all(), "An in-use key was evicted from its own table"
     assert torch.equal(retained_slots[held], slots[held])
     assert found[:bucket_capacity].all(), "Inserting into table 1 changed table 0"
@@ -105,10 +112,12 @@ def test_multitable_reference_protection(
         protected_table == 0
     )
     assert (main_counters[protected_table] == 1).all()
-    table.decrement_counter(slots[held], tids[held])
+    table.decrement_counter(held_slots, tids[held], num_valid=full_count(held_slots))
     assert (table._ref_counter == 0).all()
 
     # Releasing references restores the ability to evict from the main table.
     released_key = torch.tensor([2 * bucket_capacity + 2], device=device).to(key_type)
-    table.insert(released_key, new_tid, score(1, 3), result)
+    table.insert(
+        released_key, new_tid, score(1, 3), result, num_valid=full_count(released_key)
+    )
     assert result.item() == InsertResult.EVICT.value

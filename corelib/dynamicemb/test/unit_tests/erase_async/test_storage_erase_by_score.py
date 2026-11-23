@@ -22,6 +22,7 @@ background worker will put there.
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
 from dynamicemb.key_value_table import (
@@ -151,6 +152,7 @@ def fill(storage, keys, scores, table_id, device):
         keys,
         torch.full_like(keys, table_id),
         ScoreArg(name=score_name(storage), value=scores, policy=ScorePolicy.ASSIGN),
+        num_valid=full_count(keys),
     )
 
 
@@ -159,7 +161,8 @@ def found(storage, keys, table_id, device):
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
     arg = ScoreArg(name=score_name(storage), value=None, policy=ScorePolicy.CONST)
     _, founds, _ = storage.key_index_map.lookup(
-        keys, torch.full_like(keys, table_id), arg
+        keys, torch.full_like(keys, table_id), arg,
+        num_valid=full_count(keys),
     )
     return founds
 

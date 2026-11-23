@@ -19,6 +19,7 @@ import shutil
 import pytest
 import torch
 import torch.distributed as dist
+from dynamicemb.device_count import full_count
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import (
     InsertResult,
@@ -128,7 +129,7 @@ def test_table_dump_load(
             batch_, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
 
-        table.insert(keys, tid, score_arg, insert_results)
+        table.insert(keys, tid, score_arg, insert_results, num_valid=full_count(keys))
 
         assert (
             (insert_results == InsertResult.INSERT.value)
@@ -181,8 +182,12 @@ def test_table_dump_load(
             policy=ScorePolicy.CONST,
         )
 
-        score_out0, founds0, _ = table.lookup(keys, tid, score_arg0)
-        score_out1, founds1, _ = load_table.lookup(keys, tid, score_arg1)
+        score_out0, founds0, _ = table.lookup(
+            keys, tid, score_arg0, num_valid=full_count(keys)
+        )
+        score_out1, founds1, _ = load_table.lookup(
+            keys, tid, score_arg1, num_valid=full_count(keys)
+        )
 
         assert torch.equal(founds0, founds1)
         num_total_keys += founds0.sum()
@@ -286,7 +291,7 @@ def test_table_incremental_dump(
     ).fill_(InsertResult.INIT.value)
 
     tid = torch.randint(num_tables, (keys.numel(),), dtype=torch.int64, device=device)
-    table.insert(keys, tid, score_arg, insert_results)
+    table.insert(keys, tid, score_arg, insert_results, num_valid=full_count(keys))
 
     num_illegal = (insert_results == InsertResult.ILLEGAL.value).sum().item()
     num_initial_inserted = bucket_capacity - num_illegal
@@ -368,7 +373,8 @@ def test_table_incremental_dump(
 
             old_size = table.size()
             _, num_evict, evict_keys, _, evict_named_scores, _ = table.insert_and_evict(
-                keys, tid, score_arg, insert_results
+                keys, tid, score_arg, insert_results,
+                num_valid=full_count(keys),
             )
             new_size = table.size()
 
@@ -395,6 +401,7 @@ def test_table_incremental_dump(
             )
 
             # evicted keys are not in the table anymore, including insert failed keys.
+            evict_keys = evict_keys[: int(num_evict)]
             evict_keys_interval_mask = (evict_keys - interval_offset) >= 0
             evict_keys_interval_mask = (
                 evict_keys[evict_keys_interval_mask] - interval_offset

@@ -18,6 +18,7 @@ slots.
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -74,10 +75,10 @@ def test_pins_and_releases_on_two_streams_add_up(base):
     table_ids = torch.zeros_like(slots)
     # Load the kernel first: loading a module lazily waits for the device, which
     # would run the stalled streams dry while the rounds are being queued.
-    cache.increment_counter(slots, table_ids)
-    cache.decrement_counter(slots, table_ids)
+    cache.increment_counter(slots, table_ids, num_valid=full_count(slots))
+    cache.decrement_counter(slots, table_ids, num_valid=full_count(slots))
     for _ in range(base):
-        cache.increment_counter(slots, table_ids)
+        cache.increment_counter(slots, table_ids, num_valid=full_count(slots))
     torch.cuda.synchronize()
     start = counter.clone()
 
@@ -87,9 +88,9 @@ def test_pins_and_releases_on_two_streams_add_up(base):
             torch.cuda._sleep(STALL_CYCLES)
     for _ in range(ROUNDS):
         with torch.cuda.stream(pin_stream):
-            cache.increment_counter(slots, table_ids)
+            cache.increment_counter(slots, table_ids, num_valid=full_count(slots))
         with torch.cuda.stream(release_stream):
-            cache.decrement_counter(slots, table_ids)
+            cache.decrement_counter(slots, table_ids, num_valid=full_count(slots))
     torch.cuda.synchronize()
 
     lost = torch.count_nonzero(counter != start).item()

@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 from dynamicemb.key_value_table import (
     _expand_tables_impl,
@@ -44,7 +45,7 @@ def test_expansion_value_capacity(on_host, max_capacity, score_strategy):
         value=torch.ones_like(keys, dtype=torch.uint64),
         policy=ScorePolicy.ASSIGN,
     )
-    indices = state.key_index_map.insert(keys, table_ids, score)
+    indices = state.key_index_map.insert(keys, table_ids, score, num_valid=full_count(keys))
     values = torch.arange(3 * 384, device=device, dtype=torch.float32).view(3, 384)
     store_to_flat_single_table(state, indices, 0, values)
 
@@ -59,7 +60,9 @@ def test_expansion_value_capacity(on_host, max_capacity, score_strategy):
     assert key_rows == 384
     assert state.tables[0].shape[0] == key_rows
 
-    _, found, new_indices = state.key_index_map.lookup(keys, table_ids, score)
+    _, found, new_indices = state.key_index_map.lookup(
+        keys, table_ids, score, num_valid=full_count(keys)
+    )
     assert bool(found.all())
     torch.testing.assert_close(
         load_from_flat_single_table(state, new_indices, 0), values
@@ -108,8 +111,10 @@ def test_expansion_target_honors_max_load_factor(score_strategy):
         value=torch.ones_like(keys, dtype=torch.uint64),
         policy=ScorePolicy.ASSIGN,
     )
-    state.key_index_map.insert(keys, table_ids, score)
-    _, found, _ = state.key_index_map.lookup(keys, table_ids, score)
+    state.key_index_map.insert(keys, table_ids, score, num_valid=full_count(keys))
+    _, found, _ = state.key_index_map.lookup(
+        keys, table_ids, score, num_valid=full_count(keys)
+    )
     assert int(found.sum()) == n_keys
 
 

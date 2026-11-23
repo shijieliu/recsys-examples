@@ -24,6 +24,7 @@ import hier_switch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from dynamicemb.device_count import full_count
 from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -563,7 +564,8 @@ def check_counter_table_checkpoint(x, y):
                     policy=ScorePolicy.CONST,
                 )
                 score_out, founds, _ = cnt_y.table_.lookup(
-                    keys, lookup_table_ids, score_arg_lookup
+                    keys, lookup_table_ids, score_arg_lookup,
+                    num_valid=full_count(keys),
                 )
                 assert founds.all(), (
                     f"counter keys missing from loaded table_id={table_id}: "
