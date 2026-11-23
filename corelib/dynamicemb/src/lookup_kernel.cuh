@@ -932,7 +932,7 @@ __global__ void one_to_one_copy_kernel(CopyDesc desc, int lane_shift) {
   for (int64_t i = int64_t(blockIdx.x) * groups + (threadIdx.x >> lane_shift);
        i < n; i += int64_t(gridDim.x) * groups) {
     int64_t src_row, dst_row;
-    if (!desc.rows.resolve(i, src_row, dst_row)) continue;
+    if (!desc.rows.resolve(i, lane == 0, src_row, dst_row)) continue;
     for (int64_t col = lane; col < desc.width; col += lanes) {
       auto &out = desc.dst[dst_row * desc.dst_stride + col];
       const auto &in = desc.src[src_row * desc.src_stride + col];
@@ -949,7 +949,7 @@ __global__ void one_to_one_warp_per_ev_vec4_kernel(CopyDesc desc) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
        i < n; i += int64_t(gridDim.x) * blockDim.y) {
     int64_t src_row, dst_row;
-    if (!desc.rows.resolve(i, src_row, dst_row)) continue;
+    if (!desc.rows.resolve(i, lane == 0, src_row, dst_row)) continue;
     auto src = desc.src + src_row * desc.src_stride;
     auto dst = desc.dst + dst_row * desc.dst_stride;
 #pragma unroll

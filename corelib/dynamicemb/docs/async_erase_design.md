@@ -209,8 +209,8 @@ mechanism predicts.
 
 None of the older `dynamicemb_extensions` bindings releases the GIL. A binding that only
 **launches** holds it for microseconds. The `flagged_compact` binding
-returns its selected count on the device. The lookup passes the count directly
-to consumers that operate on the selected rows.
+returns its selected count on the device. Callers that need exact slices read the
+count with PyTorch's `.item()`, which releases the GIL during the wait.
 
 The erase binding `table_erase_by_score` releases the GIL with
 `py::call_guard<py::gil_scoped_release>()`. The worker gets its counts from

@@ -82,7 +82,8 @@ void launch_table_insert_and_evict_kernel(
     int32_t *ovf_counter_ptr = nullptr,
     int64_t *ovf_output_offsets_ptr = nullptr, int64_t score_fn_key = 0,
     int64_t *refused_ptr = nullptr,
-    RefusedOutput refused_output = RefusedOutput::PinnedFlag) {
+    RefusedOutput refused_output = RefusedOutput::PinnedFlag,
+    const int64_t *backing_rows = nullptr) {
   constexpr int BLOCK_SIZE = 256;
 
   if constexpr (PolicyTypeV == ScorePolicyType::LruLfu) {
@@ -139,7 +140,7 @@ void launch_table_insert_and_evict_kernel(
             evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
             evicted_indices_ptr, evicted_table_ids_ptr, counter_ptr, ovf_table,
             ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr,
-            num_valid_ptr, refused_ptr, refused_output);
+            num_valid_ptr, refused_ptr, refused_output, backing_rows);
   }
 
   table_unlock_kernel<Table>
@@ -276,7 +277,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
     at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key,
     std::optional<at::Tensor> refused, RefusedOutput refused_output,
-    int64_t const *global_caps_ptr, int64_t const *num_valid_ptr) {
+    int64_t const *global_caps_ptr, int64_t const *num_valid_ptr,
+    const int64_t *backing_rows) {
 
   auto key_type = get_data_type(keys);
   int64_t *refused_ptr = get_pointer<int64_t>(refused);
@@ -361,7 +363,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
                 evict_counter_, evicted_keys_, evicted_scores_ptr,
                 evicted_indices_, evicted_table_ids_ptr, counter_ptr, num_valid_ptr, stream,
                 ovf_table, ovf_bucket_sizes_, ovf_counter_ptr,
-                ovf_output_offsets_ptr, score_fn_key, refused_ptr, refused_output);
+                ovf_output_offsets_ptr, score_fn_key, refused_ptr, refused_output, backing_rows);
           } else {
             launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32,
                                                  true, ReportRefusedV>(
@@ -371,7 +373,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
                 evicted_keys_, evicted_scores_ptr, evicted_indices_,
                 evicted_table_ids_ptr, counter_ptr, num_valid_ptr, stream, ovf_table,
                 ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
-                score_fn_key, refused_ptr, refused_output);
+                score_fn_key, refused_ptr, refused_output, backing_rows);
           }
         } else {
           if (output_score) {
@@ -383,7 +385,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
                 evict_counter_, evicted_keys_, evicted_scores_ptr,
                 evicted_indices_, evicted_table_ids_ptr, counter_ptr, num_valid_ptr, stream,
                 ovf_table, ovf_bucket_sizes_, ovf_counter_ptr,
-                ovf_output_offsets_ptr, score_fn_key, refused_ptr, refused_output);
+                ovf_output_offsets_ptr, score_fn_key, refused_ptr, refused_output, backing_rows);
           } else {
             launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1,
                                                  true, ReportRefusedV>(
@@ -393,7 +395,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
                 evicted_keys_, evicted_scores_ptr, evicted_indices_,
                 evicted_table_ids_ptr, counter_ptr, num_valid_ptr, stream, ovf_table,
                 ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
-                score_fn_key, refused_ptr, refused_output);
+                score_fn_key, refused_ptr, refused_output, backing_rows);
           }
         }
       });
@@ -427,7 +429,8 @@ table_insert_and_evict(at::Tensor table_storage,
                        std::optional<at::Tensor> refused,
                        std::optional<at::Tensor> table_global_capacities,
                        std::optional<at::Tensor> num_valid,
-                       std::optional<at::Tensor> insert_status) {
+                       std::optional<at::Tensor> insert_status,
+                       std::optional<at::Tensor> backing_rows) {
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
   TORCH_CHECK(!refused.has_value() || use_overflow,
@@ -441,6 +444,16 @@ table_insert_and_evict(at::Tensor table_storage,
               "table_insert_and_evict: refused must be an int64 tensor in "
               "pinned host memory or on the same CUDA device as keys");
 
+  const int64_t *backing_row_ptr = nullptr;
+  if (backing_rows) {
+    TORCH_CHECK(insert_status && backing_rows->is_cuda() &&
+                    backing_rows->device() == keys.device() &&
+                    backing_rows->scalar_type() == at::kLong &&
+                    backing_rows->dim() == 1 && backing_rows->is_contiguous() &&
+                    backing_rows->numel() == keys.numel(),
+                "backing_rows needs insert_status and one contiguous CUDA int64 row per key");
+    backing_row_ptr = backing_rows->data_ptr<int64_t>();
+  }
   at::Tensor num_evicted;
   RefusedOutput refused_output = RefusedOutput::PinnedFlag;
   if (insert_status.has_value()) {
@@ -449,8 +462,9 @@ table_insert_and_evict(at::Tensor table_storage,
                 "insert_status needs overflow insertion and replaces refused");
     TORCH_CHECK(status.is_cuda() && status.device() == keys.device() &&
                     status.scalar_type() == at::kLong && status.dim() == 1 &&
-                    status.numel() == 3 && status.is_contiguous(),
-                "insert_status must be a contiguous int64[3] on the keys device");
+                    status.numel() == (backing_rows ? 4 : 3) && status.is_contiguous(),
+                "insert_status must be a contiguous int64 vector on the keys device "
+                "with three counts and, when backing_rows is supplied, a fourth entry");
     // The insert writes live and increments the other two entries.
     status.zero_();
     num_evicted = status.narrow(0, 1, 1);
@@ -493,7 +507,7 @@ table_insert_and_evict(at::Tensor table_storage,
         evicted_scores, evicted_table_ids, counter.value(), ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
         ovf_output_offsets.value(), num_scores, score_fn_key, refused,
-        refused_output, global_caps_ptr, num_valid_ptr);
+        refused_output, global_caps_ptr, num_valid_ptr, backing_row_ptr);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,

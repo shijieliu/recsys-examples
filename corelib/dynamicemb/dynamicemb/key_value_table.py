@@ -90,9 +90,8 @@ from dynamicemb.utils import checkpoint_dtype, decode_table_values, encode_table
 from dynamicemb_extensions import (
     EvictStrategy,
     device_timestamp,
-    fill_rows,
-    flagged_compact,
     gather_embedding,
+    flagged_compact,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
@@ -2803,14 +2802,6 @@ class DynamicEmbCache(Cache):
         )
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
-        self._placement_failed = False
-
-    def _check_placement(self) -> None:
-        if self._placement_failed:
-            raise RuntimeError(
-                "A previous cache placement failed. Restore the module from a "
-                "known-good checkpoint into a fresh instance before continuing."
-            )
 
     # -- Cache interface --
 
@@ -2849,7 +2840,6 @@ class DynamicEmbCache(Cache):
         """Lookup with overflow fallback of the first ``num_valid`` keys. Returns
         (score_out, founds, indices), one entry per key, undefined past ``num_valid``.
         While the metrics are recorded this reads the device."""
-        self._check_placement()
         state = self._state
         score_arg = get_find_score_arg(
             state,
@@ -2874,9 +2864,11 @@ class DynamicEmbCache(Cache):
         report_refused: bool = False,
         *,
         num_valid: Optional[torch.Tensor] = None,
+        backing_rows: Optional[torch.Tensor] = None,
     ) -> Tuple:
-        """Insert the live prefix of keys into the cache and return evicted rows."""
-        self._check_placement()
+        """Insert live keys. A placement report with backing_rows appends a bool
+        indicating whether any of those live keys still needs a backing row.
+        """
         state = self._state
         score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
         result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
@@ -2885,6 +2877,7 @@ class DynamicEmbCache(Cache):
             score_arg,
             report_refused=report_refused,
             num_valid=num_valid,
+            backing_rows=backing_rows,
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = (
@@ -3914,13 +3907,17 @@ class HybridStorage(Storage):
             copy_mode=copy_mode,
             num_valid=num_missing_hbm,
         )
-        # Only host-tier hits have a value and score to copy back to the original rows.
-        num_hits, host_rows, (output_rows,) = flagged_compact(
-            founds_host, [missing_indices_hbm], num_missing_hbm
+        # Update the original rows, hit flags and scores together for host-tier hits.
+        gather_embedding(
+            host_values,
+            values,
+            out_row=missing_indices_hbm,
+            num_valid=num_missing_hbm,
+            mask=founds_host,
+            found_out=founds_hbm,
+            src_aux=scores_host,
+            dst_aux=scores_hbm,
         )
-        gather_embedding(host_values, values, host_rows, output_rows, num_valid=num_hits)
-        gather_embedding(scores_host, scores_hbm, host_rows, output_rows, num_valid=num_hits)
-        fill_rows(founds_hbm, True, indices=output_rows, num_valid=num_hits)
         return _find_result(
             (
                 num_missing_both,
@@ -4575,7 +4572,6 @@ def flush_cache(
     updated. One it has evicted goes to ``external_storage``, or is dropped
     when there is none: it is not re-inserted, which would evict another row.
     """
-    cache._check_placement()
     state = cache._state
     batch_size = state.threads_in_wave
 

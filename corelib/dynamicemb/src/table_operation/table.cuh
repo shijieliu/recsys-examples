@@ -158,7 +158,8 @@ table_insert_and_evict(
     std::optional<at::Tensor> refused = std::nullopt,
     std::optional<at::Tensor> table_global_capacities = std::nullopt,
     std::optional<at::Tensor> num_valid = std::nullopt,
-    std::optional<at::Tensor> insert_status = std::nullopt);
+    std::optional<at::Tensor> insert_status = std::nullopt,
+    std::optional<at::Tensor> backing_rows = std::nullopt);
 
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -166,6 +167,13 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           ScoreType threshold, int64_t begin, int64_t end,
                           int64_t num_scores, int64_t score_index,
                           at::Tensor counts);
+
+void table_rollback_cache_placement(
+    at::Tensor storage, at::Tensor bucket_offsets, int64_t bucket_capacity,
+    at::Tensor bucket_sizes, at::Tensor overflow_storage,
+    int64_t overflow_bucket_capacity, at::Tensor overflow_sizes,
+    at::Tensor slots, at::Tensor table_ids, at::Tensor evicted_keys,
+    at::Tensor evicted_slots, at::Tensor evicted_scores, at::Tensor evicted_table_ids);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,

@@ -707,6 +707,27 @@ def test_gather_embedding_with_output_rows(n, dtype, inner):
     assert _same(dst, ref)
 
 
+@pytest.mark.parametrize("n", [0, 3])
+def test_gather_embedding_slot_and_row_outputs(n):
+    positions = torch.tensor([4, -1, 0, 2, HUGE], device="cuda")
+    new_slots = torch.tensor([17, 18, 19, 20, 21], device="cuda")
+    new_rows = torch.tensor([31, 32, 33, 34, 35], device="cuda")
+    slots = torch.full((6,), -1, dtype=torch.int64, device="cuda")
+    rows = torch.full_like(slots, -2)
+
+    gather_embedding(
+        new_slots,
+        slots,
+        out_row=positions,
+        num_valid=_nv(n),
+        src_aux=new_rows,
+        dst_aux=rows,
+    )
+
+    assert slots.tolist() == ([19, -1, -1, -1, 17, -1] if n else [-1] * 6)
+    assert rows.tolist() == ([33, -2, -2, -2, 31, -2] if n else [-2] * 6)
+
+
 @pytest.mark.parametrize(
     "n, dtype, value",
     [(n, torch.int64, -1) for n in NS] + [(CAP // 2, torch.int64, 7)]
@@ -764,6 +785,46 @@ def test_rows_of_strided_views():
     ref[idx[sel], 1 : 1 + c] = rows[sel]
     gather_embedding(rows, dst[:, 1 : 1 + c], out_row=idx, num_valid=_nv(n))
     assert torch.equal(dst, ref)
+
+
+@pytest.mark.parametrize("count", [None, 0, 4])
+def test_gather_embedding_merges_only_found_rows(count):
+    # Source and destination occupy disjoint columns in the same pitched allocation.
+    # The masked-out entry has an invalid destination, and only the exact-length
+    # call may visit the last two entries.
+    columns = 5
+    backing = torch.arange(6 * 13, dtype=torch.float32, device="cuda").view(6, 13)
+    source = backing[:, 1 : 1 + columns]
+    dest = backing[:, 7 : 7 + columns]
+    positions = torch.tensor([4, HUGE, 1, -1, 0, 2], device="cuda")
+    mask = torch.tensor([True, False, True, True, True, True], device="cuda")
+    scores = torch.arange(6, dtype=torch.int64, device="cuda") + (1 << 56)
+    dest_scores = torch.full_like(scores, -7)
+    dest_found = torch.tensor([False, False, False, True, False, False], device="cuda")
+
+    live = positions.numel() if count is None else count
+    selected = (mask[:live] & (positions[:live] >= 0)).nonzero().flatten()
+    rows = positions[selected]
+    expected = backing.clone()
+    expected[rows, 7 : 7 + columns] = source[selected]
+    expected_scores = dest_scores.clone()
+    expected_scores[rows] = scores[selected]
+    expected_found = dest_found.clone()
+    expected_found[rows] = True
+
+    gather_embedding(
+        source,
+        dest,
+        out_row=positions,
+        mask=mask,
+        found_out=dest_found,
+        src_aux=scores,
+        dst_aux=dest_scores,
+        num_valid=None if count is None else _nv(count),
+    )
+    torch.testing.assert_close(backing, expected, rtol=0, atol=0)
+    assert torch.equal(dest_scores, expected_scores)
+    assert torch.equal(dest_found, expected_found)
 
 
 @pytest.mark.parametrize("n", [1, BIG // 2 + 1, BIG])
