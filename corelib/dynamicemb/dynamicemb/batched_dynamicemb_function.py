@@ -96,7 +96,7 @@ def segmented_unique(
     segment_range: torch.Tensor,
     evict_strategy: Optional[EvictStrategy] = None,
     frequency_counts: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Perform segmented unique operation on keys with segment_range.
 
@@ -112,32 +112,22 @@ def segmented_unique(
 
     Returns:
         Tuple of (unique_keys, reverse_indices, unique_keys_table_range,
-                  output_scores, unique_size_per_table).
-        unique_size_per_table is a CPU tensor of shape (num_tables,) with
-        per-table unique counts; total unique count is its sum or
-        unique_keys_table_range[-1].
+                  output_scores). Unique keys and any scores have input capacity.
+        Only their first unique_keys_table_range[-1] entries are live. The
+        per-table offsets and the final count are on the input device.
     """
     with torch.cuda.nvtx.range("op:segmented_unique"):
-        num_keys = keys.size(0)
-        num_tables = segment_range.size(0) - 1
+        host_num_keys = keys.size(0)
+        host_num_tables = segment_range.size(0) - 1
         device = keys.device
 
-        if num_keys == 0:
+        if host_num_keys == 0:
             empty_keys = torch.empty(0, dtype=keys.dtype, device=device)
             empty_reverse_indices = torch.empty(0, dtype=torch.int64, device=device)
             d_table_range = torch.zeros(
-                num_tables + 1, dtype=torch.int64, device=device
+                host_num_tables + 1, dtype=torch.int64, device=device
             )
-            unique_size_per_table = torch.zeros(
-                num_tables, dtype=torch.int64, device="cpu"
-            )
-            return (
-                empty_keys,
-                empty_reverse_indices,
-                d_table_range,
-                None,
-                unique_size_per_table,
-            )
+            return empty_keys, empty_reverse_indices, d_table_range, None
 
         is_lfu_enabled = (
             evict_strategy == EvictStrategy.KLfu if evict_strategy else False
@@ -156,27 +146,12 @@ def segmented_unique(
             reverse_indices,
             table_offsets,
             freq_counters,
-        ) = segmented_unique_cuda(keys, segment_range, num_tables, input_frequencies)
-
-        table_offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(table_offsets)
-        total_unique = table_offsets_cpu[num_tables].item()
-        unique_size_per_table = (
-            table_offsets_cpu[1 : num_tables + 1] - table_offsets_cpu[0:num_tables]
+        ) = segmented_unique_cuda(
+            keys, segment_range, host_num_tables, input_frequencies
         )
 
-        unique_keys_out = unique_keys[:total_unique]
-
-        output_scores = None
-        if need_frequency_output and total_unique > 0:
-            output_scores = freq_counters[:total_unique]
-
-        return (
-            unique_keys_out,
-            reverse_indices,
-            table_offsets,
-            output_scores,
-            unique_size_per_table,
-        )
+        output_scores = freq_counters if need_frequency_output else None
+        return unique_keys, reverse_indices, table_offsets, output_scores
 
 
 def largest_score_per_unique_key(
@@ -944,13 +919,25 @@ def dynamicemb_prefetch(
             reverse_indices,
             unique_indices_table_range,
             lfu_accumulated_frequency,
-            unique_size_per_table,
         ) = segmented_unique(
             indices,
             indices_table_range,
             evict_strat,
             frequency_counts_int64,
         )
+        # Prefetch still passes exact-size buffers to lookup. Read the offsets
+        # once to get both the total and the per-table counts for storage growth.
+        if indices.numel():
+            host_offsets = _copy_cuda_tensor_to_pinned_cpu(unique_indices_table_range)
+            host_num_unique = int(host_offsets[-1].item())
+            host_unique_per_table = host_offsets[1:] - host_offsets[:-1]
+            unique_keys = unique_keys[:host_num_unique]
+            if lfu_accumulated_frequency is not None:
+                lfu_accumulated_frequency = lfu_accumulated_frequency[:host_num_unique]
+        else:
+            host_unique_per_table = torch.zeros(
+                table_num, dtype=torch.int64, device="cpu"
+            )
         unique_scores = (
             None
             if scores is None
@@ -977,7 +964,7 @@ def dynamicemb_prefetch(
 
         with table_section(table_gate):
             if hasattr(storage, "expand_if_need"):
-                storage.expand_if_need(unique_size_per_table)
+                storage.expand_if_need(host_unique_per_table)
 
             if storage_mode == StorageMode.CACHE:
                 (
@@ -1107,14 +1094,18 @@ def dynamicemb_eval_forward(
             unique_indices,
             reverse_indices,
             unique_indices_table_range,
-            lfu_accumulated_frequency,
-            unique_size_per_table,
+            _,
         ) = segmented_unique(
             indices,
             indices_table_range,
             evict_strat,
             frequency_counts_int64,
         )
+
+        # Pooled evaluation uses the exact unique-row count for lookup.
+        if indices.numel():
+            host_num_unique = int(_scalar_item(unique_indices_table_range[-1]))
+            unique_indices = unique_indices[:host_num_unique]
 
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,

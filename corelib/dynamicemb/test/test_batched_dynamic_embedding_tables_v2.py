@@ -33,6 +33,7 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
+from dynamicemb.batched_dynamicemb_function import segmented_unique
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
@@ -61,6 +62,7 @@ from dynamicemb.optimizer import (
 )
 from dynamicemb.types import KEY_TYPE, CopyMode
 from dynamicemb.utils import FP8_STORAGE_DTYPE
+from dynamicemb_extensions import EvictStrategy
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -77,6 +79,55 @@ POOLING_MODE: Dict[DynamicEmbPoolingMode, PoolingMode] = {
     DynamicEmbPoolingMode.MEAN: PoolingMode.MEAN,
     DynamicEmbPoolingMode.SUM: PoolingMode.SUM,
 }
+
+
+@pytest.mark.parametrize(
+    "strategy, frequencies, expected",
+    [
+        (None, None, None),
+        (EvictStrategy.KLfu, None, [2, 2, 1, 1, 2, 2]),
+        (None, [2, 3, 5, 7, 11, 13], [5, 5, 5, 7, 24, 24]),
+    ],
+)
+def test_segmented_unique_device_offsets(strategy, frequencies, expected, monkeypatch):
+    # Debug validation deliberately inspects the segment boundaries on the host.
+    monkeypatch.delenv("DYNAMICEMB_DEBUG", raising=False)
+    keys = torch.tensor([3, 3, 7, 3, 9, 9], device="cuda")
+    segments = torch.tensor([0, 3, 3, 6], device="cuda")
+    if frequencies is not None:
+        frequencies = torch.tensor(frequencies, device="cuda")
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        unique, reverse, offsets, scores = segmented_unique(
+            keys, segments, strategy, frequencies
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+    assert unique.shape == reverse.shape == keys.shape
+    assert offsets.device == keys.device
+    assert offsets.tolist() == [0, 2, 2, 4]
+    assert torch.equal(unique[reverse], keys)
+    assert reverse[:3].max().item() < 2 <= reverse[3:].min().item()
+    if expected is None:
+        assert scores is None
+    else:
+        assert scores.shape == keys.shape
+        assert scores[reverse].tolist() == expected
+
+
+def test_segmented_unique_empty_input_device_offsets():
+    keys = torch.empty(0, dtype=torch.int64, device="cuda")
+    segments = torch.zeros(4, dtype=torch.int64, device="cuda")
+    unique, reverse, offsets, scores = segmented_unique(
+        keys, segments, EvictStrategy.KLfu
+    )
+    assert unique.shape == reverse.shape == keys.shape
+    assert offsets.device == keys.device
+    assert offsets.tolist() == [0, 0, 0, 0]
+    assert scores is None
+
 
 # Strict table expansion: modest max_capacity so we can insert every slot exactly once.
 _CACHE_RATIO = 0.25
