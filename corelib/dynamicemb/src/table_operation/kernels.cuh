@@ -19,6 +19,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "device_count.cuh"
 #include "jit/evict_comparators.cuh"
+#include "segment_offsets.cuh"
 #include "types.cuh"
 #include <cub/cub.cuh>
 
@@ -86,23 +87,36 @@ struct EvalAndCount {
   }
 };
 
+// Cache prefetch consumes segmented-unique keys and publishes their table IDs
+// alongside per-key misses and slots for the subsequent backing lookup.
+struct CacheLookupRows {
+  int64_t const *key_offsets;
+  int num_tables;
+  int64_t *table_ids;
+  int32_t *counter;
+};
+
 template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
-          bool EnableOverflow = false>
+          bool EnableOverflow = false, bool CachePrefetch = false>
 __global__ void table_lookup_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int64_t batch, typename Table::KeyType const *__restrict__ input_keys,
-    int64_t const *__restrict__ table_ids, bool *__restrict__ founds,
+    int64_t const *__restrict__ table_ids, bool *__restrict__ flags,
     IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
     int64_t *__restrict__ score_output, Table ovf_table,
     int64_t const *__restrict__ ovf_output_offsets,
-    int64_t const *__restrict__ num_valid) {
+    int64_t const *__restrict__ num_valid, CacheLookupRows cache = {}) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t n = counted_limit(num_valid, batch);
+  int64_t n = counted_limit(num_valid, batch);
+  if constexpr (CachePrefetch) {
+    // The unique buffer can have padding even without a device count.
+    n = counted_limit(cache.key_offsets + cache.num_tables, n);
+  }
 
   for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 
@@ -114,15 +128,24 @@ __global__ void table_lookup_kernel(
     int64_t bkt_begin = 0;
     int64_t table_cap = 0;
     int64_t t_id = 0;
+    if constexpr (CachePrefetch) {
+      if (cache.num_tables > 1) {
+        t_id = binary_search_upper_bound(cache.key_offsets, cache.num_tables, i);
+      }
+      cache.table_ids[i] = t_id;
+    }
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
-      t_id = table_ids[i];
+      if constexpr (!CachePrefetch)
+        t_id = table_ids[i];
       table.home_bucket(table_bucket_offsets, t_id, hashcode, &bucket_id,
                         &bkt_begin, &table_cap);
     }
     if (table_cap == 0) {
-      score_output[i] = static_cast<int64_t>(score);
-      founds[i] = false;
+      if constexpr (!CachePrefetch)
+        score_output[i] = static_cast<int64_t>(score);
+      // Cache prefetch exposes the miss mask. Table lookup exposes the hit mask.
+      flags[i] = CachePrefetch;
       indices[i] = -1;
       continue;
     }
@@ -136,7 +159,8 @@ __global__ void table_lookup_kernel(
       if constexpr (PolicyType == ScorePolicyType::Const) {
         // Return the reduction score (frequency for LruLfu; word 0 otherwise),
         // not word 0 which for LruLfu is the timestamp.
-        score = *bucket.reduction_score(iter);
+        if constexpr (!CachePrefetch)
+          score = *bucket.reduction_score(iter);
       } else {
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
@@ -152,6 +176,8 @@ __global__ void table_lookup_kernel(
 
       if (found) {
         index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
+        if constexpr (CachePrefetch)
+          atomicAdd(cache.counter + bucket_id * bucket.capacity() + iter, 1);
       }
     }
 
@@ -166,9 +192,16 @@ __global__ void table_lookup_kernel(
           found = true;
           index = ovf_out_iter;
           Iter local = ovf_out_iter - ovf_output_offsets[t_id];
+          if constexpr (CachePrefetch) {
+            // All main slots precede the per-table overflow buckets in the
+            // shared ref counter. Backward can unpin on another stream.
+            const auto flat = table.capacity() + t_id * ovf_bucket.capacity() + local;
+            atomicAdd(cache.counter + flat, 1);
+          }
           if constexpr (PolicyType == ScorePolicyType::Const) {
             // Reduction score (frequency for LruLfu), not word 0 (timestamp).
-            score = *ovf_bucket.reduction_score(local);
+            if constexpr (!CachePrefetch)
+              score = *ovf_bucket.reduction_score(local);
           } else {
             // Maintain the overflow entry's score on access (stamp timestamp /
             // accumulate frequency), mirroring the main-table found path; for
@@ -185,8 +218,9 @@ __global__ void table_lookup_kernel(
       }
     }
 
-    score_output[i] = static_cast<int64_t>(score);
-    founds[i] = found;
+    if constexpr (!CachePrefetch)
+      score_output[i] = static_cast<int64_t>(score);
+    flags[i] = CachePrefetch ? !found : found;
     indices[i] = index;
   }
 }

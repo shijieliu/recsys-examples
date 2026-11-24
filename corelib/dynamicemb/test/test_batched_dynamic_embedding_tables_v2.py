@@ -3725,11 +3725,9 @@ def test_dump_optimizer_states_ckpt_width(
 def test_multi_table_caching_flush(opt_type, opt_params):
     """Multi-table caching mode: prefetch, forward, flush, verify cache metrics.
 
-    ``DynamicEmbCache`` updates ``cache_metrics[0]`` (last lookup unique count) and
-    ``[1]`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
-    Prefetch calls ``lookup``; training forward with cache loads from flat via
-    ``slot_indices`` and does not call ``lookup`` again. The first prefetch is thus
-    cold (all misses); a second prefetch on the same keys should record all hits.
+    Prefetch records the unique key count and hit count in ``cache_metrics[:2]``.
+    Training forward reads the prefetched slots. The first prefetch is cold and
+    a second prefetch on the same keys should record all hits.
     """
     assert torch.cuda.is_available()
     device_id = 0

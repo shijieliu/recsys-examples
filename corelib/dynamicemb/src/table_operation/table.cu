@@ -106,6 +106,25 @@ void bind_table_operation(py::module &m) {
         py::kw_only(), py::arg("num_valid") = py::none(),
         py::arg("host_num_valid") = py::none());
 
+  m.def("lookup_in_cache", &dyn_emb::lookup_in_cache,
+        R"doc(Probe the cache for segmented keys and atomically pin each hit.
+
+Return (miss_in_cache, slots, table_ids), each of shape (keys.numel(),).
+In the live prefix, miss_in_cache is true and slots is -1 for a miss.
+A hit has a table-local slot (including overflow) and a false miss flag.
+table_ids identifies the input segment for both hits and misses.
+
+The live length is the minimum of keys.numel(), key_table_offsets[-1],
+and each supplied bound (host_num_valid, num_valid), clamped at zero.
+Outputs beyond the live length are undefined.)doc",
+        py::arg("keys"), py::arg("key_table_offsets"), py::arg("table_storage"),
+        py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
+        py::arg("counter"), py::arg("ovf_storage"), py::arg("ovf_bucket_capacity"),
+        py::arg("ovf_output_offsets"), py::arg("score_input"),
+        py::arg("policy_type"), py::arg("num_scores") = 1,
+        py::arg("table_global_capacities") = py::none(), py::kw_only(),
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
+
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),

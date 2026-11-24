@@ -450,7 +450,7 @@ def _prefetch_cache_path(
     cache: DynamicEmbCache,
     storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
-    unique_table_ids: torch.Tensor,
+    unique_table_offsets: torch.Tensor,
     num_unique: torch.Tensor,
     max_emb_dim: int,
     max_val_dim: int,
@@ -459,7 +459,7 @@ def _prefetch_cache_path(
     admitter: Optional[MultiTableAdmitter],
     external_storage: Optional[Storage] = None,
     key_scores: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
     """Cache prefetch with counter protection and overflow buffer.
 
     ``storage`` is the tier that owns every key's score; the cache above it
@@ -481,26 +481,28 @@ def _prefetch_cache_path(
     count of the arrays it is given. Cache insertion reports the placement result
     to the host once, sizing all subsequent work.
 
-    Returns the slots and an optional (rejected positions, device count) pair.
+    Returns the table IDs, slots, and optional (rejected positions, device count)
+    pair. Table IDs and slots are in unique-key order.
     """
     with torch.cuda.nvtx.range("_prefetch_cache_path"):
         device = unique_keys.device
         state = cache._state
         if unique_keys.numel() == 0:
-            return torch.empty(0, dtype=torch.int64, device=device), None
+            empty = torch.empty(0, dtype=torch.int64, device=device)
+            return empty, empty, None
 
-        # 1. Lookup with overflow fallback; pin what is found. A key that is not in the
-        # cache has slot -1, which the counter kernel skips. ``slot_indices`` is the
-        # array the lookup allocated; the later steps write the slots of the misses
-        # into it.
+        # 1. Resolve table IDs, probe main and overflow buckets, and pin hits.
+        # Placement later fills the -1 slots at the original miss positions.
         with torch.cuda.nvtx.range("op:cache_lookup"):
-            _, founds, slot_indices = cache.lookup(
-                unique_keys, unique_table_ids, num_valid=num_unique
+            miss_in_cache, slot_indices, unique_table_ids = cache.lookup_and_pin(
+                unique_keys, unique_table_offsets
             )
-        cache.increment_counter(slot_indices, unique_table_ids, num_valid=num_unique)
 
         placing = False
         try:
+            cache.record_lookup_metrics(
+                miss_in_cache, num_unique, mask_marks_misses=True
+            )
             # 2. Storage is the only place scores live: a key-only lookup of *every*
             # key -- hits included, and even when nothing missed -- updates its score
             # there without moving a value. The cache only ranks by timestamp.
@@ -527,8 +529,8 @@ def _prefetch_cache_path(
                     unique_table_ids,
                     weights=accumulated_frequency if admitter is not None else None,
                     scores=score_input,
-                    mask=founds,
-                ).compact(num_unique, invert=True, backing_rows=st_rows)
+                    mask=miss_in_cache,
+                ).compact(num_unique, backing_rows=st_rows)
             assert misses.backing_rows is not None
             cache_batch = misses
             into_cache = None
@@ -654,7 +656,7 @@ def _prefetch_cache_path(
 
             host_num_attempted = cache_slots.numel()
             if host_num_attempted == 0:
-                return slot_indices, non_admitted
+                return unique_table_ids, slot_indices, non_admitted
 
             # The placement report sliced the eviction arrays to their live length.
             # Reuse the GPU count for writeback. On partial refusal the eviction
@@ -735,7 +737,7 @@ def _prefetch_cache_path(
             out_row=cache_batch.output_rows[:host_num_attempted],
             num_valid=cache_batch.num_valid,
         )
-        return slot_indices, non_admitted
+        return unique_table_ids, slot_indices, non_admitted
 
 
 def _prefetch_hbm_direct_path(
@@ -992,9 +994,10 @@ def dynamicemb_prefetch(
         # Deduplication keeps input-capacity buffers. The final offset is the
         # live length and stays on the GPU through every unique-row consumer.
         num_unique = unique_indices_table_range[-1:]
-        unique_table_ids = expand_table_ids_cuda(
-            unique_indices_table_range, unique_keys.numel()
-        )
+        if not caching:
+            unique_table_ids = expand_table_ids_cuda(
+                unique_indices_table_range, unique_keys.numel()
+            )
 
         slot_indices = None
         non_admitted = None
@@ -1012,11 +1015,11 @@ def dynamicemb_prefetch(
                 storage.expand_if_need(host_unique_per_table)
 
             if storage_mode == StorageMode.CACHE:
-                slot_indices, non_admitted = _prefetch_cache_path(
+                unique_table_ids, slot_indices, non_admitted = _prefetch_cache_path(
                     cache,
                     storage,
                     unique_keys,
-                    unique_table_ids,
+                    unique_indices_table_range,
                     num_unique,
                     max_emb_dim,
                     max_val_dim,

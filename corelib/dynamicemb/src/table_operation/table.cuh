@@ -111,6 +111,20 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              const std::optional<at::Tensor> &num_valid = std::nullopt,
              std::optional<int64_t> host_num_valid = std::nullopt);
 
+// Cache prefetch pins hits and returns (miss mask, local slot, table id) in
+// segmented-unique order. Only the live prefix of each output is defined.
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+lookup_in_cache(at::Tensor keys, at::Tensor key_table_offsets,
+                at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                int64_t bucket_capacity, at::Tensor counter,
+                at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
+                at::Tensor ovf_output_offsets,
+                std::optional<at::Tensor> score_input,
+                ScorePolicyType policy_type, int64_t num_scores,
+                std::optional<at::Tensor> table_global_capacities,
+                const std::optional<at::Tensor> &num_valid,
+                std::optional<int64_t> host_num_valid);
+
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
                         int64_t bucket_capacity, at::Tensor bucket_sizes,

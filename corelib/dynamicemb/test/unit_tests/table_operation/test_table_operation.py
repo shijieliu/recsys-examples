@@ -26,6 +26,7 @@ from dynamicemb_extensions import (
     InsertResult,
     ScorePolicy,
     bucketize_keys,
+    lookup_in_cache,
     table_insert_collect_evicted,
     table_lookup,
     table_partition,
@@ -1357,6 +1358,81 @@ def test_native_table_prefix_bounds(host_n, device_n, live, policy):
         *storage, keys, table_ids, None, CONST, num_scores=table.num_scores_
     )
     assert torch.equal(found, torch.arange(len(keys), device="cuda") < live)
+
+
+@pytest.mark.parametrize(
+    "host_n,device_n,policy,n",
+    [
+        (None, None, ASSIGN, 8),
+        (None, None, CONST, 8),
+        (5, None, ASSIGN, 5),
+        (9, 6, ASSIGN, 6),
+        (6, 9, ASSIGN, 6),
+        (0, 8, ASSIGN, 0),
+        (8, 0, ASSIGN, 0),
+    ],
+)
+def test_lookup_in_cache_matches_lookup_and_pin(host_n, device_n, policy, n):
+    table = _table(caps=(256, 128, 128), enable_overflow=True)
+    # Fill and pin the last table's single bucket so that key 900 lands in
+    # overflow. Key 1 is resident in both the first and the last tables.
+    resident = torch.arange(1, 129, device="cuda")
+    last_table = torch.full_like(resident, 2)
+    scores = _arg(resident.to(torch.uint64))
+    slots = table.insert(resident, last_table, scores)
+    table.increment_counter(slots, last_table)
+    table.insert(resident[:1], torch.zeros_like(resident[:1]), _arg(None, CONST))
+    overflow_key = torch.tensor([900], device="cuda")
+    overflow_slots, *_ = table.insert_and_evict_with_counter_and_overflow(
+        overflow_key, last_table[:1], _arg(overflow_key.to(torch.uint64))
+    )
+    assert overflow_slots.item() >= 128
+
+    # An empty middle segment skips table 1. Two extra resident keys in the
+    # physical tail would acquire extra pins if the final offset were ignored.
+    keys = torch.tensor([1, 9999, -1, 2, 900, 9999, -2, 1, 3, 4], device="cuda")
+    offsets = torch.tensor([0, 3, 3, 8], device="cuda")
+    ids = torch.tensor([0, 0, 0, 2, 2, 2, 2, 2], device="cuda")
+    score_input = None
+    if policy == ASSIGN:
+        score_input = torch.arange(1000, 1000 + len(keys), device="cuda").to(torch.uint64)
+    reference_score = _arg(None if score_input is None else score_input[:n], policy)
+
+    # Use the same physical hash tables on both paths so that their slot
+    # numbers, score updates and complete counter buffers can be compared.
+    state = (table.table_storage_, table.overflow_table_storage_, table._ref_counter)
+    before = [tensor.clone() for tensor in state]
+    _, hits, expected_slots = table.lookup_with_overflow(
+        keys[:n], ids[:n], reference_score
+    )
+    table.increment_counter(expected_slots, ids[:n])
+    expected_state = [tensor.clone() for tensor in state]
+    for tensor, saved in zip(state, before):
+        tensor.copy_(saved)
+
+    misses, slots, table_ids = lookup_in_cache(
+        keys,
+        offsets,
+        table.table_storage_,
+        table.table_bucket_offsets_,
+        table.bucket_capacity_,
+        table._ref_counter,
+        table.overflow_table_storage_,
+        table.overflow_bucket_capacity_,
+        table.overflow_output_offsets_,
+        score_input,
+        policy,
+        num_scores=table.num_scores_,
+        table_global_capacities=table.table_global_capacities_,
+        num_valid=None if device_n is None else _nv(device_n),
+        host_num_valid=host_n,
+    )
+    assert misses.shape == slots.shape == table_ids.shape == keys.shape
+    torch.testing.assert_close(misses[:n], ~hits)
+    torch.testing.assert_close(slots[:n], expected_slots)
+    torch.testing.assert_close(table_ids[:n], ids[:n])
+    for tensor, expected in zip(state, expected_state):
+        torch.testing.assert_close(tensor, expected)
 
 
 @pytest.mark.parametrize("count, live", [(-3, 0), (CAP + 9, CAP)])
