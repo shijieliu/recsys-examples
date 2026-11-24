@@ -22,7 +22,6 @@ from typing import Any, Dict, Optional, Union
 
 import torch  # usort:skip
 from dynamicemb.utils import DTYPE_NUM_BYTES, FP8_STORAGE_DTYPE, torch_to_dyn_emb
-from dynamicemb.device_count import full_count
 from dynamicemb_extensions import (
     adagrad_update_for_flat_table,
     adagrad_update_for_padded_buffer,
@@ -185,7 +184,8 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         ...
 
@@ -199,7 +199,8 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         ...
 
@@ -262,9 +263,10 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         indices: Optional[torch.Tensor] = None,
         emb_dims: Optional[Union[int, torch.Tensor]] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
         table_ids: Optional[torch.Tensor] = None,
         table_emb_dims: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Reset a batch of rows' optimizer state to its initial value, in place.
 
@@ -293,7 +295,10 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
 
         The default fills every element with the same scalar.
         """
-        fill_rows(optim_states, self.get_initial_optimizer_state(), num_valid, indices)
+        fill_rows(
+            optim_states, self.get_initial_optimizer_state(), num_valid, indices,
+            host_num_valid=host_num_valid,
+        )
 
     def _check_state_width(
         self,
@@ -378,7 +383,8 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         sgd_update_for_padded_buffer(
             grads,
@@ -390,6 +396,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             self._opt_args.learning_rate,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -403,7 +410,8 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         sgd_update_for_flat_table(
             grads,
@@ -417,6 +425,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.learning_rate,
             torch_to_dyn_emb(table_dtype).value,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def get_opt_args(self):
@@ -469,7 +478,8 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         adam_update_for_padded_buffer(
             grads,
@@ -486,6 +496,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.weight_decay,
             self._iterations,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -499,7 +510,8 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         adam_update_for_flat_table(
             grads,
@@ -518,6 +530,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def get_opt_args(self):
@@ -561,7 +574,8 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         adagrad_update_for_padded_buffer(
             grads,
@@ -574,6 +588,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.learning_rate,
             self._opt_args.eps,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -587,7 +602,8 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         adagrad_update_for_flat_table(
             grads,
@@ -602,6 +618,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def get_opt_args(self):
@@ -642,7 +659,8 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         rowwise_adagrad_for_padded_buffer(
             grads,
@@ -656,6 +674,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.eps,
             torch_to_dyn_emb(self.get_state_dtype(values.dtype)).value,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -669,7 +688,8 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         rowwise_adagrad_for_flat_table(
             grads,
@@ -685,6 +705,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             torch_to_dyn_emb(table_dtype).value,
             torch_to_dyn_emb(self.get_state_dtype(table_dtype)).value,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def get_opt_args(self):
@@ -750,9 +771,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         indices: Optional[torch.Tensor] = None,
         emb_dims: Optional[Union[int, torch.Tensor]] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
         table_ids: Optional[torch.Tensor] = None,
         table_emb_dims: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Seed the slot with the initial accumulator value, at the state's precision."""
         fill_rows(
@@ -761,6 +783,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             num_valid,
             indices,
             fp32_words=self._packs_fp32_in_words(optim_states.dtype),
+            host_num_valid=host_num_valid,
         )
 
     def states_for_checkpoint(
@@ -804,7 +827,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         )
         # The slack the file does not cover is not read by the kernel, but seed
         # it the way a fresh row would be rather than leaving it uninitialized.
-        self.reset_optimizer_states(out, emb_dims=emb_dim, num_valid=full_count(out))
+        self.reset_optimizer_states(out, emb_dims=emb_dim)
         accumulator = optim_states.to(device=device, dtype=torch.float32)
         if self._packs_fp32_in_words(values_dtype):
             words_per_fp32 = 4 // DTYPE_NUM_BYTES[values_dtype]
@@ -917,7 +940,8 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         ftrl_update_for_padded_buffer(
             grads,
@@ -934,6 +958,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.l2_reg,
             self._opt_args.group_lasso_reg,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -947,7 +972,8 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         ftrl_update_for_flat_table(
             grads,
@@ -966,6 +992,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             torch_to_dyn_emb(table_dtype).value,
             self._opt_args.group_lasso_reg,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def get_opt_args(self):
@@ -1013,15 +1040,18 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         indices: Optional[torch.Tensor] = None,
         emb_dims: Optional[Union[int, torch.Tensor]] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
         table_ids: Optional[torch.Tensor] = None,
         table_emb_dims: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         accum = self._opt_args.initial_accumulator_value
         if accum == 0.0:
             # Both halves start at zero, so the uniform fill is exact and the
             # row widths do not matter.
-            super().reset_optimizer_states(optim_states, indices, num_valid=num_valid)
+            super().reset_optimizer_states(
+                optim_states, indices, num_valid=num_valid, host_num_valid=host_num_valid
+            )
             return
 
         if table_ids is not None and table_emb_dims is not None:
@@ -1038,4 +1068,6 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 "FTRL with a nonzero initial accumulator needs emb_dims or "
                 "both table_ids and table_emb_dims."
             )
-        reset_ftrl_states(optim_states, table_ids, widths, accum, num_valid, indices)
+        reset_ftrl_states(
+            optim_states, table_ids, widths, accum, num_valid, indices, host_num_valid
+        )

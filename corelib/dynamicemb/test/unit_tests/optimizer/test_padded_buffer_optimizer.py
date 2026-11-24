@@ -498,17 +498,73 @@ def test_random_initializer(with_indices):
     assert torch.equal(base != SENTINEL, written)
 
 
+# A host bound sizes the launch. A device count can shorten that launch further.
+# Keep a row map whose first entry points beyond either bound.
+PREFIX_CASES = [(None, None, 4), (2, None, 2), (None, 1, 1), (3, 1, 1), (1, 3, 1), (0, 3, 0)]
+
+
+@pytest.fixture(params=PREFIX_CASES)
+def row_prefix(request):
+    host, device, expected = request.param
+    kwargs = {}
+    if host is not None:
+        kwargs["host_num_valid"] = host
+    if device is not None:
+        kwargs["num_valid"] = nv(device)
+    return kwargs, expected
+
+
 @cuda
 @pytest.mark.parametrize("indexed", [False, True])
-def test_initializer_requires_device_count(indexed):
-    buf = torch.zeros(BUF_ROWS, WIDTH, device=DEV)
-    indices = i64([0]) if indexed else None
-    with pytest.raises(TypeError, match="num_valid"):
-        dynamicemb_extensions.const_init(buf, indices, 1.0)
-    with pytest.raises((TypeError, RuntimeError), match="num_valid"):
-        dynamicemb_extensions.const_init(buf, indices, 1.0, None)
+def test_initializer_row_prefix(row_prefix, indexed):
+    kwargs, n = row_prefix
+    buf = torch.zeros(4, WIDTH, device=DEV)
+    rows = i64([3, 2, 1, 0]) if indexed else None
+    init = MultiTableInitializer.create(
+        [DynamicEmbInitializerArgs(mode=DynamicEmbInitializerMode.CONSTANT, value=1.0)],
+        torch.device(DEV),
+    )
+    init(buf, None, indices=rows, **kwargs)
+    expected = torch.zeros_like(buf)
+    expected[rows[:n] if indexed else slice(n)] = 1.0
+    torch.testing.assert_close(buf, expected)
+
+
+@cuda
+def test_initializer_validates_supplied_count():
+    buf = torch.zeros(4, WIDTH, device=DEV)
     with pytest.raises(RuntimeError, match="num_valid"):
-        dynamicemb_extensions.const_init(buf, indices, 1.0, torch.tensor([1]))
+        dynamicemb_extensions.const_init(buf, None, 1.0, torch.tensor([1]))
+
+
+@cuda
+def test_flat_copy_row_prefix(row_prefix):
+    kwargs, n = row_prefix
+    source = torch.arange(16, device=DEV, dtype=torch.float32).view(4, 4)
+    rows = i64([3, 1, 2, 0])
+    ptrs, dims = i64([source.data_ptr()]), i64([4])
+    out = torch.full_like(source, SENTINEL)
+    dynamicemb_extensions.load_from_flat_table_contiguous(
+        ptrs, rows, 0, out, dims, dims, 4, True, **kwargs
+    )
+    expected = torch.full_like(source, SENTINEL)
+    expected[:n] = source[rows[:n]]
+    torch.testing.assert_close(out, expected)
+
+    table = torch.full_like(source, SENTINEL)
+    dynamicemb_extensions.store_to_flat_table_contiguous(
+        i64([table.data_ptr()]), rows, 0, source, dims, dims, 4, True,
+        input_rows=rows, **kwargs
+    )
+    expected.fill_(SENTINEL)
+    expected[rows[:n]] = source[rows[:n]]
+    torch.testing.assert_close(table, expected)
+
+    out.fill_(SENTINEL)
+    dynamicemb_extensions.gather_embedding(source, out, rows, **kwargs)
+    expected.fill_(SENTINEL)
+    expected[:n] = source[rows[:n]]
+    torch.testing.assert_close(out, expected)
 
 
 # -- optimizer updates ---------------------------------------------------------
@@ -543,6 +599,30 @@ def flat_update(opt, t, g, idx, ids, **kw):
     opt.fused_update_for_flat_table(
         g, idx, t["ptrs"], ids, *t["args"], torch.float32, **kw
     )
+
+
+@cuda
+def test_optimizer_row_prefix(row_prefix):
+    kwargs, n = row_prefix
+    opt = make_optimizer("sgd")
+    grads = torch.ones(4, 4, device=DEV)
+    table_ids, dims = i64([0] * 4), i64([4])
+
+    values = torch.zeros_like(grads)
+    opt.update_for_padded_buffer(grads, values, table_ids, dims, 4, 4, True, **kwargs)
+    want = torch.zeros_like(values)
+    want[:n] = -0.1
+    torch.testing.assert_close(values, want)
+
+    rows = i64([3, 1, 2, 0])
+    values.zero_()
+    opt.fused_update_for_flat_table(
+        grads, rows, i64([values.data_ptr()]), table_ids, dims, dims, 4, True,
+        torch.float32, **kwargs
+    )
+    want.zero_()
+    want[rows[:n]] = -0.1
+    torch.testing.assert_close(values, want)
 
 
 @cuda

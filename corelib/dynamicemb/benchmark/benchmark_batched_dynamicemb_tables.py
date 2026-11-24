@@ -25,7 +25,6 @@ import pytest
 import torch
 import torchrec
 from benchmark_utils import GPUTimer
-from dynamicemb.device_count import full_count
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -490,7 +489,7 @@ def create_dynamic_embedding_tables(
                 if cfg.cache_algorithm == "lfu"
                 else None
             )
-            storage.insert(keys, table_ids, values, scores, num_valid=full_count(keys))
+            storage.insert(keys, table_ids, values, scores)
     else:
         var.fill_tables()
 
@@ -1414,7 +1413,7 @@ def _populate_correctness_tables(
                 if cfg.cache_algorithm == "lfu"
                 else None
             )
-            storage.insert(keys, table_ids, values, scores, num_valid=full_count(keys))
+            storage.insert(keys, table_ids, values, scores)
             total += chunk
 
     return total

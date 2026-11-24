@@ -145,7 +145,7 @@ void table_insert_single_score(at::Tensor table_storage,
                                std::optional<at::Tensor> counter,
                                int64_t num_scores, int64_t score_fn_key,
                                int64_t const *global_caps_ptr,
-                               int64_t const *num_valid_ptr) {
+                               int64_t num_total, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -174,8 +174,6 @@ void table_insert_single_score(at::Tensor table_storage,
   auto counter_ptr = get_pointer<int32_t>(counter);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   auto table_key_slots = at::empty(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
@@ -229,16 +227,18 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_output,
                         int64_t num_scores, int64_t score_fn_key,
                         std::optional<at::Tensor> table_global_capacities,
-                        const at::Tensor &num_valid) {
+                        const std::optional<at::Tensor> &num_valid,
+                        std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   int64_t num_total = keys.size(0);
-  if (num_total == 0) {
-    return torch::empty({0}, keys.options().dtype(torch::kInt64));
-  }
+  const int64_t host_n = counted_host_limit(host_num_valid, num_total);
 
   at::Tensor indices =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+
+  if (host_n == 0)
+    return indices;
 
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
@@ -246,7 +246,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                             score_output, counter, num_scores, score_fn_key,
                             global_capacities_ptr(table_global_capacities,
                                                   table_bucket_offsets),
-                            num_valid_ptr);
+                            host_n, num_valid_ptr);
 
   return indices;
 }
@@ -263,7 +263,7 @@ void table_insert_collect_single_score(
     int64_t num_scores, int64_t score_fn_key, at::Tensor evicted_counter,
     at::Tensor evicted_keys, at::Tensor evicted_table_ids,
     int64_t const *global_caps_ptr,
-    int64_t const *num_valid_ptr) {
+    int64_t num_total, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -295,8 +295,6 @@ void table_insert_collect_single_score(
   auto evicted_table_ids_ptr = evicted_table_ids.data_ptr<int64_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   auto table_key_slots = at::empty(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
@@ -356,22 +354,22 @@ table_insert_collect_evicted(
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, int64_t num_scores,
     int64_t score_fn_key, std::optional<at::Tensor> table_global_capacities,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   auto i64 = keys.options().dtype(torch::kInt64);
   int64_t num_total = keys.size(0);
-  if (num_total == 0) {
-    at::Tensor empty_keys = torch::empty({0}, keys.options());
-    at::Tensor empty_i64 = torch::empty({0}, i64);
-    return std::make_tuple(empty_i64, torch::zeros({1}, i64), empty_keys,
-                           empty_i64);
-  }
+  const int64_t host_n = counted_host_limit(host_num_valid, num_total);
 
   at::Tensor indices = torch::empty({num_total}, i64);
   at::Tensor evicted_keys = torch::empty({num_total}, keys.options());
   at::Tensor evicted_table_ids = torch::empty({num_total}, i64);
   at::Tensor evicted_counter = torch::zeros({1}, i64);
+
+  if (host_n == 0)
+    return std::make_tuple(indices, evicted_counter, evicted_keys,
+                           evicted_table_ids);
 
   table_insert_collect_single_score(
       table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes, keys,
@@ -379,7 +377,7 @@ table_insert_collect_evicted(
       score_output, counter, num_scores, score_fn_key, evicted_counter,
       evicted_keys, evicted_table_ids,
       global_capacities_ptr(table_global_capacities, table_bucket_offsets),
-      num_valid_ptr);
+      host_n, num_valid_ptr);
 
   return std::make_tuple(indices, evicted_counter, evicted_keys,
                          evicted_table_ids);

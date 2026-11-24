@@ -23,7 +23,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torchrec
-from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.key_ownership import OwnershipRule
@@ -615,7 +614,6 @@ class ConstructTwinModule:
                 table_name_map_optimizer[tmp_table_name].reset_optimizer_states(
                     padded_values[:, max_emb_dim : max_emb_dim + optstate_dim],
                     emb_dims=emb_dim,
-                    num_valid=full_count(padded_values),
                 )
 
             table_ids = torch.full(
@@ -628,7 +626,6 @@ class ConstructTwinModule:
                 unique_indices,
                 table_ids,
                 padded_values,
-                num_valid=full_count(unique_indices),
             )
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).
         # This makes it difficult to accurately test ADAM since the iteration count affects the optimizer's behavior.

@@ -26,7 +26,7 @@ void table_lookup_single_score(
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     int64_t num_scores, int64_t const *global_caps_ptr,
-    int64_t const *num_valid_ptr) {
+    int64_t num_total, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -49,8 +49,6 @@ void table_lookup_single_score(
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   constexpr int BLOCK_SIZE = 256;
 
@@ -96,7 +94,7 @@ static void table_lookup_with_overflow_single_score(
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_output_offsets, int64_t num_scores,
     int64_t const *global_caps_ptr,
-    int64_t const *num_valid_ptr) {
+    int64_t num_total, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -120,8 +118,6 @@ static void table_lookup_with_overflow_single_score(
   auto ovf_output_offsets_ptr = ovf_output_offsets.data_ptr<int64_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   constexpr int BLOCK_SIZE = 256;
 
@@ -169,17 +165,12 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> ovf_storage, int64_t ovf_bucket_capacity,
              std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores,
              std::optional<at::Tensor> table_global_capacities,
-             const at::Tensor &num_valid) {
+             const std::optional<at::Tensor> &num_valid,
+             std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   int64_t num_total = keys.size(0);
-  if (num_total == 0) {
-    at::Tensor score_output =
-        torch::empty({0}, keys.options().dtype(torch::kInt64));
-    at::Tensor founds = torch::empty({0}, keys.options().dtype(torch::kBool));
-    at::Tensor indices = torch::empty({0}, keys.options().dtype(torch::kInt64));
-    return std::make_tuple(score_output, founds, indices);
-  }
+  const int64_t host_n = counted_host_limit(host_num_valid, num_total);
 
   at::Tensor score_output =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
@@ -187,6 +178,9 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
       torch::empty({num_total}, keys.options().dtype(torch::kBool));
   at::Tensor indices =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+
+  if (host_n == 0)
+    return std::make_tuple(score_output, founds, indices);
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
   auto global_caps_ptr =
@@ -197,12 +191,12 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, policy_type, score_output, founds, indices,
         ovf_storage.value(), ovf_bucket_capacity, ovf_output_offsets.value(),
-        num_scores, global_caps_ptr, num_valid_ptr);
+        num_scores, global_caps_ptr, host_n, num_valid_ptr);
   } else {
     table_lookup_single_score(table_storage, table_bucket_offsets,
                               bucket_capacity, keys, table_ids, score_input,
                               policy_type, score_output, founds, indices,
-                              num_scores, global_caps_ptr, num_valid_ptr);
+                              num_scores, global_caps_ptr, host_n, num_valid_ptr);
   }
 
   return std::make_tuple(score_output, founds, indices);

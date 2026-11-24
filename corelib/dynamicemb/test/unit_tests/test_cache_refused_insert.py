@@ -192,14 +192,16 @@ def test_failed_backing_load_preserves_dirty_victim_and_hit_pins(monkeypatch):
     assert torch.count_nonzero(counter).item() == 0
 
 
-@pytest.mark.parametrize("padding", [0, 200])
-def test_the_insert_counts_the_keys_it_refuses(padding):
+@pytest.mark.parametrize(
+    "host_limit,device_limit,live",
+    [(None, None, 6000), (None, 5800, 5800), (5900, None, 5900), (5800, 5900, 5800)],
+)
+def test_the_insert_counts_the_keys_it_refuses(host_limit, device_limit, live):
     model = make_model()
     state = model._cache._state
     km = state.key_index_map
     keys = torch.arange(1, 6001, dtype=torch.int64, device="cuda")
-    live = keys.numel() - padding
-    num_valid = keys.new_full((1,), live)
+    num_valid = None if device_limit is None else keys.new_tensor([device_limit])
     table_ids = torch.zeros_like(keys)
     score = get_insert_score_arg(state, keys.numel(), keys.device, None)
     (
@@ -211,7 +213,12 @@ def test_the_insert_counts_the_keys_it_refuses(padding):
         _,
         num_refused,
     ) = km.insert_and_evict_with_counter_and_overflow(
-        keys, table_ids, score, report_refused=True, num_valid=num_valid
+        keys,
+        table_ids,
+        score,
+        report_refused=True,
+        num_valid=num_valid,
+        host_num_valid=host_limit,
     )
     # The empty cache evicts nothing: every "evicted" key is one it refused, the
     # keys past its slots, each with a negative index.
@@ -224,7 +231,40 @@ def test_the_insert_counts_the_keys_it_refuses(padding):
     more = torch.arange(10001, 10011, dtype=torch.int64, device="cuda")
     score = get_insert_score_arg(state, more.numel(), more.device, None)
     result = km.insert_and_evict_with_counter_and_overflow(
-        more, torch.zeros_like(more), score,
-        num_valid=full_count(more),
+        more,
+        torch.zeros_like(more),
+        score,
     )
     assert len(result) == 6
+
+
+def test_storage_host_bound_guards_table_ids_and_value_row_maps():
+    storage = make_model()._storage
+    keys = torch.tensor([31, 41, 47], device="cuda")
+    table_ids = torch.zeros_like(keys)
+    invalid_table_ids = torch.tensor([0, 0, -1], device="cuda")
+    rows = torch.tensor([2, 0, -999], device="cuda")
+    values = torch.arange(3 * DIM, dtype=torch.float32, device="cuda").view(3, DIM)
+    storage.insert(
+        keys,
+        invalid_table_ids,
+        values,
+        input_rows=rows,
+        host_num_valid=2,
+        num_valid=keys.new_tensor([3]),
+    )
+
+    # A count-free find looks up the entire input and still returns a device count.
+    missing, missing_keys, _, _, _, found, _, result = storage.find(
+        keys, table_ids, CopyMode.VALUE
+    )
+    assert missing.is_cuda and missing.item() == 1
+    assert missing_keys.shape == keys.shape
+    assert missing_keys[0].item() == 47
+    assert found.tolist() == [True, True, False]
+    torch.testing.assert_close(result[:2], values[[2, 0]])
+
+    missing, *_ = storage.find(
+        keys, invalid_table_ids, CopyMode.VALUE, host_num_valid=2
+    )
+    assert missing.is_cuda and missing.item() == 0

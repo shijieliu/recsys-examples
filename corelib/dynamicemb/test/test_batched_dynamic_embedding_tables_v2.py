@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import pytest
 import torch
-from dynamicemb.device_count import full_count
+from dynamicemb.device_count import full_count, read_host_count
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -976,7 +976,8 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor],
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -987,7 +988,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         torch.Tensor,
     ]:
         capacity = unique_keys.size(0)
-        host_num_valid = max(0, min(capacity, int(num_valid.item())))
+        host_num_valid = read_host_count(capacity, num_valid, host_num_valid)
         h_unique_keys = unique_keys[:host_num_valid].cpu()
         h_table_ids = table_ids[:host_num_valid].cpu()
         lookup_dim = unique_embs.size(1)
@@ -1044,7 +1045,8 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1076,7 +1078,12 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             founds,
             output_scores,
         ) = self.find_impl(
-            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency, num_valid
+            unique_keys,
+            table_ids,
+            unique_vals,
+            lfu_accumulated_frequency,
+            num_valid,
+            host_num_valid,
         )
         return (
             num_missing,
@@ -1097,10 +1104,11 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
         input_rows: Optional[torch.Tensor] = None,
     ) -> None:
-        host_num_valid = max(0, min(keys.size(0), int(num_valid.item())))
+        host_num_valid = read_host_count(keys.size(0), num_valid, host_num_valid)
         h_keys = keys[:host_num_valid].cpu()
         h_table_ids = table_ids[:host_num_valid].cpu()
         h_scores = (

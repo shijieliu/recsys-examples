@@ -142,19 +142,20 @@ class MultiTableInitializer(abc.ABC):
         self,
         buffer: torch.Tensor,
         keys: Optional[torch.Tensor],  # remove it when debug mode is removed
-        num_valid: torch.Tensor,
-        table_ids: Optional[torch.Tensor],
-        indices: Optional[torch.Tensor],
+        num_valid: Optional[torch.Tensor] = None,
+        table_ids: Optional[torch.Tensor] = None,
+        indices: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Initialize the rows of ``buffer`` that ``indices`` selects.
 
         Keys and table IDs correspond to rows of ``buffer``. Indices select
         which of those rows the initializer writes.
 
-        ``num_valid`` is a one-element int64 CUDA tensor holding how many
-        leading entries of ``indices`` are live; the rest are undefined and are
-        never read. ``indices=None`` means the identity over the first ``n``
-        rows of ``buffer`` (``n = num_valid``).
+        Omit both counts to initialize all selected rows. A host count limits
+        the launch to a known prefix. A one-element int64 CUDA count may
+        shorten that prefix further. Without indices, the selected rows are
+        consecutive from zero.
         """
         ...
 
@@ -168,7 +169,9 @@ class NormalInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.mean, args.std_dev] for args in args_list]
 
-    def __call__(self, buffer, keys, num_valid, table_ids, indices) -> None:
+    def __call__(
+        self, buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None
+    ) -> None:
         if self._table_params is None:
             normal_init(
                 buffer,
@@ -177,6 +180,7 @@ class NormalInitializer(MultiTableInitializer):
                 self._args.mean,
                 self._args.std_dev,
                 num_valid,
+                host_num_valid,
             )
         else:
             normal_init_table_params(
@@ -186,6 +190,7 @@ class NormalInitializer(MultiTableInitializer):
                 self._table_params,
                 self._table_ids_for_kernel(table_ids),
                 num_valid,
+                host_num_valid,
             )
 
 
@@ -198,7 +203,9 @@ class TruncatedNormalInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.mean, args.std_dev, args.lower, args.upper] for args in args_list]
 
-    def __call__(self, buffer, keys, num_valid, table_ids, indices) -> None:
+    def __call__(
+        self, buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None
+    ) -> None:
         if self._table_params is None:
             truncated_normal_init(
                 buffer,
@@ -209,6 +216,7 @@ class TruncatedNormalInitializer(MultiTableInitializer):
                 self._args.lower,
                 self._args.upper,
                 num_valid,
+                host_num_valid,
             )
         else:
             truncated_normal_init_table_params(
@@ -218,6 +226,7 @@ class TruncatedNormalInitializer(MultiTableInitializer):
                 self._table_params,
                 self._table_ids_for_kernel(table_ids),
                 num_valid,
+                host_num_valid,
             )
 
 
@@ -230,7 +239,9 @@ class UniformInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.lower, args.upper] for args in args_list]
 
-    def __call__(self, buffer, keys, num_valid, table_ids, indices) -> None:
+    def __call__(
+        self, buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None
+    ) -> None:
         if self._table_params is None:
             uniform_init(
                 buffer,
@@ -239,6 +250,7 @@ class UniformInitializer(MultiTableInitializer):
                 self._args.lower,
                 self._args.upper,
                 num_valid,
+                host_num_valid,
             )
         else:
             uniform_init_table_params(
@@ -248,6 +260,7 @@ class UniformInitializer(MultiTableInitializer):
                 self._table_params,
                 self._table_ids_for_kernel(table_ids),
                 num_valid,
+                host_num_valid,
             )
 
 
@@ -256,9 +269,11 @@ class ConstantInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.value] for args in args_list]
 
-    def __call__(self, buffer, keys, num_valid, table_ids, indices) -> None:
+    def __call__(
+        self, buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None
+    ) -> None:
         if self._table_params is None:
-            const_init(buffer, indices, self._args.value, num_valid)
+            const_init(buffer, indices, self._args.value, num_valid, host_num_valid)
         else:
             const_init_table_params(
                 buffer,
@@ -266,6 +281,7 @@ class ConstantInitializer(MultiTableInitializer):
                 self._table_params,
                 self._table_ids_for_kernel(table_ids),
                 num_valid,
+                host_num_valid,
             )
 
 
@@ -273,8 +289,10 @@ class DebugInitializer(MultiTableInitializer):
     # Fills a row from its key, so it takes no parameters at all and its tables
     # cannot disagree. Inherits table_param_rows, which then reports no
     # parameters for every table, so create never builds a tensor for it.
-    def __call__(self, buffer, keys, num_valid, table_ids, indices) -> None:
-        debug_init(buffer, indices, keys, num_valid)
+    def __call__(
+        self, buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None
+    ) -> None:
+        debug_init(buffer, indices, keys, num_valid, host_num_valid)
 
 
 _INITIALIZERS: Dict[DynamicEmbInitializerMode, type] = {

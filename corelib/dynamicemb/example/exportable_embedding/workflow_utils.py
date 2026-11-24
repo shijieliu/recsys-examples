@@ -26,7 +26,6 @@ import dynamicemb.index_range_meta as _index_range_meta  # noqa: E402,F401
 import dynamicemb.lookup_meta as _lookup_meta  # noqa: E402,F401
 
 # isort: on
-from dynamicemb.device_count import full_count
 from dynamicemb import (  # noqa: E402
     DeltaDumpResult,
     DynamicEmbPoolingMode,
@@ -212,7 +211,7 @@ def make_dynamicemb_copy(
     )
     values = torch.cat(table_weights).to(device)
     scores = torch.ones(keys.numel(), dtype=torch.uint64, device=device)
-    tables.tables.insert(keys, table_ids, values, scores=scores, num_valid=full_count(keys))
+    tables.tables.insert(keys, table_ids, values, scores=scores)
     return tables
 
 
@@ -418,7 +417,6 @@ def produce_delta(
             dtype=torch.uint64,
             device=existing_keys.device,
         ),
-        num_valid=full_count(existing_keys),
     )
     producer.tables.insert(
         new_keys,
@@ -427,7 +425,6 @@ def produce_delta(
         scores=torch.full(
             (2,), 2 * round_id, dtype=torch.uint64, device=existing_keys.device
         ),
-        num_valid=full_count(new_keys),
     )
     thresholds = {name: 2 * round_id for name in producer.table_names}
     delta = producer.incremental_dump(thresholds)

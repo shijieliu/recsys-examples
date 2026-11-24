@@ -41,7 +41,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-// The ABI version of EvictParams: bump it whenever the struct changes. The
+// The ABI version of EvictParams: bump it when its layout or field contract changes. The
 // cubin's entry points carry it in their names, so an image built against
 // another layout does not export the names the launcher asks for, and the
 // load raises (load_from_image, jit_link.cpp). Without it a stale fatbin
@@ -51,7 +51,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   1: the layout before table_global_capacities (entry points without suffix)
 //   2: + table_global_capacities
 //   3: + num_valid
-#define DYN_EMB_EVICT_ABI 3
+//   4: num_valid may be null when batch is the exact length
+#define DYN_EMB_EVICT_ABI 4
 #define DYN_EMB_STR_(x) #x
 #define DYN_EMB_STR(x) DYN_EMB_STR_(x)
 // An entry point's identifier (device side) and its name string (host side).
@@ -101,7 +102,7 @@ struct EvictParams {
   // Per logical table global capacity for LinearBucketTable::home_bucket;
   // nullptr == every table hashes within its own capacity.
   const int64_t *table_global_capacities;
-  // Device count of the live leading entries of the per-key arrays. See device_count.h.
+  // Optional device bound on the live prefix. nullptr processes batch entries.
   const int64_t *num_valid;
 };
 

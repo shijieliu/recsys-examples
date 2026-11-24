@@ -223,9 +223,10 @@ class ReplayStats:
 class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
     """Storage for embedding keys, scores and values.
 
-    Both find and insert require ``num_valid``, a one-element int64 CUDA tensor
-    on the input device. It gives the live prefix of the key and table ID
-    arrays. The unused tail may contain invalid keys, table IDs or row indices.
+    The live prefix ends at the smallest of the input capacity, the optional
+    host upper bound (``host_num_valid``) and the optional one-element int64 CUDA
+    count (``num_valid``). With both omitted, the whole input is live. The unused
+    tail may contain invalid keys, table IDs or row indices.
 
     Find returns capacity-sized miss arrays and a CUDA count, ``num_missing``.
     Pass that count to the initializer or storage operation consuming the misses.
@@ -241,7 +242,8 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -268,12 +270,12 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
             key_scores (Optional[torch.Tensor]): ``[N]`` the score the input gave each
                 key, for a store that ranks its keys by the score of the input;
                 ``None`` for a table that takes no score per key.
-            num_valid (torch.Tensor): one-element int64 CUDA tensor giving the live
-                prefix of the ``[N]`` arrays.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading entries.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
 
         Returns:
-            A tuple of eight. Of the ``[N]`` arrays only the first ``num_valid``
-            entries are defined, and of the ``missing_*`` ones only the first
+            A tuple of eight. Of the ``[N]`` arrays only the entries in the live prefix
+            are defined, and of the ``missing_*`` ones only the first
             ``num_missing``.
 
             - num_missing (torch.Tensor): one-element int64 CUDA tensor, how many of
@@ -309,8 +311,9 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
         input_rows: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Insert the live keys with their values, or refresh the rows they have.
 
@@ -321,7 +324,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
                 ``CopyMode.VALUE`` layout. The buffer belongs to the caller.
             input_rows (Optional[torch.Tensor]): ``[N]`` int64 source row indices.
                 Live key ``i`` takes ``values[input_rows[i]]``, or ``values[i]``
-                when omitted. Only the first ``num_valid`` indices are live.
+                when omitted. Only indices in the live prefix are read.
                 Their values can refer to any row in the source buffer.
             scores (Optional[torch.Tensor]): ``[N]`` the score to insert each key with,
                 as :meth:`find` handed it out in ``missing_scores``; ``None``: the
@@ -329,8 +332,8 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
             preserve_existing (bool): the keys are ones the store already holds and
                 this writes their updated rows back: it keeps the scores they have
                 instead of assigning new ones. A key it does not hold may be ignored.
-            num_valid (torch.Tensor): one-element int64 CUDA tensor giving the live
-                prefix of the ``[N]`` arrays.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading entries.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
         """
 
     @abc.abstractmethod
@@ -457,7 +460,8 @@ class Cache(abc.ABC):
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lookup with overflow fallback.
 
@@ -469,12 +473,11 @@ class Cache(abc.ABC):
             table_ids (torch.Tensor): ``[N]`` int64, the table each key belongs to.
             lfu_accumulated_frequency (Optional[torch.Tensor]): ``[N]`` how many times
                 the batch had each key.
-            num_valid (torch.Tensor): one-element int64 CUDA tensor giving the live
-                prefix of the ``[N]`` arrays.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading entries.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
 
         Returns:
-            Three ``[N]`` arrays, of which only the first ``num_valid`` entries are
-            defined.
+            Three ``[N]`` arrays, of which only the live prefix is defined.
 
             - score_out (torch.Tensor): int64, output scores.
             - founds (torch.Tensor): bool, True for the keys that were found.
@@ -489,7 +492,8 @@ class Cache(abc.ABC):
         scores: Optional[torch.Tensor] = None,
         report_refused: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """Insert with counter-aware eviction and overflow fallback.
 
@@ -498,8 +502,8 @@ class Cache(abc.ABC):
             table_ids (torch.Tensor): ``[N]`` int64, the table each key belongs to.
             scores (Optional[torch.Tensor]): ``[N]`` the score to insert each key with;
                 ``None``: the cache's own ranking.
-            num_valid (torch.Tensor): one-element int64 CUDA tensor giving the live
-                prefix of the ``[N]`` arrays.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading entries.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
 
         Returns:
             (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores,
@@ -538,32 +542,33 @@ class Counter(abc.ABC):
     Supports multi-table via table_ids parameter.
 
     ``add`` and ``erase`` are called with the arrays of a step: per-key arrays of a
-    capacity ``N`` and ``num_valid``, the number of live leading entries, under the
-    rules of :class:`Storage` (what lies past ``num_valid`` is undefined and never
-    read; no wait for the device).
+    capacity ``N`` and optional bounds under the rules of :class:`Storage`. Padded
+    tail entries may contain invalid keys or table IDs.
     """
 
     @abc.abstractmethod
     def add(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Add keys with frequencies to the `Counter` and get accumulated counter of each key.
 
         Args:
             keys (torch.Tensor): The input keys, ``[N]``, should be unique keys.
-            num_valid (torch.Tensor): One-element int64 CUDA tensor containing the
-                number of live keys.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading keys.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
             table_ids (torch.Tensor): The table id for each key, ``[N]``.
             frequencies (torch.Tensor): The input frequencies, ``[N]``.
 
         Returns:
             accumulated_frequencies (torch.Tensor): the frequencies' state for the
-                input keys, ``[N]`` int64; the entries past ``num_valid`` are undefined.
+                input keys, ``[N]`` int64; the entries after the live prefix are undefined.
         """
         ...
 
@@ -571,16 +576,18 @@ class Counter(abc.ABC):
     def erase(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """
         Erase keys from the `Counter`.
 
         Args:
             keys (torch.Tensor): The input keys to be erased, ``[N]``.
-            num_valid (torch.Tensor): One-element int64 CUDA tensor containing the
-                number of live keys to erase.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading keys.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
             table_ids (torch.Tensor): The table id for each key, ``[N]``.
         """
 
@@ -701,20 +708,21 @@ class MultiTableAdmitter(abc.ABC):
     def admit(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         The arrays are those of a step: per-key arrays of a capacity ``N`` and
-        ``num_valid``, the number of live leading entries, under the rules of
-        :class:`Storage`.
+        optional host and device bounds under the rules of :class:`Storage`.
 
         Args:
             keys (torch.Tensor): The keys to decide on, deduplicated, ``[N]``.
-            num_valid (torch.Tensor): One-element int64 CUDA tensor containing the
-                number of live keys. Only this prefix participates in admission.
+            num_valid (Optional[torch.Tensor]): CUDA count of leading keys.
+            host_num_valid (Optional[int]): Host upper bound on the live prefix.
             table_ids (torch.Tensor): The table each key belongs to, ``[N]``. One
                 module spans several, so a decision may be made per table.
             frequencies (Optional[torch.Tensor]): How often each key occurred in
@@ -731,7 +739,7 @@ class MultiTableAdmitter(abc.ABC):
 
         Returns:
             torch.Tensor: Boolean mask over `keys`, ``[N]``, True where admitted. Only
-            its first ``num_valid`` entries are read; the others may hold anything.
+            entries in the live prefix are read.
         """
 
     def state(self) -> Optional[Counter]:
@@ -756,7 +764,7 @@ class MultiTableAdmitter(abc.ABC):
         when the admitter is built, and not renegotiated on every batch.
 
         The module calls initializer(buffer, keys, num_valid, table_ids, indices).
-        The required one-element int64 CUDA count gives the
-        number of live indices selecting rows to initialize.
+        The CUDA count gives the number of live indices selecting rows. The
+        initializer can also use an explicit host bound or the input capacity.
         """
         return None

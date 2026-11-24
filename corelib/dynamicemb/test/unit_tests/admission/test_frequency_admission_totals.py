@@ -47,14 +47,18 @@ def test_the_frequencies_given_come_back_as_running_totals():
 
     num_valid = _tensor([keys.numel()])
     frequencies = _tensor([1, 2, 3, 5])
-    admitted = admitter.admit(keys, num_valid, table_ids, frequencies)
+    admitted = admitter.admit(
+        keys, num_valid, table_ids=table_ids, frequencies=frequencies
+    )
     # Nothing was waiting yet: the totals are the increments.
     assert admitted.tolist() == [False, False, True, True]
     assert frequencies.tolist() == [1, 2, 3, 5]
 
     # Keys 3 and 4 were admitted, so they stopped waiting; 1 and 2 kept their count.
     frequencies = _tensor([1, 1, 1, 1])
-    admitted = admitter.admit(keys, num_valid, table_ids, frequencies)
+    admitted = admitter.admit(
+        keys, num_valid, table_ids=table_ids, frequencies=frequencies
+    )
     assert frequencies.tolist() == [2, 3, 1, 1]
     assert admitted.tolist() == [False, True, False, False]
 
@@ -62,18 +66,17 @@ def test_the_frequencies_given_come_back_as_running_totals():
 def test_without_frequencies_each_key_counts_once_and_nothing_is_handed_back():
     admitter = _admitter(threshold=2)
     keys, table_ids = _tensor([1, 2]), _tensor([0, 0])
-    num_valid = _tensor([keys.numel()])
-    assert admitter.admit(keys, num_valid, table_ids).tolist() == [False, False]
-    assert admitter.admit(keys, num_valid, table_ids).tolist() == [True, True]
+    assert admitter.admit(keys, table_ids=table_ids).tolist() == [False, False]
+    assert admitter.admit(keys, table_ids=table_ids).tolist() == [True, True]
 
 
-def test_counter_requires_a_device_count_before_accessing_keys():
+def test_counter_validates_a_supplied_device_count():
     counter = _admitter(threshold=3).state()
     keys, table_ids = _tensor([11, 22]), _tensor([0, 0])
     with pytest.raises(TypeError, match="num_valid"):
-        counter.add(keys, None, table_ids, _tensor([1, 1]))
+        counter.add(keys, 2, table_ids=table_ids, frequencies=_tensor([1, 1]))
     with pytest.raises(ValueError, match="num_valid"):
-        counter.erase(keys, table_ids, table_ids)
+        counter.erase(keys, table_ids, table_ids=table_ids)
 
 
 def test_admission_writes_running_totals_only_to_live_frequencies():
@@ -81,9 +84,29 @@ def test_admission_writes_running_totals_only_to_live_frequencies():
     keys = _tensor([11, 22, 33])
     table_ids = _tensor([0, 0, 0])
     live = _tensor([2])
-    admitter.admit(keys, live, table_ids, _tensor([1, 2, 0]))
+    admitter.admit(keys, live, table_ids=table_ids, frequencies=_tensor([1, 2, 0]))
 
     frequencies = _tensor([2, 2, -17])
-    admitted = admitter.admit(keys, live, table_ids, frequencies)
+    admitted = admitter.admit(keys, live, table_ids=table_ids, frequencies=frequencies)
     assert admitted[:2].tolist() == [True, True]
     assert frequencies.tolist() == [3, 4, -17]
+
+
+@pytest.mark.parametrize("host_limit,device_limit", [(2, None), (2, 3), (3, 2)])
+def test_admission_respects_both_limits(host_limit, device_limit):
+    admitter = _admitter(threshold=2)
+    keys = _tensor([11, 22, 33])
+    table_ids = _tensor([0, 0, -1])
+    counts = _tensor([1, 1, -17])
+    num_valid = None if device_limit is None else _tensor([device_limit])
+
+    for _ in range(2):
+        admitted = admitter.admit(
+            keys,
+            num_valid,
+            table_ids=table_ids,
+            frequencies=counts,
+            host_num_valid=host_limit,
+        )
+    assert admitted[:2].tolist() == [True, True]
+    assert counts.tolist() == [2, 2, -17]

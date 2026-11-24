@@ -21,12 +21,13 @@ import pytest
 import torch
 import torch.distributed as dist
 import torchrec
-from dynamicemb.device_count import full_count
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import (
     InsertResult,
     ScorePolicy,
     bucketize_keys,
+    table_insert_collect_evicted,
+    table_lookup,
     table_partition,
 )
 
@@ -343,7 +344,7 @@ def test_table_basic(
     insert_results = torch.empty(batch_size, dtype=table.result_type, device=device)
 
     indices = table.insert(
-        keys, table_ids, score_arg, insert_results, num_valid=full_count(keys)
+        keys, table_ids, score_arg, insert_results
     )
 
     assert (
@@ -364,7 +365,6 @@ def test_table_basic(
     scores_reinsert = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
     indices_reinsert = table.insert(
         keys, table_ids, score_arg_reinsert, insert_results, score_out=scores_reinsert,
-        num_valid=full_count(keys),
     )
 
     assert (
@@ -379,7 +379,7 @@ def test_table_basic(
         policy=ScorePolicy.CONST,
     )
     score_out, founds, indices_lookup = table.lookup(
-        keys, table_ids, score_arg_lookup, num_valid=full_count(keys)
+        keys, table_ids, score_arg_lookup
     )
 
     assert founds[valid_mask].all()
@@ -414,7 +414,6 @@ def test_table_basic(
         wrong_table_ids = (table_ids + 1) % num_tables
         _, wrong_founds, wrong_indices = table.lookup(
             keys, wrong_table_ids, score_arg_lookup,
-            num_valid=full_count(keys),
         )
         both_valid = valid_mask & wrong_founds
         if both_valid.any():
@@ -422,8 +421,8 @@ def test_table_basic(
                 wrong_indices[both_valid] >= 0
             ).all(), "Cross-table lookup should return valid local indices"
 
-    table.erase(keys, table_ids, num_valid=full_count(keys))
-    _, founds, _ = table.lookup(keys, table_ids, score_arg_lookup, num_valid=full_count(keys))
+    table.erase(keys, table_ids)
+    _, founds, _ = table.lookup(keys, table_ids, score_arg_lookup)
     assert not founds.any()
 
     num_valid = valid_mask.sum().item()
@@ -453,7 +452,7 @@ def test_table_basic(
         ).fill_(InsertResult.INIT.value)
 
         indices = table.insert(
-            keys, tid, score_arg, insert_results, num_valid=full_count(keys)
+            keys, tid, score_arg, insert_results
         )
 
         num_inserted = (insert_results == InsertResult.INSERT.value).sum()
@@ -504,7 +503,7 @@ def test_table_basic(
         ).fill_(InsertResult.INIT.value)
 
         indices = table.insert(
-            keys, tid, score_arg, insert_results, num_valid=full_count(keys)
+            keys, tid, score_arg, insert_results
         )
 
         assert (
@@ -512,15 +511,15 @@ def test_table_basic(
             | (insert_results == InsertResult.ILLEGAL.value)
         ).all()
 
-        table.erase(keys, tid, num_valid=full_count(keys))
-        _, founds, _ = table.lookup(keys, tid, score_arg, num_valid=full_count(keys))
+        table.erase(keys, tid)
+        _, founds, _ = table.lookup(keys, tid, score_arg)
         assert not founds.any()
 
         insert_results2 = torch.empty(
             batch_size, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
         indices_reinsert = table.insert(
-            keys, tid, score_arg, insert_results2, num_valid=full_count(keys)
+            keys, tid, score_arg, insert_results2
         )
 
         assert (
@@ -615,12 +614,10 @@ def test_table_evict(
             evicted_table_ids,
         ) = table.insert_and_evict(
             keys, table_ids, score_arg, insert_results, score_out=insert_scores_out,
-            num_valid=full_count(keys),
         )
 
         score_out, founds, indices_lookup = table.lookup(
             keys, table_ids, score_arg_lookup,
-            num_valid=full_count(keys),
         )
 
         num_existed = founds.sum()
@@ -772,7 +769,6 @@ def test_overflow_with_counter(key_type, table_config):
             batch_tids,
             batch_scores,
             batch_results,
-            num_valid=full_count(batch_keys),
         )
 
         success_mask = (
@@ -786,7 +782,7 @@ def test_overflow_with_counter(key_type, table_config):
 
         succ_indices = indices[success_mask]
         succ_tids = batch_tids[success_mask]
-        table.increment_counter(succ_indices, succ_tids, num_valid=full_count(succ_indices))
+        table.increment_counter(succ_indices, succ_tids)
         fill_keys_list.append(batch_keys[success_mask])
         fill_tids_list.append(batch_tids[success_mask])
         fill_indices_list.append(succ_indices)
@@ -875,7 +871,6 @@ def test_overflow_with_counter(key_type, table_config):
             round_tids,
             round_scores,
             round_results,
-            num_valid=full_count(round_keys),
         )
 
         success_mask = (
@@ -893,7 +888,6 @@ def test_overflow_with_counter(key_type, table_config):
             table.increment_counter(
                 successful_indices,
                 successful_tids,
-                num_valid=full_count(successful_indices),
             )
 
         all_ovf_indices.append(round_indices)
@@ -937,7 +931,6 @@ def test_overflow_with_counter(key_type, table_config):
         fill_keys,
         fill_tids,
         lookup_score,
-        num_valid=full_count(fill_keys),
     )
     assert fill_founds.all(), "All fill keys should still be found"
     assert torch.equal(
@@ -960,7 +953,6 @@ def test_overflow_with_counter(key_type, table_config):
             ovf_success_keys,
             ovf_success_tids,
             ovf_lookup_score,
-            num_valid=full_count(ovf_success_keys),
         )
         assert (
             ovf_founds.all()
@@ -980,7 +972,6 @@ def test_overflow_with_counter(key_type, table_config):
         ghost_keys,
         ghost_tids,
         ghost_score,
-        num_valid=full_count(ghost_keys),
     )
     assert not ghost_founds.any(), "Never-inserted keys should not be found"
 
@@ -989,7 +980,7 @@ def test_overflow_with_counter(key_type, table_config):
     # ------------------------------------------------------------------
     # Phase 6: Decrement counters + verify eviction is possible
     # ------------------------------------------------------------------
-    table.decrement_counter(fill_indices, fill_tids, num_valid=full_count(fill_indices))
+    table.decrement_counter(fill_indices, fill_tids)
 
     ovf_success_indices_list = []
     ovf_success_tids_list = []
@@ -1007,7 +998,6 @@ def test_overflow_with_counter(key_type, table_config):
         table.decrement_counter(
             held_slots,
             torch.cat(ovf_success_tids_list),
-            num_valid=full_count(held_slots),
         )
 
     assert (
@@ -1030,7 +1020,6 @@ def test_overflow_with_counter(key_type, table_config):
         evict_tids,
         evict_scores,
         evict_results,
-        num_valid=full_count(evict_keys),
     )
 
     has_evict = (evict_results == InsertResult.EVICT.value).any().item()
@@ -1089,9 +1078,9 @@ def test_table_without_ref_counter(key_type, score_name, score_policy):
     slots = torch.arange(4, dtype=torch.int64, device=device)
     tids = torch.zeros(4, dtype=torch.int64, device=device)
     with pytest.raises(RuntimeError, match="use_ref_counter=False"):
-        table.increment_counter(slots, tids, num_valid=full_count(slots))
+        table.increment_counter(slots, tids)
     with pytest.raises(RuntimeError, match="use_ref_counter=False"):
-        table.decrement_counter(slots, tids, num_valid=full_count(slots))
+        table.decrement_counter(slots, tids)
 
     # Keep inserting new keys. Once every bucket is full each insert has to evict
     # a resident key, and with no counter nothing is pinned, so any key can go.
@@ -1113,7 +1102,6 @@ def test_table_without_ref_counter(key_type, score_name, score_policy):
         ).fill_(InsertResult.INIT.value)
         (_, num_evicted, *_rest) = table.insert_and_evict(
             keys, table_ids, score_arg, insert_results,
-            num_valid=full_count(keys),
         )
         evicted = (insert_results == InsertResult.EVICT.value).sum()
         failed = (insert_results == InsertResult.BUSY.value).sum()
@@ -1172,7 +1160,7 @@ def _arg(value, policy=ASSIGN):
 
 
 def _found(table, keys, ids):
-    return table.lookup(keys, ids, _arg(None, CONST), num_valid=full_count(keys))[1]
+    return table.lookup(keys, ids, _arg(None, CONST))[1]
 
 
 def _junk_keys(m):
@@ -1221,7 +1209,6 @@ def _resident(policy, use_rows=False):
             old,
             torch.zeros_like(old),
             _arg(old.to(torch.uint64), policy),
-            num_valid=full_count(old),
         )
     return tables
 
@@ -1240,7 +1227,7 @@ def _check_lookup(size, n, use_rows):
     scores = (keys * 10).to(torch.uint64)
     present = keys[::2].contiguous()  # the table holds every other key
     pids = ids[: present.numel()]
-    table.insert(present, pids, _arg(scores[::2].contiguous()), num_valid=full_count(present))
+    table.insert(present, pids, _arg(scores[::2].contiguous()))
 
     def present_keys(m):  # the tail asks for keys the table has, ...
         return present[torch.randint(0, present.numel(), (m,), device="cuda")]
@@ -1253,13 +1240,12 @@ def _check_lookup(size, n, use_rows):
         ids[:n],
         _arg(scores[:n]),
         return_slots=True,
-        num_valid=full_count(keys[:n]),
     )
     for g, w in zip(got, want):
         assert g.numel() == size and torch.equal(g[:n], w)
     # An ASSIGN lookup rewrites the score of a key it finds; the tail's did not.
     score_out, founds, _ = table.lookup(
-        present, pids, _arg(None, CONST), num_valid=full_count(present)
+        present, pids, _arg(None, CONST)
     )
     assert founds.all() and torch.equal(score_out, present * 10)
 
@@ -1296,7 +1282,6 @@ def _check_insert(size, n, use_rows, policy):
         _arg(scores[:n], policy),
         results_b,
         score_b,
-        num_valid=full_count(keys[:n]),
     )
     # The outputs match the exact-slice run, and are untouched past n.
     assert rows.numel() == slots.numel() == size
@@ -1313,12 +1298,12 @@ def _check_insert(size, n, use_rows, policy):
     # The indices reported are where the keys are found.
     assert torch.equal(
         rows[:n],
-        a.lookup(keys[:n], ids[:n], _arg(None, CONST), num_valid=full_count(keys[:n]))[
+        a.lookup(keys[:n], ids[:n], _arg(None, CONST))[
             2
         ],
     )
     assert torch.equal(
-        slots[:n], a.slots_of(keys[:n], ids[:n], num_valid=full_count(keys[:n]))
+        slots[:n], a.slots_of(keys[:n], ids[:n])
     )
     if use_rows:  # the rows are dense: the tail took none
         assert torch.equal(torch.sort(rows[:n]).values, torch.arange(n, device="cuda"))
@@ -1338,6 +1323,40 @@ def test_insert(n, use_rows, policy):
 @BIG_COUNTS
 def test_insert_big_batch(n):
     _check_insert(BIG, n, False, ASSIGN)
+
+
+@pytest.mark.parametrize(
+    "host_n,device_n,live",
+    [(None, None, 8), (3, None, 3), (0, 9, 0), (3, 7, 3), (7, 2, 2)],
+)
+@pytest.mark.parametrize("policy", [ASSIGN, LRU_LFU], ids=["assign", "lru_lfu"])
+def test_native_table_prefix_bounds(host_n, device_n, live, policy):
+    table = _table(policy)
+    keys = torch.arange(1, 9, device="cuda")
+    table_ids = torch.zeros_like(keys)
+    results = _unset(keys.numel())
+    num_valid = None if device_n is None else _nv(device_n)
+    storage = (table.table_storage_, table.table_bucket_offsets_, table.bucket_capacity_)
+    slots, evicted_count, evicted_keys, evicted_ids = table_insert_collect_evicted(
+        *storage,
+        table.bucket_sizes,
+        keys,
+        table_ids,
+        keys.to(torch.uint64),
+        policy,
+        None,
+        results,
+        num_scores=table.num_scores_,
+        num_valid=num_valid,
+        host_num_valid=host_n,
+    )
+    assert slots.shape == evicted_keys.shape == evicted_ids.shape == keys.shape
+    assert int(evicted_count) == 0
+    assert (results[:live] == INSERT).all() and (results[live:] == UNSET).all()
+    _, found, _ = table_lookup(
+        *storage, keys, table_ids, None, CONST, num_scores=table.num_scores_
+    )
+    assert torch.equal(found, torch.arange(len(keys), device="cuda") < live)
 
 
 @pytest.mark.parametrize("count, live", [(-3, 0), (CAP + 9, CAP)])
@@ -1381,7 +1400,6 @@ def test_insert_and_evict(n, use_rows, policy):
     # The exact-slice run on the twin agrees, table included, at its own capacity n.
     idx_b, m_b, *ev_b = b.insert_and_evict(
         new[:n], torch.zeros_like(new[:n]), _arg(high[:n], policy),
-        num_valid=full_count(new[:n]),
     )
     assert m_b.is_cuda and m_b.dtype == torch.int64 and idx_b.numel() == n
     assert all(x.numel() == n for x in ev_b)
@@ -1445,8 +1463,8 @@ def test_overflow(n):
     old = torch.arange(1, 129, device="cuda")
     zeros = torch.zeros_like(old)
     for t in (a, b):  # fill the bucket, pin every slot: newcomers go to the overflow
-        slots = t.insert(old, zeros, _arg(old.to(torch.uint64)), num_valid=full_count(old))
-        t.increment_counter(slots, zeros, num_valid=full_count(slots))
+        slots = t.insert(old, zeros, _arg(old.to(torch.uint64)))
+        t.increment_counter(slots, zeros)
     new, high = _newcomers()
     results = _unset(CAP)
     keys, ids, junk = _dirty_batch(new, high, n)
@@ -1458,7 +1476,6 @@ def test_overflow(n):
     # The exact-slice run answers at its own capacity n.
     idx_b, m_b, *ev_b = b.insert_and_evict_with_counter_and_overflow(
         new[:n], zeros[:n], _arg(high[:n]),
-        num_valid=full_count(new[:n]),
     )
     assert m_b.is_cuda and int(m_b) == 0 and idx_b.numel() == n
     assert all(x.numel() == n for x in ev_b)
@@ -1470,7 +1487,7 @@ def test_overflow(n):
     assert (where[:n] >= 128).all()
     assert (
         int(
-            a.lookup_with_overflow(new, zeros[:CAP], look, num_valid=full_count(new))[
+            a.lookup_with_overflow(new, zeros[:CAP], look)[
                 1
             ].sum()
         )
@@ -1488,7 +1505,7 @@ def test_counter(n, op, overflow):
     slots = flat - 512 * ids
     if op == "decrement_counter":  # something to take back
         for t in (a, b):
-            t.increment_counter(slots, ids, num_valid=full_count(slots))
+            t.increment_counter(slots, ids)
 
     def junk_slots(m):
         return torch.randint(-8, 2048, (m,), dtype=torch.int64, device="cuda")
@@ -1507,14 +1524,14 @@ def test_erase(n):
     keys = torch.arange(1, CAP + 1, device="cuda")
     ids = torch.zeros_like(keys)
     for t in (a, b):
-        t.insert(keys, ids, _arg(keys.to(torch.uint64)), num_valid=full_count(keys))
+        t.insert(keys, ids, _arg(keys.to(torch.uint64)))
 
     def kept(m):  # the tail names keys that are in the table and have to stay
         return keys[n:][torch.randint(0, max(CAP - n, 1), (m,), device="cuda")]
 
     erase_keys, erase_ids = _dirty(keys, n, kept), _dirty(ids, n, _junk_ids)
     present = a.erase(erase_keys, erase_ids, return_indices=True, num_valid=_nv(n))
-    b.erase(keys[:n], ids[:n], num_valid=full_count(keys[:n]))
+    b.erase(keys[:n], ids[:n])
     assert present.numel() == CAP and (present[:n] >= 0).all()
     again = a.erase(erase_keys, erase_ids, return_indices=True, num_valid=_nv(n))
     assert (again[:n] < 0).all()
@@ -1543,7 +1560,6 @@ def test_determinism_mode(n, use_rows, monkeypatch):
     # With exact-size input, all output buffers have capacity n.
     idx_b, m_b, *ev_b = b.insert_and_evict(
         new[:n], torch.zeros_like(new[:n]), _arg(high[:n]),
-        num_valid=full_count(new[:n]),
     )
     assert m_b.is_cuda and m_b.dtype == torch.int64 and idx_b.numel() == n
     assert all(x.numel() == n for x in ev_b)
@@ -1564,6 +1580,6 @@ def test_determinism_mode(n, use_rows, monkeypatch):
     assert torch.equal(
         slots[:n],
         c.slots_of(
-            keys[:n], torch.zeros_like(keys[:n]), num_valid=full_count(keys[:n])
+            keys[:n], torch.zeros_like(keys[:n])
         ),
     )

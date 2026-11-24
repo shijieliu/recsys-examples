@@ -50,7 +50,6 @@ from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helpe
     get_loading_files,
     list_checkpoint_files,
 )
-from dynamicemb.device_count import full_count
 from dynamicemb.dynamicemb_config import (
     DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
@@ -2719,7 +2718,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._cache.key_index_map.erase(
             stale,
             torch.full((stale.numel(),), table_id, dtype=torch.int64, device=device),
-            num_valid=full_count(stale),
         )
 
     @staticmethod

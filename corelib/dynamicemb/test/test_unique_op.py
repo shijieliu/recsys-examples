@@ -15,7 +15,6 @@
 
 import pytest
 import torch
-from dynamicemb.device_count import full_count
 from dynamicemb_extensions import (
     expand_table_ids_cuda,
     fill_rows,
@@ -532,7 +531,7 @@ def test_flagged_compact(setup_device, N, flag_mode, input_spec):
                 torch.randint(0, 2**60, (N,), dtype=torch.int64, device=device)
             )
 
-    count, indices, outputs = flagged_compact(flags, inputs, full_count(flags))
+    count, indices, outputs = flagged_compact(flags, inputs)
     assert count.device == flags.device and count.dtype == torch.int64
     assert count.shape == (1,)
     h_count = count.item()
@@ -590,17 +589,33 @@ def test_flagged_compact_rejects_a_seventh_input(setup_device):
     flags = torch.ones(8, dtype=torch.bool, device=setup_device)
     with pytest.raises(RuntimeError, match="at most 6"):
         flagged_compact(
-            flags, [torch.arange(8, device=setup_device)] * 7, full_count(flags)
+            flags, [torch.arange(8, device=setup_device)] * 7
         )
 
 
+@pytest.mark.parametrize(
+    "host_n,device_n,live",
+    [(None, None, 7), (4, None, 4), (5, 2, 2), (2, 6, 2), (0, 6, 0)],
+)
+def test_flagged_compact_host_bound(setup_device, host_n, device_n, live):
+    keys = torch.arange(7, device=setup_device)
+    flags = keys % 2 == 1
+    count = None if device_n is None else keys.new_tensor([device_n])
+    n, positions, (selected, absent) = flagged_compact(
+        flags, [keys + 10, None], count, invert=True, host_num_valid=host_n
+    )
+
+    expected = keys[:live:2]
+    assert int(n) == len(expected)
+    assert positions.shape == selected.shape == keys.shape
+    assert torch.equal(positions[: len(expected)], expected)
+    assert torch.equal(selected[: len(expected)], expected + 10)
+    assert absent is None
+
+
 @pytest.mark.parametrize("capacity", [0, 3])
-def test_flagged_compact_requires_device_count(setup_device, capacity):
+def test_flagged_compact_validates_supplied_count(setup_device, capacity):
     flags = torch.ones(capacity, dtype=torch.bool, device=setup_device)
-    with pytest.raises(TypeError):
-        flagged_compact(flags, [])
-    with pytest.raises(TypeError):
-        flagged_compact(flags, [], None)
     with pytest.raises(RuntimeError, match="num_valid"):
         flagged_compact(flags, [], torch.tensor([capacity], device="cpu"))
 

@@ -85,9 +85,10 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                at::Tensor table_emb_dims, int64_t max_emb_dim,
                                bool all_dims_vec4, float const lr,
                                int64_t table_dtype,
-                               const at::Tensor &num_valid) {
+                               const std::optional<at::Tensor> &num_valid,
+                               std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t ev_nums = grads.size(0);
+  const int64_t ev_nums = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
@@ -130,9 +131,10 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float eps, const float weight_decay,
                                 const uint32_t iter_num, int64_t max_emb_dim,
                                 bool all_dims_vec4, int64_t table_dtype,
-                                const at::Tensor &num_valid) {
+                                const std::optional<at::Tensor> &num_valid,
+                                std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t ev_nums = grads.size(0);
+  const int64_t ev_nums = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
@@ -174,9 +176,10 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                    at::Tensor table_emb_dims, const float lr,
                                    const float eps, int64_t max_emb_dim,
                                    bool all_dims_vec4, int64_t table_dtype,
-                                   const at::Tensor &num_valid) {
+                                   const std::optional<at::Tensor> &num_valid,
+                                   std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t ev_nums = grads.size(0);
+  const int64_t ev_nums = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
@@ -238,9 +241,10 @@ void rowwise_adagrad_for_flat_table(
     at::Tensor table_ids, at::Tensor table_value_dims,
     at::Tensor table_emb_dims, const float lr, const float eps,
     int64_t max_emb_dim, bool all_dims_vec4, int64_t table_dtype,
-    int64_t state_dtype, const at::Tensor &num_valid) {
+    int64_t state_dtype, const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t ev_nums = grads.size(0);
+  const int64_t ev_nums = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
@@ -302,9 +306,10 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float l2_reg, int64_t max_emb_dim,
                                 bool all_dims_vec4, int64_t table_dtype,
                                 const float group_lasso_reg,
-                                const at::Tensor &num_valid) {
+                                const std::optional<at::Tensor> &num_valid,
+                                std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t ev_nums = grads.size(0);
+  const int64_t ev_nums = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
@@ -396,9 +401,10 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                   at::Tensor table_emb_dims, int64_t emb_dim,
                                   int64_t value_dim, bool all_dims_vec4,
                                   float lr,
-                                  const at::Tensor &num_valid) {
+                                  const std::optional<at::Tensor> &num_valid,
+                                  std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t num_rows = grads.size(0);
+  const int64_t num_rows = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
     return;
@@ -432,9 +438,10 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    float lr, float beta1, float beta2,
                                    float eps, float weight_decay,
                                    uint32_t iter_num,
-                                   const at::Tensor &num_valid) {
+                                   const std::optional<at::Tensor> &num_valid,
+                                   std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t num_rows = grads.size(0);
+  const int64_t num_rows = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
     return;
@@ -466,9 +473,10 @@ void adagrad_update_for_padded_buffer(
     at::Tensor grads, at::Tensor values, at::Tensor table_ids,
     at::Tensor table_emb_dims, int64_t emb_dim, int64_t value_dim,
     bool all_dims_vec4, float lr, float eps,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t num_rows = grads.size(0);
+  const int64_t num_rows = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
     return;
@@ -499,9 +507,10 @@ void rowwise_adagrad_for_padded_buffer(
     at::Tensor grads, at::Tensor values, at::Tensor table_ids,
     at::Tensor table_emb_dims, int64_t emb_dim, int64_t value_dim,
     bool all_dims_vec4, float lr, float eps, int64_t state_dtype,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t num_rows = grads.size(0);
+  const int64_t num_rows = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
     return;
@@ -541,9 +550,10 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    float lr, float learning_rate_power,
                                    float beta, float l1_reg, float l2_reg,
                                    float group_lasso_reg,
-                                   const at::Tensor &num_valid) {
+                                   const std::optional<at::Tensor> &num_valid,
+                                   std::optional<int64_t> host_num_valid) {
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
-  int64_t num_rows = grads.size(0);
+  const int64_t num_rows = counted_host_limit(host_num_valid, grads.size(0));
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
     return;
@@ -590,7 +600,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),
         py::arg("table_value_dims"), py::arg("table_emb_dims"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("lr"),
-        py::arg("table_dtype"), py::arg("num_valid"));
+        py::arg("table_dtype"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("adam_update_for_flat_table", &dyn_emb::adam_update_for_flat_table,
         "Adam optimizer for multi-table buffer via table_ptrs",
@@ -599,7 +610,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("beta1"),
         py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"),
         py::arg("iter_num"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"), py::arg("num_valid"));
+        py::arg("table_dtype"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def(
       "adagrad_update_for_flat_table", &dyn_emb::adagrad_update_for_flat_table,
@@ -608,7 +620,7 @@ void bind_optimizer_kernel_op(py::module &m) {
       py::arg("table_ids"), py::arg("table_value_dims"),
       py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
       py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("table_dtype"),
-      py::arg("num_valid"));
+      py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("rowwise_adagrad_for_flat_table",
         &dyn_emb::rowwise_adagrad_for_flat_table,
@@ -618,7 +630,7 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
         py::arg("table_dtype"), py::arg("state_dtype"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("ftrl_update_for_flat_table", &dyn_emb::ftrl_update_for_flat_table,
         "FTRL optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
@@ -627,13 +639,14 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("learning_rate_power"), py::arg("beta"), py::arg("l1_reg"),
         py::arg("l2_reg"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
         py::arg("table_dtype"), py::arg("group_lasso_reg") = 0.0f, py::kw_only(),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
-        py::arg("lr"), py::arg("num_valid"));
+        py::arg("lr"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("adam_update_for_padded_buffer",
         &dyn_emb::adam_update_for_padded_buffer,
@@ -642,14 +655,15 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
         py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
         py::arg("weight_decay"), py::arg("iter_num"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("adagrad_update_for_padded_buffer",
         &dyn_emb::adagrad_update_for_padded_buffer,
         "Adagrad optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
-        py::arg("lr"), py::arg("eps"), py::arg("num_valid"));
+        py::arg("lr"), py::arg("eps"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("rowwise_adagrad_for_padded_buffer",
         &dyn_emb::rowwise_adagrad_for_padded_buffer,
@@ -657,7 +671,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("grads"), py::arg("values"), py::arg("table_ids"),
         py::arg("table_emb_dims"), py::arg("emb_dim"), py::arg("value_dim"),
         py::arg("all_dims_vec4"), py::arg("lr"), py::arg("eps"),
-        py::arg("state_dtype"), py::arg("num_valid"));
+        py::arg("state_dtype"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("ftrl_update_for_padded_buffer",
         &dyn_emb::ftrl_update_for_padded_buffer,
@@ -666,5 +681,5 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
         py::arg("lr"), py::arg("learning_rate_power"), py::arg("beta"),
         py::arg("l1_reg"), py::arg("l2_reg"), py::arg("group_lasso_reg") = 0.0f, py::kw_only(),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 }

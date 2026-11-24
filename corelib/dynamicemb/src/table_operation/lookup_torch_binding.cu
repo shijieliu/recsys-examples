@@ -43,7 +43,7 @@ table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, static_cast<ScorePolicyType>(policy),
         ovf_storage, ovf_bucket_capacity, ovf_output_offsets, /*num_scores=*/1,
-        table_global_capacities, at::full({1}, keys.size(0), keys.options().dtype(at::kLong)));
+        table_global_capacities);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>

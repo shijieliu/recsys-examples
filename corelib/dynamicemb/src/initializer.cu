@@ -111,7 +111,8 @@ static void check_beside_buffer(const at::Tensor &buffer,
 template <typename GeneratorT>
 void initialize_with_generator(at::Tensor buffer,
                                const std::optional<at::Tensor> &indices,
-                               const at::Tensor &num_valid,
+                               const std::optional<at::Tensor> &num_valid,
+                               std::optional<int64_t> host_num_valid,
                                typename GeneratorT::Args generator_args,
                                int64_t num_worker = -1) {
   int64_t num_dims = buffer.dim();
@@ -132,8 +133,10 @@ void initialize_with_generator(at::Tensor buffer,
   if (has_indices) {
     check_beside_buffer(buffer, indices.value(), "indices");
   }
-  int64_t num_total = has_indices ? indices.value().size(0) : buffer.size(0);
+  const int64_t num_total = counted_host_limit(
+      host_num_valid, has_indices ? indices->size(0) : buffer.size(0));
   int64_t dim = buffer.size(1);
+  if (!num_total || !dim) return;
   int64_t stride = buffer.stride(0);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -228,12 +231,13 @@ static TableParamPtrs check_table_params(const at::Tensor &buffer,
 void normal_init(at::Tensor buffer, const std::optional<at::Tensor> &indices,
                  CurandStateContext &curand_state_context, float mean,
                  float std_dev,
-                 const at::Tensor &num_valid) {
+                 const std::optional<at::Tensor> &num_valid,
+                 std::optional<int64_t> host_num_valid) {
   using GeneratorT = NormalEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{mean, std_dev}};
   auto generator_args =
       typename GeneratorT::Args{curand_state_context.ptr(), params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args,
                                         curand_state_context.num_worker());
 }
@@ -242,14 +246,15 @@ void normal_init_table_params(
     at::Tensor buffer, const std::optional<at::Tensor> &indices,
     CurandStateContext &curand_state_context, at::Tensor table_params,
     at::Tensor table_ids,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   using GeneratorT = NormalEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
                                  GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args =
       typename GeneratorT::Args{curand_state_context.ptr(), params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args,
                                         curand_state_context.num_worker());
 }
@@ -258,12 +263,13 @@ void truncated_normal_init(
     at::Tensor buffer, const std::optional<at::Tensor> &indices,
     CurandStateContext &curand_state_context, float mean, float std_dev,
     float lower, float upper,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   using GeneratorT = TruncatedNormalEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{mean, std_dev, lower, upper}};
   auto generator_args =
       typename GeneratorT::Args{curand_state_context.ptr(), params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args,
                                         curand_state_context.num_worker());
 }
@@ -272,14 +278,15 @@ void truncated_normal_init_table_params(
     at::Tensor buffer, const std::optional<at::Tensor> &indices,
     CurandStateContext &curand_state_context, at::Tensor table_params,
     at::Tensor table_ids,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   using GeneratorT = TruncatedNormalEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
                                  GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args =
       typename GeneratorT::Args{curand_state_context.ptr(), params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args,
                                         curand_state_context.num_worker());
 }
@@ -287,12 +294,13 @@ void truncated_normal_init_table_params(
 void uniform_init(at::Tensor buffer, const std::optional<at::Tensor> &indices,
                   CurandStateContext &curand_state_context, float lower,
                   float upper,
-                  const at::Tensor &num_valid) {
+                  const std::optional<at::Tensor> &num_valid,
+                  std::optional<int64_t> host_num_valid) {
   using GeneratorT = UniformEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{lower, upper}};
   auto generator_args =
       typename GeneratorT::Args{curand_state_context.ptr(), params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args,
                                         curand_state_context.num_worker());
 }
@@ -301,44 +309,48 @@ void uniform_init_table_params(
     at::Tensor buffer, const std::optional<at::Tensor> &indices,
     CurandStateContext &curand_state_context, at::Tensor table_params,
     at::Tensor table_ids,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   using GeneratorT = UniformEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
                                  GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args =
       typename GeneratorT::Args{curand_state_context.ptr(), params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args,
                                         curand_state_context.num_worker());
 }
 
 void const_init(at::Tensor buffer, const std::optional<at::Tensor> &indices,
                 float value,
-                const at::Tensor &num_valid) {
+                const std::optional<at::Tensor> &num_valid,
+                std::optional<int64_t> host_num_valid) {
   using GeneratorT = ConstEmbeddingGenerator<false>;
   typename GeneratorT::Params params{{value}};
   auto generator_args = typename GeneratorT::Args{params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args);
 }
 
 void const_init_table_params(
     at::Tensor buffer, const std::optional<at::Tensor> &indices,
     at::Tensor table_params, at::Tensor table_ids,
-    const at::Tensor &num_valid) {
+    const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   using GeneratorT = ConstEmbeddingGenerator<true>;
   auto ptrs = check_table_params(buffer, table_params, table_ids,
                                  GeneratorT::kNumParams);
   typename GeneratorT::Params params{ptrs.args, ptrs.ids};
   auto generator_args = typename GeneratorT::Args{params};
-  initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+  initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                         generator_args);
 }
 
 void debug_init(at::Tensor buffer, const std::optional<at::Tensor> &indices,
                 at::Tensor keys,
-                const at::Tensor &num_valid) {
+                const std::optional<at::Tensor> &num_valid,
+                std::optional<int64_t> host_num_valid) {
   check_beside_buffer(buffer, keys, "keys");
   if (keys.size(0) != buffer.size(0)) {
     throw std::invalid_argument(
@@ -351,7 +363,7 @@ void debug_init(at::Tensor buffer, const std::optional<at::Tensor> &indices,
     using GeneratorT = MappingEmbeddingGenerator<KeyType>;
     auto generator_args = typename GeneratorT::Args{
         reinterpret_cast<const KeyType *>(keys.data_ptr()), 100000};
-    initialize_with_generator<GeneratorT>(buffer, indices, num_valid,
+    initialize_with_generator<GeneratorT>(buffer, indices, num_valid, host_num_valid,
                                           generator_args);
   });
 }
@@ -378,46 +390,49 @@ void bind_initializer_op(py::module &m) {
   // the debug `keys`) run alongside the rows of the buffer either way.
   m.def("normal_init", &dyn_emb::normal_init, "Normal initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"),
-        py::arg("mean"), py::arg("std_dev"), py::arg("num_valid"));
+        py::arg("mean"), py::arg("std_dev"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("normal_init_table_params", &dyn_emb::normal_init_table_params,
         "Normal initializer, parameters one row per table", py::arg("buffer"),
         py::arg("indices"), py::arg("curand_state_context"),
         py::arg("table_params"), py::arg("table_ids"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("truncated_normal_init", &dyn_emb::truncated_normal_init,
         "Truncated normal initializer", py::arg("buffer"), py::arg("indices"),
         py::arg("curand_state_context"), py::arg("mean"), py::arg("std_dev"),
-        py::arg("lower"), py::arg("upper"), py::arg("num_valid"));
+        py::arg("lower"), py::arg("upper"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("truncated_normal_init_table_params",
         &dyn_emb::truncated_normal_init_table_params,
         "Truncated normal initializer, parameters one row per table",
         py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"),
         py::arg("table_params"), py::arg("table_ids"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("uniform_init", &dyn_emb::uniform_init, "Uniform initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"),
-        py::arg("lower"), py::arg("upper"), py::arg("num_valid"));
+        py::arg("lower"), py::arg("upper"), py::arg("num_valid") = py::none(),
+        py::arg("host_num_valid") = py::none());
 
   m.def("uniform_init_table_params", &dyn_emb::uniform_init_table_params,
         "Uniform initializer, parameters one row per table", py::arg("buffer"),
         py::arg("indices"), py::arg("curand_state_context"),
         py::arg("table_params"), py::arg("table_ids"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("const_init", &dyn_emb::const_init, "Const initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("value"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("const_init_table_params", &dyn_emb::const_init_table_params,
         "Const initializer, parameters one row per table", py::arg("buffer"),
         py::arg("indices"), py::arg("table_params"), py::arg("table_ids"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 
   m.def("debug_init", &dyn_emb::debug_init, "Debug initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("keys"),
-        py::arg("num_valid"));
+        py::arg("num_valid") = py::none(), py::arg("host_num_valid") = py::none());
 }

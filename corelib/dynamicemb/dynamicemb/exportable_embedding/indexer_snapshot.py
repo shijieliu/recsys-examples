@@ -11,7 +11,6 @@ from typing import Any, Sequence
 from urllib.parse import quote
 
 import torch
-from dynamicemb.device_count import full_count
 
 from . import _C
 
@@ -217,7 +216,6 @@ def rebuild_linear_hash_snapshot(
                     policy=ScorePolicy.ASSIGN,
                 ),
                 collect_evicted=True,
-                num_valid=full_count(feature_ids),
             )
             if (slots < 0).any() or int(evicted_count.item()) != 0:
                 logical_capacities[table_id] *= 2

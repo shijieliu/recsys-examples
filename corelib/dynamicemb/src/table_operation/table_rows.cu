@@ -26,9 +26,8 @@ namespace dyn_emb {
 // buffer has: handing out one past it would make every later read and write of
 // that key run off the buffer, so it is asserted here, where it is first known.
 //
-// Only the first *num_valid entries of slots and
-// table_ids are live: the others are neither read nor allocated for, and the
-// matching entries of `out` are undefined.
+// Resolve the prefix bounded by n and the optional device count. Entries of
+// out past the live prefix are undefined.
 __global__ void table_resolve_rows_kernel(
     int64_t *__restrict__ rows, int64_t *__restrict__ row_counters,
     int64_t const *__restrict__ row_limits,
@@ -79,7 +78,8 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
                               at::Tensor table_ids, bool allocate,
-                              const at::Tensor &num_valid) {
+                              const std::optional<at::Tensor> &num_valid,
+                              std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, slots.device());
   TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
   TORCH_CHECK(row_counters.is_cuda() && row_counters.scalar_type() == at::kLong);
@@ -88,7 +88,7 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
   TORCH_CHECK(slots.is_cuda() && slots.scalar_type() == at::kLong);
   TORCH_CHECK(table_ids.is_cuda() && table_ids.scalar_type() == at::kLong);
   TORCH_CHECK(slots.numel() == table_ids.numel());
-  int64_t n = slots.numel();
+  const int64_t n = counted_host_limit(host_num_valid, slots.numel());
   at::Tensor out = torch::empty_like(slots);
   if (n == 0)
     return out;

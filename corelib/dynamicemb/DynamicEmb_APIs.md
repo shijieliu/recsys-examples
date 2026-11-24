@@ -1627,24 +1627,27 @@ class Counter(abc.ABC):
     def add(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """Add frequencies to these keys and return their accumulated counts.
 
-        The result has the length of ``keys``; its entries past ``num_valid``
-        are undefined.
+        The result has the capacity of ``keys``. Only the live prefix is defined.
         """
 
     @abc.abstractmethod
     def erase(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
+        host_num_valid: Optional[int] = None,
     ) -> None:
-        """Erase these keys (the first ``num_valid`` of them)."""
+        """Erase the live keys."""
 
     @abc.abstractmethod
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
@@ -1741,9 +1744,11 @@ class MultiTableAdmitter(abc.ABC):
     def admit(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
@@ -1756,9 +1761,8 @@ class MultiTableAdmitter(abc.ABC):
         which a table that evicts by LFU takes as the score the key is inserted
         with; one that keeps none leaves it as it is.
 
-        ``num_valid`` is a one-element int64 CUDA tensor containing the
-        number of live keys. The result is a boolean mask with the same
-        capacity as ``keys``. Only the live prefix is consumed.
+        The host bound and optional CUDA count select the live prefix.
+        The result is a boolean mask with the same capacity as ``keys``.
         """
 
     def state(self) -> Optional[Counter]:
@@ -1968,17 +1972,19 @@ Read-only evaluation keeps the counts on the device for all layouts. Table growt
 
 ## Writing a Storage, Counter or MultiTableAdmitter
 
-Each implementation requires `num_valid`, a one-element int64 CUDA tensor on the same device as the keys or row buffers. It bounds the live prefix. The buffer's first dimension is its capacity, and its unused tail may contain uninitialized keys, table IDs or row indices. Counters, admitters and initializers take the count immediately after the keys. Pass the count returned by deduplication or compaction to the next operation. At an entry point where every row is live, construct the count once with `dynamicemb.device_count.full_count(rows)`.
+The first dimension of a per-key buffer is its capacity. `host_num_valid` is a host integer that can shorten that prefix. By default the host bound is the full capacity. If a one-element int64 CUDA `num_valid` tensor is also provided, the kernel takes the smaller bound on the GPU. Counts are clipped to the range from zero to capacity. An exact-size caller can omit both counts. A counted lookup passes its existing device count downstream so consumers skip the undefined tail.
 
 | Class | Method | Result |
 | --- | --- | --- |
-| `Storage` | `find(unique_keys, table_ids, copy_mode, lfu_accumulated_frequency=None, key_scores=None, *, num_valid)` | `(num_missing, missing_keys, missing_indices, missing_table_ids, missing_scores, founds, output_scores, values)` |
-| `Storage` | `insert(keys, table_ids, values, scores=None, preserve_existing=False, *, num_valid, input_rows=None)` | Updates storage |
-| `Counter` | `add(keys, num_valid, table_ids, frequencies)` and `erase(keys, num_valid, table_ids)` | Accumulated frequencies for `add` |
-| `MultiTableAdmitter` | `admit(keys, num_valid, table_ids, frequencies=None)` | A boolean mask over the input keys |
-| `MultiTableInitializer` | `__call__(buffer, keys, num_valid, table_ids, indices)` | Initializes the selected rows in place |
+| `Storage` | `find(keys, table_ids, copy_mode, ..., num_valid=None, host_num_valid=None)` | Miss count, miss metadata, hit flags, scores and values |
+| `Storage` | `insert(keys, table_ids, values, ..., num_valid=None, host_num_valid=None, input_rows=None)` | Updates storage |
+| `Counter` | `add(keys, num_valid=None, *, table_ids, frequencies, host_num_valid=None)` and `erase(keys, num_valid=None, *, table_ids, host_num_valid=None)` | Accumulated frequencies for `add` |
+| `MultiTableAdmitter` | `admit(keys, num_valid=None, *, table_ids, frequencies=None, host_num_valid=None)` | A boolean mask over the input keys |
+| `MultiTableInitializer` | `__call__(buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None)` | Initializes the selected rows in place |
 
 Lookup calls these methods directly. `Storage.find` returns `num_missing` on the GPU and the miss arrays at input capacity. Only the first `num_missing` entries of each miss array are live. For `Storage.insert`, live key `i` takes `values[input_rows[i]]` when a row map is supplied and `values[i]` otherwise. Source rows can lie anywhere in the values buffer. An implementation that performs host I/O can read the device count at its I/O boundary.
+
+Cache prefetch uses `LookupBatch` for keys and row-aligned table IDs, values, weights, scores and a selection mask. `CompactedBatch` carries selected key metadata, the CUDA count, and mappings into the source and destination row spaces. Wide value rows stay in their source buffer until a consumer needs to copy them. Pooling weights remain indexed by the original input occurrences.
 
 ## Erasing keys by score
 

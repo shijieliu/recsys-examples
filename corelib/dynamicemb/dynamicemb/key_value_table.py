@@ -37,7 +37,7 @@ from typing import (
 import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
-from dynamicemb.device_count import full_count
+from dynamicemb.device_count import read_host_count
 from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
     META_EMBEDDING_DIM,
     META_EMBEDDING_DTYPE,
@@ -825,9 +825,7 @@ def _expand_tables_impl(
                 tid_tensor = torch.full(
                     (keys.numel(),), table_id, dtype=torch.int64, device=device
                 )
-                dst_slots = new_key_index_map.insert(
-                    keys, tid_tensor, score_arg, num_valid=full_count(keys)
-                )
+                dst_slots = new_key_index_map.insert(keys, tid_tensor, score_arg)
             # Single-value re-insert above only restores the leading score word.
             # For multi-word layouts (LruLfu: timestamp + frequency) copy the
             # whole score block so the frequency (and exact timestamp) survive
@@ -1418,12 +1416,13 @@ def load_from_flat(
     table_ids: torch.Tensor,
     copy_mode: CopyMode,
     *,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
+    host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
     """Rows ``indices`` of the value buffers, one output row per index.
 
-    A negative index leaves its output row unwritten. The required device count
-    bounds the leading entries to load. The output has the capacity of
+    A negative index leaves its output row unwritten. Optional host and device
+    counts bound the leading entries to load. The output has the capacity of
     ``indices``, and rows after the live prefix remain undefined.
     """
     # The key map hands rows back on the host after a dump.
@@ -1447,6 +1446,7 @@ def load_from_flat(
             state.emb_dim,
             state.all_dims_vec4,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
     return output
 
@@ -1459,7 +1459,8 @@ def load_from_flat_by(
     out: torch.Tensor,
     out_rows: Optional[torch.Tensor] = None,
     *,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
+    host_num_valid: Optional[int] = None,
 ) -> None:
     """Into row i of ``out`` (``[entry_of_row.numel(), columns]``, of the
     tables' dtype; row ``out_rows[i]`` with ``out_rows``, int32) the embedding
@@ -1477,6 +1478,7 @@ def load_from_flat_by(
         entry_of_row,
         out_rows,
         num_valid=num_valid,
+        host_num_valid=host_num_valid,
     )
 
 
@@ -1486,8 +1488,9 @@ def store_to_flat(
     table_ids: torch.Tensor,
     values: torch.Tensor,
     *,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
     input_rows: Optional[torch.Tensor] = None,
+    host_num_valid: Optional[int] = None,
 ) -> None:
     """Write the live values into nonnegative table rows.
 
@@ -1506,6 +1509,7 @@ def store_to_flat(
         state.all_dims_vec4,
         num_valid=num_valid,
         input_rows=input_rows,
+        host_num_valid=host_num_valid,
     )
 
 
@@ -1529,7 +1533,6 @@ def load_from_flat_single_table(
             state.table_emb_dims,
             state.emb_dim,
             state.all_dims_vec4,
-            num_valid=full_count(indices),
         )
     return output
 
@@ -1556,7 +1559,6 @@ def store_to_flat_single_table(
         state.table_emb_dims,
         state.emb_dim,
         state.all_dims_vec4,
-        num_valid=full_count(indices),
     )
 
 
@@ -1696,13 +1698,14 @@ def _lookup_keys(
     state: DynamicEmbTableState,
     keys: torch.Tensor,
     table_ids: torch.Tensor,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
     score_input: Optional[torch.Tensor] = None,
     *,
     const_lookup: bool = False,
     return_slots: bool = False,
+    host_num_valid: Optional[int] = None,
 ) -> Tuple[ScoreArg, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Look up the first ``num_valid`` keys (see :class:`dynamicemb.types.Storage`);
+    """Look up the live keys (see :class:`dynamicemb.types.Storage`);
     no compaction of the misses.
 
     Returns ``(score_arg, score_out, founds, indices, slots)``. The indices are value
@@ -1723,16 +1726,29 @@ def _lookup_keys(
     slots = None
     if getattr(km, "enable_overflow_", False):
         score_out, founds, indices = km.lookup_with_overflow(
-            keys, table_ids, score_arg, num_valid=num_valid
+            keys,
+            table_ids,
+            score_arg,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         slots = indices  # a cache keeps slot == row
     elif return_slots:
         score_out, founds, indices, slots = km.lookup(
-            keys, table_ids, score_arg, return_slots=True, num_valid=num_valid
+            keys,
+            table_ids,
+            score_arg,
+            return_slots=True,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
     else:
         score_out, founds, indices = km.lookup(
-            keys, table_ids, score_arg, num_valid=num_valid
+            keys,
+            table_ids,
+            score_arg,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
     return score_arg, score_out, founds, indices, slots
 
@@ -1741,14 +1757,15 @@ def _find_keys(
     state: DynamicEmbTableState,
     keys: torch.Tensor,
     table_ids: torch.Tensor,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
     score_input: Optional[torch.Tensor] = None,
     *,
     const_lookup: bool = False,
     return_slots: bool = False,
     miss_inputs: Tuple[Optional[torch.Tensor], ...] = (),
+    host_num_valid: Optional[int] = None,
 ) -> Tuple:
-    """Key-only find: look up the first ``num_valid`` keys in the hash table and pick
+    """Key-only find: look up the live keys in the hash table and pick
     out the missing ones.
 
     Returns ``(num_missing, missing_keys, missing_indices, missing_table_ids,
@@ -1772,6 +1789,7 @@ def _find_keys(
         score_input,
         const_lookup=const_lookup,
         return_slots=return_slots,
+        host_num_valid=host_num_valid,
     )
     (
         num_missing,
@@ -1783,7 +1801,11 @@ def _find_keys(
             *miss_outputs,
         ),
     ) = flagged_compact(
-        founds, [keys, table_ids, score_arg.value, *miss_inputs], num_valid, invert=True
+        founds,
+        [keys, table_ids, score_arg.value, *miss_inputs],
+        num_valid,
+        invert=True,
+        host_num_valid=host_num_valid,
     )
     return (
         num_missing,
@@ -1921,11 +1943,12 @@ def _insert_key_values(
     values: torch.Tensor,
     scores: Optional[torch.Tensor],
     preserve_existing: bool,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
     *,
     input_rows: Optional[torch.Tensor] = None,
+    host_num_valid: Optional[int] = None,
 ) -> None:
-    """Insert the first ``num_valid`` keys with their
+    """Insert the live keys with their
     ``values``; nothing is read back, except the count of the keys evicted when the
     state retains them (opt-in, see :func:`_append_evicted`)."""
     score_arg = get_insert_score_arg(
@@ -1938,15 +1961,30 @@ def _insert_key_values(
             evicted_keys,
             evicted_table_ids,
         ) = state.key_index_map.insert(
-            keys, table_ids, score_arg, collect_evicted=True, num_valid=num_valid
+            keys,
+            table_ids,
+            score_arg,
+            collect_evicted=True,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
     else:
         indices = state.key_index_map.insert(
-            keys, table_ids, score_arg, num_valid=num_valid
+            keys,
+            table_ids,
+            score_arg,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
     store_to_flat(
-        state, indices, table_ids, values, num_valid=num_valid, input_rows=input_rows
+        state,
+        indices,
+        table_ids,
+        values,
+        num_valid=num_valid,
+        input_rows=input_rows,
+        host_num_valid=host_num_valid,
     )
 
 
@@ -1955,11 +1993,13 @@ def _insert_and_evict_keys(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     scores: Optional[torch.Tensor],
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
+    *,
+    host_num_valid: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Key-only insert_and_evict of the first ``num_valid`` keys. Returns (indices,
+    """Key-only insert_and_evict of the live keys. Returns (indices,
     num_evicted, evicted_keys, evicted_table_ids, evicted_indices, evicted_scores):
     ``num_evicted`` is a one-element device tensor and the evicted arrays have the
     capacity of ``keys``, with ``num_evicted`` live leading entries.
@@ -1974,7 +2014,7 @@ def _insert_and_evict_keys(
         evicted_scores,
         evicted_table_ids,
     ) = state.key_index_map.insert_and_evict(
-        keys, table_ids, score_arg, num_valid=num_valid
+        keys, table_ids, score_arg, num_valid=num_valid, host_num_valid=host_num_valid
     )
     return (
         indices,
@@ -2444,9 +2484,7 @@ def _load_key_values(
             dtype=state.emb_dtype,
             device=embeddings.device,
         )
-        state.optimizer.reset_optimizer_states(
-            opt_states, emb_dims=emb_dim_cfg, num_valid=full_count(opt_states)
-        )
+        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
     elif opt_states is not None and runtime_optstate_dim > 0:
         opt_states = state.optimizer.states_from_checkpoint(
             opt_states,
@@ -2496,14 +2534,12 @@ def _load_key_values(
             value=torch.zeros(keys.numel(), dtype=SCORE_TYPE, device=keys.device),
             policy=state.score_policy.policy,
         )
-        indices = state.key_index_map.insert(
-            keys, tid_tensor, place_arg, num_valid=full_count(keys)
-        )
+        indices = state.key_index_map.insert(keys, tid_tensor, place_arg)
         # The score blocks are keyed by slot, the values by row (the same thing
         # unless the table stores rows).
         state.key_index_map.scatter_score_blocks(
             table_id,
-            state.key_index_map.slots_of(keys, tid_tensor, num_valid=full_count(keys)),
+            state.key_index_map.slots_of(keys, tid_tensor),
             scores.to(SCORE_TYPE).contiguous(),
         )
         store_to_flat_single_table(state, indices, table_id, values)
@@ -2532,9 +2568,7 @@ def _load_key_values(
         policy=policy,
     )
 
-    indices = state.key_index_map.insert(
-        keys, tid_tensor, score_arg_insert, num_valid=full_count(keys)
-    )
+    indices = state.key_index_map.insert(keys, tid_tensor, score_arg_insert)
     store_to_flat_single_table(state, indices, table_id, values)
 
 
@@ -2621,9 +2655,7 @@ def _replay_write_values(
             dtype=state.emb_dtype,
             device=fresh_emb.device,
         )
-        state.optimizer.reset_optimizer_states(
-            opt_states, emb_dims=emb_dim_cfg, num_valid=full_count(opt_states)
-        )
+        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
         store_to_flat_single_table(
             state,
             rows[fresh],
@@ -2767,9 +2799,7 @@ def _erase_state_keys(
     device = state.device
     keys = keys.to(device=device, dtype=state.key_index_map.key_type)
     tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
-    indices = state.key_index_map.erase(
-        keys, tids, return_indices=True, num_valid=full_count(keys)
-    )
+    indices = state.key_index_map.erase(keys, tids, return_indices=True)
     removed = indices >= 0
     if EvictedItemMode.RETAIN_KEY in mode:
         # Only the keys that were really there: a caller may name keys this
@@ -2780,9 +2810,7 @@ def _erase_state_keys(
             # The slot stays reclaimed with its row; record both so a replica can
             # recreate it, laid out the way a dumped slot_index is.
             slots = indices[removed]
-            rows = state.key_index_map._rows_of(
-                slots, tids[removed], False, num_valid=full_count(slots)
-            )
+            rows = state.key_index_map._rows_of(slots, tids[removed], False)
             slot_index = torch.stack([slots, rows], dim=1)
         _append_erased(state, keys[removed], table_id, slot_index)
     num_removed = int(removed.sum().item())
@@ -2828,11 +2856,12 @@ class DynamicEmbCache(Cache):
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.increment_counter(
-            slot_indices, table_ids, num_valid=num_valid
+            slot_indices, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
         )
 
     def decrement_counter(
@@ -2840,11 +2869,12 @@ class DynamicEmbCache(Cache):
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.decrement_counter(
-            slot_indices, table_ids, num_valid=num_valid
+            slot_indices, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
         )
 
     def lookup(
@@ -2853,9 +2883,10 @@ class DynamicEmbCache(Cache):
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback of the first ``num_valid`` keys. Returns
+        """Lookup with overflow fallback of the live keys. Returns
         (score_out, founds, indices), one entry per key, undefined past ``num_valid``.
         While the metrics are recorded this reads the device."""
         self._check_placement()
@@ -2867,10 +2898,16 @@ class DynamicEmbCache(Cache):
             score_source(state, lfu_accumulated_frequency),
         )
         result = state.key_index_map.lookup_with_overflow(
-            unique_keys, table_ids, score_arg, num_valid=num_valid
+            unique_keys,
+            table_ids,
+            score_arg,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         if self._record_cache_metrics:
-            host_num_valid = int(num_valid.item())
+            host_num_valid = read_host_count(
+                unique_keys.numel(), num_valid, host_num_valid
+            )
             self._cache_metrics[0] = host_num_valid
             self._cache_metrics[1] = int(result[1][:host_num_valid].sum())
         return result
@@ -2882,7 +2919,8 @@ class DynamicEmbCache(Cache):
         scores: Optional[torch.Tensor] = None,
         report_refused: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """Insert the live prefix of keys into the cache and return evicted rows."""
         self._check_placement()
@@ -2894,10 +2932,13 @@ class DynamicEmbCache(Cache):
             score_arg,
             report_refused=report_refused,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = (
-                result[0].numel() if report_refused else int(num_valid.item())
+                result[0].numel()
+                if report_refused
+                else read_host_count(keys.numel(), num_valid, host_num_valid)
             )
             self._cache_metrics[3] = (
                 result[2].numel() if report_refused else int(result[1].item())
@@ -3133,9 +3174,7 @@ class DynamicEmbStorage(Storage):
                     device,
                     score_input=score_source(state, lfu_freq),
                 )
-                _, founds, _ = km.lookup(
-                    keys, table_ids, score_find, num_valid=full_count(keys)
-                )
+                _, founds, _ = km.lookup(keys, table_ids, score_find)
                 missing = torch.logical_not(founds)
                 new_keys = keys[missing]
                 new_lfu_freq = lfu_freq[missing]
@@ -3167,7 +3206,6 @@ class DynamicEmbStorage(Storage):
                     insert_keys,
                     insert_tids,
                     score_ins,
-                    num_valid=full_count(insert_keys),
                 )
                 remaining -= take
                 if _lf_within_tol():
@@ -3218,7 +3256,8 @@ class DynamicEmbStorage(Storage):
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -3229,7 +3268,7 @@ class DynamicEmbStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Find the first ``num_valid`` keys.
+        """Find the live keys.
 
         Returns ``(num_missing, missing_keys, missing_indices, missing_table_ids,
         missing_scores, founds, output_scores, values)``. ``num_missing`` is a
@@ -3244,9 +3283,15 @@ class DynamicEmbStorage(Storage):
             table_ids,
             num_valid,
             score_source(self._state, lfu_accumulated_frequency, key_scores),
+            host_num_valid=host_num_valid,
         )
         values = load_from_flat(
-            self._state, indices, table_ids, copy_mode=copy_mode, num_valid=num_valid
+            self._state,
+            indices,
+            table_ids,
+            copy_mode=copy_mode,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         return (*found, values)
 
@@ -3255,11 +3300,12 @@ class DynamicEmbStorage(Storage):
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.increment_counter(
-            slot_indices, table_ids, num_valid=num_valid
+            slot_indices, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
         )
 
     def decrement_counter(
@@ -3267,11 +3313,12 @@ class DynamicEmbStorage(Storage):
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.decrement_counter(
-            slot_indices, table_ids, num_valid=num_valid
+            slot_indices, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
         )
 
     def insert(
@@ -3282,10 +3329,11 @@ class DynamicEmbStorage(Storage):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
         input_rows: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
-        """Insert the first ``num_valid`` keys with their values (see
+        """Insert the live keys with their values (see
         :func:`_insert_key_values`)."""
         _insert_key_values(
             self._state,
@@ -3296,6 +3344,7 @@ class DynamicEmbStorage(Storage):
             preserve_existing,
             num_valid,
             input_rows=input_rows,
+            host_num_valid=host_num_valid,
         )
 
     def dump(
@@ -3862,7 +3911,8 @@ class HybridStorage(Storage):
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -3873,7 +3923,7 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Find the first ``num_valid`` keys in the HBM tier and then, for the keys it
+        """Find the live keys in the HBM tier and then, for the keys it
         lacks, in the host tier.
 
         Returns the elements of :meth:`DynamicEmbStorage.find`, where ``num_missing``
@@ -3900,9 +3950,15 @@ class HybridStorage(Storage):
             table_ids,
             num_valid,
             score_source(self._hbm, lfu_accumulated_frequency),
+            host_num_valid=host_num_valid,
         )
         values = load_from_flat(
-            self._hbm, indices_hbm, table_ids, copy_mode=copy_mode, num_valid=num_valid
+            self._hbm,
+            indices_hbm,
+            table_ids,
+            copy_mode=copy_mode,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         (
             num_missing_both,
@@ -3921,6 +3977,7 @@ class HybridStorage(Storage):
             num_missing_hbm,
             missing_scores_hbm,
             miss_inputs=(missing_indices_hbm,),
+            host_num_valid=host_num_valid,
         )
         host_values = load_from_flat(
             self._host,
@@ -3928,14 +3985,38 @@ class HybridStorage(Storage):
             missing_table_ids_hbm,
             copy_mode=copy_mode,
             num_valid=num_missing_hbm,
+            host_num_valid=host_num_valid,
         )
         # Only host-tier hits have a value and score to copy back to the original rows.
         num_hits, host_rows, (output_rows,) = flagged_compact(
-            founds_host, [missing_indices_hbm], num_missing_hbm
+            founds_host,
+            [missing_indices_hbm],
+            num_missing_hbm,
+            host_num_valid=host_num_valid,
         )
-        gather_embedding(host_values, values, host_rows, output_rows, num_valid=num_hits)
-        gather_embedding(scores_host, scores_hbm, host_rows, output_rows, num_valid=num_hits)
-        fill_rows(founds_hbm, True, indices=output_rows, num_valid=num_hits)
+        gather_embedding(
+            host_values,
+            values,
+            host_rows,
+            output_rows,
+            num_valid=num_hits,
+            host_num_valid=host_num_valid,
+        )
+        gather_embedding(
+            scores_host,
+            scores_hbm,
+            host_rows,
+            output_rows,
+            num_valid=num_hits,
+            host_num_valid=host_num_valid,
+        )
+        fill_rows(
+            founds_hbm,
+            True,
+            indices=output_rows,
+            num_valid=num_hits,
+            host_num_valid=host_num_valid,
+        )
         return (
             num_missing_both,
             missing_keys_both,
@@ -3957,10 +4038,11 @@ class HybridStorage(Storage):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
         input_rows: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
-        """Insert or update the first ``num_valid`` rows; the host tier takes the
+        """Insert or update the live rows; the host tier takes the
         evicted keys with :func:`_insert_key_values`.
 
         * ``preserve_existing=False`` (default): insert into the HBM tier; evicted
@@ -3973,7 +4055,11 @@ class HybridStorage(Storage):
         """
         if preserve_existing:
             score_arg, _, founds_hbm, rows_hbm, _ = _lookup_keys(
-                self._hbm, unique_keys, table_ids, num_valid
+                self._hbm,
+                unique_keys,
+                table_ids,
+                num_valid,
+                host_num_valid=host_num_valid,
             )
             # A key the tier lacks has row -1, which store_to_flat skips.
             store_to_flat(
@@ -3983,6 +4069,7 @@ class HybridStorage(Storage):
                 unique_values,
                 num_valid=num_valid,
                 input_rows=input_rows,
+                host_num_valid=host_num_valid,
             )
             (
                 num_missing,
@@ -3998,6 +4085,7 @@ class HybridStorage(Storage):
                 [unique_keys, table_ids, score_arg.value, input_rows],
                 num_valid,
                 invert=True,
+                host_num_valid=host_num_valid,
             )
             _, _, _, rows_host, _ = _lookup_keys(
                 self._host,
@@ -4005,6 +4093,7 @@ class HybridStorage(Storage):
                 missing_table_ids,
                 num_missing,
                 missing_scores,
+                host_num_valid=host_num_valid,
             )
             store_to_flat(
                 self._host,
@@ -4013,6 +4102,7 @@ class HybridStorage(Storage):
                 unique_values,
                 num_valid=num_missing,
                 input_rows=missing_pos if input_rows is None else missing_input_rows,
+                host_num_valid=host_num_valid,
             )
             return
 
@@ -4020,7 +4110,10 @@ class HybridStorage(Storage):
         # Align values once so both slot writes and spills use that order.
         if input_rows is not None:
             unique_values = gather_embedding(
-                unique_values, input_rows, num_valid=num_valid
+                unique_values,
+                input_rows,
+                num_valid=num_valid,
+                host_num_valid=host_num_valid,
             )
         (
             indices,
@@ -4029,18 +4122,37 @@ class HybridStorage(Storage):
             evicted_table_ids,
             evicted_indices,
             evicted_scores,
-        ) = _insert_and_evict_keys(self._hbm, unique_keys, table_ids, scores, num_valid)
+        ) = _insert_and_evict_keys(
+            self._hbm,
+            unique_keys,
+            table_ids,
+            scores,
+            num_valid,
+            host_num_valid=host_num_valid,
+        )
         evicted_values = load_from_flat(
             self._hbm,
             evicted_indices,
             evicted_table_ids,
             copy_mode=CopyMode.VALUE,
             num_valid=num_evicted,
+            host_num_valid=host_num_valid,
         )
         select_insert_failed_values(
-            evicted_indices, unique_values, evicted_values, num_valid=num_evicted
+            evicted_indices,
+            unique_values,
+            evicted_values,
+            num_valid=num_evicted,
+            host_num_valid=host_num_valid,
         )
-        store_to_flat(self._hbm, indices, table_ids, unique_values, num_valid=num_valid)
+        store_to_flat(
+            self._hbm,
+            indices,
+            table_ids,
+            unique_values,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
+        )
         _insert_key_values(
             self._host,
             evicted_keys,
@@ -4049,6 +4161,7 @@ class HybridStorage(Storage):
             evicted_scores,
             False,
             num_evicted,
+            host_num_valid=host_num_valid,
         )
 
     def incremental_dump(
@@ -4431,7 +4544,6 @@ class HybridStorage(Storage):
                 self._hbm.optimizer.reset_optimizer_states(
                     opt_states,
                     emb_dims=self._hbm.table_emb_dims_cpu[table_id],
-                    num_valid=full_count(opt_states),
                 )
             elif opt_states is not None and params.runtime_optstate_dim > 0:
                 opt_states = self._hbm.optimizer.states_from_checkpoint(
@@ -4462,7 +4574,7 @@ class HybridStorage(Storage):
                 evicted_table_ids,
                 evicted_indices,
                 evicted_scores,
-            ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores, full_count(keys))
+            ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores)
 
             evicted_values = load_from_flat(
                 self._hbm,
@@ -4529,7 +4641,7 @@ class HybridStorage(Storage):
                     dtype=torch.int64,
                     device=host_dev,
                 )
-                self._host.key_index_map.erase(chunk, tids, num_valid=full_count(chunk))
+                self._host.key_index_map.erase(chunk, tids)
 
         yield from export_keys_values_iter(self._host, device, batch_size, table_id)
 
@@ -4544,9 +4656,10 @@ def _write_back_evicted(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     values: torch.Tensor,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
     *,
     next_tier: Optional[Storage],
+    host_num_valid: Optional[int] = None,
 ) -> None:
     """Return what the cache evicted -- the first ``num_valid`` entries -- to the
     tier below it (see :func:`_insert_key_values` for what is read from the device).
@@ -4557,13 +4670,15 @@ def _write_back_evicted(
     """
     st = storage._state
     _, _, founds, rows, _ = _lookup_keys(
-        st, keys, table_ids, num_valid, const_lookup=True
+        st, keys, table_ids, num_valid, const_lookup=True, host_num_valid=host_num_valid
     )
-    store_to_flat(st, rows, table_ids, values, num_valid=num_valid)  # -1: not found
+    store_to_flat(
+        st, rows, table_ids, values, num_valid=num_valid, host_num_valid=host_num_valid
+    )  # -1: not found
     if next_tier is None and EvictedItemMode.RETAIN_KEY not in st.evicted_item_mode:
         return
     num_gone, gone_pos, (gone_keys, gone_table_ids) = flagged_compact(
-        founds, [keys, table_ids], num_valid, invert=True
+        founds, [keys, table_ids], num_valid, invert=True, host_num_valid=host_num_valid
     )
     if next_tier is not None:
         next_tier.insert(
@@ -4572,6 +4687,7 @@ def _write_back_evicted(
             values,
             num_valid=num_gone,
             input_rows=gone_pos,
+            host_num_valid=host_num_valid,
         )
     else:
         _append_evicted(st, gone_keys, gone_table_ids, num_gone)
@@ -4601,11 +4717,8 @@ def flush_cache(
             table_id=t,
         ):
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            num_keys = full_count(keys)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE, num_valid=num_keys)
-            _write_back_evicted(
-                storage, keys, tid, values, num_keys, next_tier=external_storage
-            )
+            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
+            _write_back_evicted(storage, keys, tid, values, next_tier=external_storage)
 
 
 # ---------------------------------------------------------------------------
@@ -4618,10 +4731,16 @@ def _eval_lookup_storage(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
+    *,
+    host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
     (num_missing, _, missing_indices, _, _, _, _, embs) = storage.find(
-        keys, table_ids, copy_mode=CopyMode.EMBEDDING, num_valid=num_valid
+        keys,
+        table_ids,
+        copy_mode=CopyMode.EMBEDDING,
+        num_valid=num_valid,
+        host_num_valid=host_num_valid,
     )
     initializer(
         embs,
@@ -4639,21 +4758,28 @@ def _eval_lookup_cached(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
+    *,
+    host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
-    _, founds, cache_indices = cache.lookup(keys, table_ids, num_valid=num_valid)
+    _, founds, cache_indices = cache.lookup(
+        keys, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
+    )
     embs = load_from_flat(
         cache._state,
         cache_indices,
         table_ids,
         copy_mode=CopyMode.EMBEDDING,
         num_valid=num_valid,
+        host_num_valid=host_num_valid,
     )
     (
         num_miss,
         miss_positions,
         (missing_keys, missing_table_ids),
-    ) = flagged_compact(founds, [keys, table_ids], num_valid, invert=True)
+    ) = flagged_compact(
+        founds, [keys, table_ids], num_valid, invert=True, host_num_valid=host_num_valid
+    )
     (
         num_missing_in_storage,
         _,
@@ -4668,6 +4794,7 @@ def _eval_lookup_cached(
         missing_table_ids,
         copy_mode=CopyMode.EMBEDDING,
         num_valid=num_miss,
+        host_num_valid=host_num_valid,
     )
     initializer(
         storage_embs,
@@ -4676,7 +4803,13 @@ def _eval_lookup_cached(
         missing_table_ids,
         missing_indices_in_storage,
     )
-    gather_embedding(storage_embs, embs, out_row=miss_positions, num_valid=num_miss)
+    gather_embedding(
+        storage_embs,
+        embs,
+        out_row=miss_positions,
+        num_valid=num_miss,
+        host_num_valid=host_num_valid,
+    )
     return embs
 
 
@@ -4686,8 +4819,9 @@ def eval_lookup(
     table_ids: torch.Tensor,
     initializer: Callable,
     *,
-    num_valid: torch.Tensor,
+    num_valid: Optional[torch.Tensor] = None,
     cache: Optional[Cache] = None,
+    host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
     """Eval-only lookup (no insertion, no admission, no backward) of the first
     ``num_valid`` keys.
@@ -4709,5 +4843,20 @@ def eval_lookup(
             device=keys.device,
         )
     if cache is None:
-        return _eval_lookup_storage(storage, keys, table_ids, initializer, num_valid)
-    return _eval_lookup_cached(cache, storage, keys, table_ids, initializer, num_valid)
+        return _eval_lookup_storage(
+            storage,
+            keys,
+            table_ids,
+            initializer,
+            num_valid,
+            host_num_valid=host_num_valid,
+        )
+    return _eval_lookup_cached(
+        cache,
+        storage,
+        keys,
+        table_ids,
+        initializer,
+        num_valid,
+        host_num_valid=host_num_valid,
+    )

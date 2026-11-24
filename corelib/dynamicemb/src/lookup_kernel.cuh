@@ -926,7 +926,7 @@ __global__ void one_to_one_copy_kernel(CopyDesc desc, int lane_shift) {
   const int lanes = 1 << lane_shift;
   const int lane = threadIdx.x & (lanes - 1);
   const int groups = blockDim.x >> lane_shift;
-  const int64_t n = counted_limit(desc.rows.num_valid, desc.rows.capacity);
+  const int64_t n = counted_limit(desc.rows.num_valid, desc.rows.host_limit);
   using Src = typename CopyDesc::SrcT;
   using Dst = typename CopyDesc::DstT;
   for (int64_t i = int64_t(blockIdx.x) * groups + (threadIdx.x >> lane_shift);
@@ -945,7 +945,7 @@ __global__ void one_to_one_copy_kernel(CopyDesc desc, int lane_shift) {
 template <typename CopyDesc, int kMaxElemPerThread>
 __global__ void one_to_one_warp_per_ev_vec4_kernel(CopyDesc desc) {
   const int lane = threadIdx.x;
-  const int64_t n = counted_limit(desc.rows.num_valid, desc.rows.capacity);
+  const int64_t n = counted_limit(desc.rows.num_valid, desc.rows.host_limit);
   for (int64_t i = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
        i < n; i += int64_t(gridDim.x) * blockDim.y) {
     int64_t src_row, dst_row;
@@ -1122,9 +1122,9 @@ void copy_multi_to_one(CopyDesc &copy_desc, bool feature_dims_vec4,
 
 template <typename CopyDesc>
 void copy_one_to_one(CopyDesc &desc, int num_sms, cudaStream_t stream) {
-  if (!desc.rows.capacity) return;
+  if (!desc.rows.host_limit) return;
   if constexpr (CopyDesc::kUseVec4) {
-    const int grid = std::min<int64_t>((desc.rows.capacity + 1) / 2, num_sms * 32);
+    const int grid = std::min<int64_t>((desc.rows.host_limit + 1) / 2, num_sms * 32);
     if (desc.width <= 128)
       one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 1>
           <<<grid, dim3(32, 2), 0, stream>>>(desc);
@@ -1140,7 +1140,7 @@ void copy_one_to_one(CopyDesc &desc, int num_sms, cudaStream_t stream) {
       ++lane_shift;
     }
     const int groups = block >> lane_shift;
-    const int grid = std::min<int64_t>((desc.rows.capacity + groups - 1) / groups,
+    const int grid = std::min<int64_t>((desc.rows.host_limit + groups - 1) / groups,
                                        num_sms * 32);
     one_to_one_copy_kernel<<<grid, block, 0, stream>>>(desc, lane_shift);
   }

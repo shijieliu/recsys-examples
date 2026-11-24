@@ -27,10 +27,11 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores,
                  std::optional<at::Tensor> table_global_capacities,
-                 const at::Tensor &num_valid) {
+                 const std::optional<at::Tensor> &num_valid,
+                 std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
-  int64_t num_total = keys.size(0);
+  const int64_t num_total = counted_host_limit(host_num_valid, keys.size(0));
   if (num_total == 0)
     return;
 

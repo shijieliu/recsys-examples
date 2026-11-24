@@ -159,7 +159,7 @@ void table_insert_and_evict_single_score(
     at::Tensor evicted_scores, at::Tensor evicted_table_ids,
     std::optional<at::Tensor> counter, int64_t num_scores,
     int64_t score_fn_key, int64_t const *global_caps_ptr,
-    int64_t const *num_valid_ptr) {
+    int64_t num_total, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -192,8 +192,6 @@ void table_insert_and_evict_single_score(
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
   auto counter_ptr = get_pointer<int32_t>(counter);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   auto table_key_slots = at::empty(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
@@ -256,7 +254,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
     at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key,
     std::optional<at::Tensor> refused, RefusedOutput refused_output,
-    int64_t const *global_caps_ptr, int64_t const *num_valid_ptr) {
+    int64_t const *global_caps_ptr, int64_t num_total,
+    int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
   int64_t *refused_ptr = get_pointer<int64_t>(refused);
@@ -293,8 +292,6 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
   auto ovf_counter_ptr = ovf_counter.data_ptr<int32_t>();
   auto ovf_output_offsets_ptr = ovf_output_offsets.data_ptr<int64_t>();
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   auto table_key_slots = at::empty(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
@@ -382,10 +379,13 @@ table_insert_and_evict(at::Tensor table_storage,
                        int64_t num_scores, int64_t score_fn_key,
                        std::optional<at::Tensor> refused,
                        std::optional<at::Tensor> table_global_capacities,
-                       const at::Tensor &num_valid,
-                       std::optional<at::Tensor> insert_status) {
+                       const std::optional<at::Tensor> &num_valid,
+                       std::optional<at::Tensor> insert_status,
+                       std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
+  const int64_t num_total = keys.size(0);
+  const int64_t host_n = counted_host_limit(host_num_valid, num_total);
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
   TORCH_CHECK(!refused.has_value() || use_overflow,
               "table_insert_and_evict: refused is flagged by the insert with "
@@ -420,7 +420,6 @@ table_insert_and_evict(at::Tensor table_storage,
     }
   }
 
-  const int64_t num_total = keys.size(0);
   at::Tensor indices =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
   at::Tensor evicted_keys =
@@ -432,7 +431,7 @@ table_insert_and_evict(at::Tensor table_storage,
   at::Tensor evicted_table_ids =
       torch::empty({num_total}, keys.options().dtype(torch::kLong));
 
-  if (num_total == 0) {
+  if (host_n == 0) {
     return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
                            evicted_scores, evicted_table_ids);
   }
@@ -449,14 +448,14 @@ table_insert_and_evict(at::Tensor table_storage,
         evicted_scores, evicted_table_ids, counter.value(), ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
         ovf_output_offsets.value(), num_scores, score_fn_key, refused,
-        refused_output, global_caps_ptr, num_valid_ptr);
+        refused_output, global_caps_ptr, host_n, num_valid_ptr);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
         keys, table_ids, score_input, policy_type, indices, insert_results,
         score_output, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids, counter, num_scores, score_fn_key,
-        global_caps_ptr, num_valid_ptr);
+        global_caps_ptr, host_n, num_valid_ptr);
   }
 
   return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
@@ -469,10 +468,11 @@ void table_update_counter_with_layout(
     int64_t main_capacity, int64_t num_tables,
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity, const at::Tensor &num_valid) {
+    int64_t overflow_bucket_capacity, const std::optional<at::Tensor> &num_valid,
+    std::optional<int64_t> host_num_valid) {
   const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, slot_indices.device());
 
-  int64_t n = slot_indices.size(0);
+  const int64_t n = counted_host_limit(host_num_valid, slot_indices.size(0));
   if (n == 0)
     return;
 
@@ -492,7 +492,7 @@ void table_update_counter_with_layout(
 
   constexpr int BLOCK_SIZE = 256;
   // One thread per entry, not a grid-stride loop: the grid stays derived from
-  // the capacity n, and the blocks past the live count return at once.
+  // the host upper bound n, and the blocks past the live count return at once.
   update_counter_with_layout_kernel<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE,
                                       BLOCK_SIZE, 0, stream>>>(
       counter_ptr, total_capacity, slot_indices_ptr, n, delta, table_ids_ptr,

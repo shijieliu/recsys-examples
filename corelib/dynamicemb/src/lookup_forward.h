@@ -88,7 +88,7 @@ void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
 
 // Source and destination row maps are optional. A null map is the identity.
 struct RowMapping {
-  int64_t capacity, input_rows, output_rows;
+  int64_t host_limit, input_rows, output_rows;
   const int64_t *num_valid;
   const int64_t *src64, *dst64;
   const int32_t *src32, *dst32;

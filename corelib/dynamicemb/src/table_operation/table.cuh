@@ -108,7 +108,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> ovf_output_offsets,
              int64_t num_scores,
              std::optional<at::Tensor> table_global_capacities,
-             const at::Tensor &num_valid);
+             const std::optional<at::Tensor> &num_valid = std::nullopt,
+             std::optional<int64_t> host_num_valid = std::nullopt);
 
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
@@ -120,7 +121,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_output,
                         int64_t num_scores, int64_t score_fn_key,
                         std::optional<at::Tensor> table_global_capacities,
-                        const at::Tensor &num_valid);
+                        const std::optional<at::Tensor> &num_valid = std::nullopt,
+                        std::optional<int64_t> host_num_valid = std::nullopt);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
 // (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids); the
@@ -135,7 +137,8 @@ table_insert_collect_evicted(
     std::optional<at::Tensor> score_output,
     int64_t num_scores, int64_t score_fn_key,
     std::optional<at::Tensor> table_global_capacities,
-    const at::Tensor &num_valid);
+    const std::optional<at::Tensor> &num_valid = std::nullopt,
+    std::optional<int64_t> host_num_valid = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -154,8 +157,9 @@ table_insert_and_evict(
     int64_t num_scores, int64_t score_fn_key,
     std::optional<at::Tensor> refused,
     std::optional<at::Tensor> table_global_capacities,
-    const at::Tensor &num_valid,
-    std::optional<at::Tensor> insert_status);
+    const std::optional<at::Tensor> &num_valid = std::nullopt,
+    std::optional<at::Tensor> insert_status = std::nullopt,
+    std::optional<int64_t> host_num_valid = std::nullopt);
 
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -169,7 +173,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores,
                  std::optional<at::Tensor> table_global_capacities,
-                 const at::Tensor &num_valid);
+                 const std::optional<at::Tensor> &num_valid = std::nullopt,
+                 std::optional<int64_t> host_num_valid = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
@@ -234,7 +239,8 @@ void table_update_counter_with_layout(
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
     int64_t overflow_bucket_capacity,
-    const at::Tensor &num_valid);
+    const std::optional<at::Tensor> &num_valid = std::nullopt,
+    std::optional<int64_t> host_num_valid = std::nullopt);
 
 // Resolve table-relative hash slots to the value rows they own, taking the
 // next row of the slot's table for a slot that has none yet when `allocate`;
@@ -244,7 +250,8 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
                               at::Tensor table_ids, bool allocate,
-                              const at::Tensor &num_valid);
+                              const std::optional<at::Tensor> &num_valid = std::nullopt,
+                              std::optional<int64_t> host_num_valid = std::nullopt);
 
 // Rehash support. table_collect_reclaimed_rows returns the rows owned by the
 // reclaimed slots of buckets [bkt_begin, bkt_end) as int64[num_rows], where

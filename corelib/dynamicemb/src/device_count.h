@@ -24,14 +24,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <optional>
 
 namespace dyn_emb {
 
-// Per-key arrays are allocated at a capacity the host knows (the number of
-// input keys); the number of live leading entries is a device tensor
-// `num_valid`: int64, exactly one element (any view with numel() == 1, e.g.
-// table_offsets[T:T+1]). Entries from n = clamp(*num_valid, 0, capacity) on are
-// undefined memory that no kernel reads or writes.
+// The host chooses an upper bound inside the physical buffer capacity.
+// A device count may shorten that prefix without a host read.
+inline int64_t counted_host_limit(std::optional<int64_t> host_num_valid,
+                                  int64_t capacity) {
+  return std::clamp(host_num_valid.value_or(capacity), int64_t{0}, capacity);
+}
+
+// A count can be a one-element view such as table_offsets[T:T+1].
 inline const int64_t *counted_num_valid_ptr(const at::Tensor &t,
                                            const at::Device &device) {
   TORCH_CHECK(t.is_cuda() && t.device() == device,
@@ -39,6 +43,12 @@ inline const int64_t *counted_num_valid_ptr(const at::Tensor &t,
   TORCH_CHECK(t.scalar_type() == at::kLong && t.numel() == 1,
               "num_valid must be a one-element int64 tensor");
   return t.data_ptr<int64_t>();
+}
+
+inline const int64_t *
+counted_num_valid_ptr(const std::optional<at::Tensor> &num_valid,
+                      const at::Device &device) {
+  return num_valid ? counted_num_valid_ptr(*num_valid, device) : nullptr;
 }
 
 // Blocks of a grid-stride launch that wants `blocks` of them (to cover its

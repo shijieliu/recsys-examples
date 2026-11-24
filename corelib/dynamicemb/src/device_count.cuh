@@ -22,16 +22,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-// n = clamp(*num_valid, 0, capacity), read on the device: how many leading
-// entries of a per-key array of capacity `capacity` are live. Every caller
-// supplies a device count, including when all rows are live. The contract of
-// `num_valid` is in device_count.h.
+// The host count bounds the live prefix and is already limited to the buffer
+// capacity. An optional device count can shorten that prefix.
 // This header includes no torch header, so that table_operation/kernels.cuh,
 // which the evict fatbin builds with plain nvcc (setup.py), can use it.
 __host__ __device__ __forceinline__ int64_t
-counted_limit(const int64_t *num_valid, int64_t capacity) {
+counted_limit(const int64_t *num_valid, int64_t host_num_valid) {
+  if (num_valid == nullptr) {
+    return host_num_valid;
+  }
   const int64_t n = *num_valid;
-  return n < 0 ? 0 : (n > capacity ? capacity : n);
+  return n < 0 ? 0 : (n > host_num_valid ? host_num_valid : n);
 }
 
 } // namespace dyn_emb

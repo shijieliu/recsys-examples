@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
 import torch
-from dynamicemb.device_count import full_count
 
 from . import _C
 from .config import EmbeddingCollectionIndexerType, InferenceEmbeddingCollectionConfig
@@ -213,7 +212,6 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
             feature_ids,
             table_ids,
             ScoreArg(name="fused_key", policy=ScorePolicy.CONST),
-            num_valid=full_count(feature_ids),
         )
         missing_ids = feature_ids[~found]
         missing_tables = table_ids[~found]
@@ -251,7 +249,6 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
                     policy=ScorePolicy.ASSIGN,
                 ),
                 collect_evicted=True,
-                num_valid=full_count(missing_ids),
             )
             evicted_count_value = int(evicted_count.item())
             direct_failures = slots < 0
@@ -276,7 +273,6 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
                 feature_ids,
                 table_ids,
                 ScoreArg(name="fused_key", policy=ScorePolicy.CONST),
-                num_valid=full_count(feature_ids),
             )
 
         return torch.where(found, stored_keys, torch.full_like(stored_keys, -1))
@@ -312,7 +308,6 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
                 feature_ids,
                 table_ids,
                 ScoreArg(name="fused_key", policy=ScorePolicy.CONST),
-                num_valid=full_count(feature_ids),
             )
             self._failed_build_rows = {
                 row

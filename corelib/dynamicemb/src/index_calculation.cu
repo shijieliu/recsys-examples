@@ -34,16 +34,14 @@ struct CastI32ToI64 {
   }
 };
 
-// The flag of entry i in the counted compaction: set iff i < n and flags[i],
-// with n = clamp(*num_valid, 0, capacity) read on the device. Entries at or past n are never read, so whatever
-// they hold selects nothing.
+// Candidates beyond the optional device count must never read a flag.
 struct CountedFlag {
   bool const *flags;
   int64_t const *num_valid;
-  int64_t capacity;
+  int64_t host_n;
   bool invert;
   __host__ __device__ __forceinline__ bool operator()(int64_t i) const {
-    return i < counted_limit(num_valid, capacity) && (flags[i] != invert);
+    return i < counted_limit(num_valid, host_n) && (flags[i] != invert);
   }
 };
 
@@ -140,15 +138,12 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
   return table_range;
 }
 
-// Compaction of capacity-N arrays whose live length is a device count: the
-// entries of `inputs` where `flags` is set, over the entries i < n only,
-// n = clamp(*num_valid, 0, N). Nothing is read back (the temporary
-// storage is an at::empty, which does not wait). Returns (count[1] int64 on
-// the device, positions[N], outs[N] aligned with `inputs`, None staying None);
-// entries from count on are undefined.
+// Return the device selection count, positions, and aligned fields. Outputs
+// retain input capacity and only their selected prefix is initialized.
 std::tuple<at::Tensor, at::Tensor, std::vector<c10::optional<at::Tensor>>>
 flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
-                const at::Tensor &num_valid, bool invert) {
+                const std::optional<at::Tensor> &num_valid, bool invert,
+                std::optional<int64_t> host_num_valid) {
 
   TORCH_CHECK(flags.is_cuda(), "flags must be on CUDA");
   TORCH_CHECK(flags.dtype() == at::kBool, "flags must be bool");
@@ -157,7 +152,8 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
   auto device = flags.device();
   c10::cuda::CUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t num_total = flags.size(0);
+  const int64_t capacity = flags.size(0);
+  const int64_t host_n = counted_host_limit(host_num_valid, capacity);
   const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, device);
 
   std::vector<at::Tensor> real_inputs;
@@ -170,7 +166,7 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
       TORCH_CHECK(t.dim() == 1, "all inputs must be 1D");
       TORCH_CHECK(t.element_size() == 8,
                   "all inputs must be 8-byte elements (int64/uint64)");
-      TORCH_CHECK(t.size(0) == num_total, "all inputs must match flags length");
+      TORCH_CHECK(t.size(0) == capacity, "all inputs must match flags length");
       TORCH_CHECK(t.is_contiguous(), "all inputs must be contiguous");
       real_inputs.push_back(t);
       real_positions.push_back(i);
@@ -184,72 +180,59 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
   std::vector<c10::optional<at::Tensor>> full_outputs(inputs.size(),
                                                       c10::nullopt);
 
-  if (num_total == 0) {
-    for (size_t j = 0; j < num_real; j++) {
-      full_outputs[real_positions[j]] =
-          at::empty({0}, real_inputs[j].options());
-    }
-    return {at::zeros({1}, i64), at::empty({0}, i64), full_outputs};
+  auto out_indices = at::empty({capacity}, i64);
+  for (size_t j = 0; j < num_real; j++) {
+    full_outputs[real_positions[j]] = at::empty_like(real_inputs[j]);
   }
+  if (host_n == 0)
+    return {at::zeros({1}, i64), out_indices, full_outputs};
 
   auto num_selected = at::empty({1}, i64);
-  auto out_indices = at::empty({num_total}, i64);
-  std::vector<at::Tensor> real_outputs;
-  real_outputs.reserve(num_real);
-  for (const auto &inp : real_inputs) {
-    real_outputs.push_back(at::empty_like(inp));
-  }
-
   std::vector<int64_t const *> in_ptrs(num_real);
   std::vector<int64_t *> out_ptrs(num_real);
   for (size_t i = 0; i < num_real; i++) {
     in_ptrs[i] = reinterpret_cast<int64_t const *>(real_inputs[i].data_ptr());
-    out_ptrs[i] = reinterpret_cast<int64_t *>(real_outputs[i].data_ptr());
+    out_ptrs[i] = reinterpret_cast<int64_t *>(full_outputs[real_positions[i]]->data_ptr());
   }
 
-  // CUB runs over the capacity; the flag iterator reads the count and turns
-  // every entry at or past it off.
+  // The host bound sizes the CUB dispatch, and the iterator applies the device bound.
   auto d_flags = thrust::make_transform_iterator(
       thrust::counting_iterator<int64_t>(0),
-      CountedFlag{flags.data_ptr<bool>(), d_num_valid, num_total, invert});
+      CountedFlag{flags.data_ptr<bool>(), d_num_valid, host_n, invert});
   auto *d_out_idx = out_indices.data_ptr<int64_t>();
   auto *d_num_sel = num_selected.data_ptr<int64_t>();
 
   switch (num_real) {
   case 0:
-    select_index_async<int64_t, int64_t>(num_total, d_flags, d_out_idx,
+    select_index_async<int64_t, int64_t>(host_n, d_flags, d_out_idx,
                                          d_num_sel, device, stream);
     break;
   case 1:
-    flagged_compact_cub<1>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
+    flagged_compact_cub<1>(host_n, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
   case 2:
-    flagged_compact_cub<2>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
+    flagged_compact_cub<2>(host_n, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
   case 3:
-    flagged_compact_cub<3>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
+    flagged_compact_cub<3>(host_n, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
   case 4:
-    flagged_compact_cub<4>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
+    flagged_compact_cub<4>(host_n, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
   case 5:
-    flagged_compact_cub<5>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
+    flagged_compact_cub<5>(host_n, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
   case 6:
-    flagged_compact_cub<6>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
+    flagged_compact_cub<6>(host_n, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-  for (size_t j = 0; j < num_real; j++) {
-    full_outputs[real_positions[j]] = real_outputs[j];
-  }
 
   return {num_selected, out_indices, full_outputs};
 }
@@ -263,14 +246,14 @@ void bind_index_calculation_op(py::module &m) {
         py::arg("offsets"), py::arg("feature_offsets"));
 
   m.def("flagged_compact", &dyn_emb::flagged_compact,
-        "CUB stream compaction with zipped iterators, with a device count and "
-        "no host read. Only entries i < n (n = clamp(*num_valid, 0, "
-        "len(flags))) are candidates. Accepts "
+        "Compact the prefix bounded by host_num_valid (default len(flags)) and "
+        "the optional device count num_valid, without a host read. Accepts "
         "Optional[Tensor] in inputs; None passes through. Returns (count[1] "
         "int64 on device, positions[len(flags)], [opt_tensors[len(flags)]...]); "
         "entries from count on are undefined.",
-        py::arg("flags"), py::arg("inputs"), py::arg("num_valid"),
-        py::kw_only(), py::arg("invert") = false);
+        py::arg("flags"), py::arg("inputs"), py::arg("num_valid") = py::none(),
+        py::kw_only(), py::arg("invert") = false,
+        py::arg("host_num_valid") = py::none());
 
   m.def("segmented_sum_cuda", &dyn_emb::segmented_sum_cuda,
         "Segmented sum: output[i] = sum(data[offsets[i]:offsets[i+1]]). data "

@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from dynamicemb.device_count import full_count
+from dynamicemb.device_count import full_count, read_host_count
 from dynamicemb.dynamicemb_config import dtype_to_bytes
 from dynamicemb.key_ownership import OwnershipRule, murmur3_hash_64bits
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
@@ -134,7 +134,8 @@ class ScoredHashTable(abc.ABC):
         table_ids: torch.Tensor,
         score: ScoreArg,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Lookup keys in the table.
@@ -142,7 +143,9 @@ class ScoredHashTable(abc.ABC):
             keys: input keys tensor.
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
             score: score argument.
-            num_valid: one-element int64 CUDA tensor giving the live prefix of every input.
+            num_valid: optional one-element int64 CUDA count of leading keys.
+            host_num_valid: optional host upper bound, defaulting to input capacity.
+                Table operations use the smaller of the two bounds.
         Returns:
             (score_out, founds, indices)
         """
@@ -156,7 +159,8 @@ class ScoredHashTable(abc.ABC):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Keys have to be unique.
@@ -177,7 +181,8 @@ class ScoredHashTable(abc.ABC):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """
         Keys have to be unique.
@@ -196,7 +201,8 @@ class ScoredHashTable(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """
         Erase Keys
@@ -636,7 +642,9 @@ class LinearBucketTable(ScoredHashTable):
         slots: torch.Tensor,
         table_ids: torch.Tensor,
         allocate: bool,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """Table-relative hash slots -> the value rows they own.
 
@@ -663,13 +671,16 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             allocate,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def _evicted_rows_of(
         self,
         result: Tuple,
         table_ids: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """``_rows_of`` over an ``insert_and_evict`` result: the inserted keys'
         indices take (and allocate) their rows, the evicted victims' indices
@@ -693,18 +704,21 @@ class LinearBucketTable(ScoredHashTable):
             evicted_table_ids,
         ) = result
         return (
-            self._rows_of(indices, table_ids, True, num_valid),
+            self._rows_of(
+                indices, table_ids, True, num_valid, host_num_valid=host_num_valid
+            ),
             num_evicted,
             evicted_keys,
-            self._rows_of(evicted_indices, evicted_table_ids, False, num_evicted),
+            self._rows_of(
+                evicted_indices,
+                evicted_table_ids,
+                False,
+                num_evicted,
+                host_num_valid=host_num_valid,
+            ),
             evicted_scores,
             evicted_table_ids,
         )
-
-    @staticmethod
-    def _host_count(num_valid: torch.Tensor, capacity: int) -> int:
-        """Read the live length for host-driven DEMB_DETERMINISM_MODE insertion."""
-        return max(0, min(int(num_valid.item()), capacity))
 
     @staticmethod
     def _to_capacity(a: torch.Tensor, capacity: int) -> torch.Tensor:
@@ -731,7 +745,12 @@ class LinearBucketTable(ScoredHashTable):
         )
 
     def slots_of(
-        self, keys: torch.Tensor, table_ids: torch.Tensor, *, num_valid: torch.Tensor
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         """The hash slots ``keys`` sit in (``-1`` where absent), whatever
         ``use_rows`` is.
@@ -751,6 +770,7 @@ class LinearBucketTable(ScoredHashTable):
             num_valid=num_valid,
             num_scores=self.num_scores_,
             table_global_capacities=self.table_global_capacities_,
+            host_num_valid=host_num_valid,
         )
         return slots
 
@@ -802,7 +822,8 @@ class LinearBucketTable(ScoredHashTable):
         score: ScoreArg,
         return_slots: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """
         Lookup keys in the table. Score is optional input for Assign/Accumulate policies.
@@ -831,15 +852,24 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=num_scores,
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         if return_slots:
             return (
                 score_out,
                 founds,
-                self._rows_of(indices, table_ids, False, num_valid),
+                self._rows_of(
+                    indices, table_ids, False, num_valid, host_num_valid=host_num_valid
+                ),
                 indices,
             )
-        return score_out, founds, self._rows_of(indices, table_ids, False, num_valid)
+        return (
+            score_out,
+            founds,
+            self._rows_of(
+                indices, table_ids, False, num_valid, host_num_valid=host_num_valid
+            ),
+        )
 
     def insert(
         self,
@@ -851,7 +881,8 @@ class LinearBucketTable(ScoredHashTable):
         collect_evicted: bool = False,
         return_slots: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ):
         """
         Keys have to be unique.
@@ -882,7 +913,7 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            host_num_valid = self._host_count(num_valid, keys.numel())
+            host_num_valid = read_host_count(keys.numel(), num_valid, host_num_valid)
             slots = self._to_capacity(
                 self._deterministic_insert(
                     keys[:host_num_valid],
@@ -892,7 +923,9 @@ class LinearBucketTable(ScoredHashTable):
                 ),
                 keys.numel(),
             )
-            rows = self._rows_of(slots, table_ids, True, num_valid)
+            rows = self._rows_of(
+                slots, table_ids, True, num_valid, host_num_valid=host_num_valid
+            )
             return (rows, slots) if return_slots else rows
 
         if collect_evicted:
@@ -912,8 +945,11 @@ class LinearBucketTable(ScoredHashTable):
                 score_fn_key=self.score_fn_key_,
                 table_global_capacities=self.table_global_capacities_,
                 num_valid=num_valid,
+                host_num_valid=host_num_valid,
             )
-            rows = self._rows_of(indices, table_ids, True, num_valid)
+            rows = self._rows_of(
+                indices, table_ids, True, num_valid, host_num_valid=host_num_valid
+            )
             return (rows, *rest, indices) if return_slots else (rows, *rest)
 
         indices = table_insert(
@@ -932,8 +968,11 @@ class LinearBucketTable(ScoredHashTable):
             score_fn_key=self.score_fn_key_,
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
-        rows = self._rows_of(indices, table_ids, True, num_valid)
+        rows = self._rows_of(
+            indices, table_ids, True, num_valid, host_num_valid=host_num_valid
+        )
         return (rows, indices) if return_slots else rows
 
     def insert_and_evict(
@@ -944,7 +983,8 @@ class LinearBucketTable(ScoredHashTable):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """Insert live keys and return the CUDA victim count and capacity-sized buffers."""
         score_value, policy = self._parse_score(score)
@@ -954,7 +994,7 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            host_num_valid = self._host_count(num_valid, keys.numel())
+            host_num_valid = read_host_count(keys.numel(), num_valid, host_num_valid)
             result = self._pad_eviction_result(
                 self._deterministic_insert_and_evict(
                     keys[:host_num_valid],
@@ -982,9 +1022,12 @@ class LinearBucketTable(ScoredHashTable):
                 score_fn_key=self.score_fn_key_,
                 table_global_capacities=self.table_global_capacities_,
                 num_valid=num_valid,
+                host_num_valid=host_num_valid,
             )
 
-        return self._evicted_rows_of(result, table_ids, num_valid)
+        return self._evicted_rows_of(
+            result, table_ids, num_valid, host_num_valid=host_num_valid
+        )
 
     def insert_carrying_rows(
         self,
@@ -1027,7 +1070,6 @@ class LinearBucketTable(ScoredHashTable):
                 num_scores=self.num_scores_,
                 score_fn_key=self.score_fn_key_,
                 table_global_capacities=self.table_global_capacities_,
-                num_valid=full_count(keys),
             )
         assert bool((slots >= 0).all()), "rehash insert must not reject keys"
         self.set_rows(slots, table_id, rows)
@@ -1124,7 +1166,9 @@ class LinearBucketTable(ScoredHashTable):
         self,
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Increment ref-counter at given per-table slot indices.
 
@@ -1158,13 +1202,16 @@ class LinearBucketTable(ScoredHashTable):
                 self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
             ),
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def decrement_counter(
         self,
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         """Decrement ref-counter at given per-table slot indices.
 
@@ -1198,6 +1245,7 @@ class LinearBucketTable(ScoredHashTable):
                 self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
             ),
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
 
     def lookup_with_overflow(
@@ -1205,7 +1253,9 @@ class LinearBucketTable(ScoredHashTable):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         score: ScoreArg,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lookup with overflow buffer fallback. Indices for overflow entries
         are offset by the per-table main capacity. ``num_valid``: as in
@@ -1230,6 +1280,7 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=num_scores,
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         return score_out, founds, indices
 
@@ -1242,7 +1293,8 @@ class LinearBucketTable(ScoredHashTable):
         score_out: Optional[torch.Tensor] = None,
         report_refused: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Tuple:
         """Insert live keys with counter-aware eviction and overflow fallback.
 
@@ -1260,7 +1312,7 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            host_num_valid = self._host_count(num_valid, keys.numel())
+            host_num_valid = read_host_count(keys.numel(), num_valid, host_num_valid)
             result = self._deterministic_insert_and_evict_with_overflow(
                 keys[:host_num_valid],
                 table_ids[:host_num_valid],
@@ -1302,6 +1354,7 @@ class LinearBucketTable(ScoredHashTable):
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
             insert_status=status,
+            host_num_valid=host_num_valid,
         )
         if not report_refused:
             return (indices, num_evicted, *evicted)
@@ -1325,7 +1378,8 @@ class LinearBucketTable(ScoredHashTable):
         table_ids: torch.Tensor,
         return_indices: bool = False,
         *,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """
         Erase Keys
@@ -1360,6 +1414,7 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=self.num_scores_,
             table_global_capacities=self.table_global_capacities_,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         return indices
 
@@ -1565,7 +1620,7 @@ class LinearBucketTable(ScoredHashTable):
             tid = torch.full(
                 (keys.numel(),), load_table_id, dtype=torch.int64, device=device
             )
-            self.insert(keys, tid, score_arg, num_valid=full_count(keys))
+            self.insert(keys, tid, score_arg)
 
         fkey.close()
         for name in fscores.keys():
@@ -2266,7 +2321,6 @@ class LinearBucketTable(ScoredHashTable):
                 policy,
                 self._ref_counter,
                 table_global_capacities=self.table_global_capacities_,
-                num_valid=full_count(vk),
             )
 
         _, _, indices = table_lookup(
@@ -2278,7 +2332,6 @@ class LinearBucketTable(ScoredHashTable):
             None,
             ScorePolicy.CONST,
             table_global_capacities=self.table_global_capacities_,
-            num_valid=full_count(keys),
         )
         return indices
 
@@ -2337,7 +2390,6 @@ class LinearBucketTable(ScoredHashTable):
                 policy,
                 self._ref_counter,
                 table_global_capacities=self.table_global_capacities_,
-                num_valid=full_count(vk),
             )
             h_num_ev = num_ev.cpu().item()
             if h_num_ev > 0:
@@ -2358,7 +2410,6 @@ class LinearBucketTable(ScoredHashTable):
             None,
             ScorePolicy.CONST,
             table_global_capacities=self.table_global_capacities_,
-            num_valid=full_count(keys),
         )
         return (
             indices,
@@ -2436,7 +2487,6 @@ class LinearBucketTable(ScoredHashTable):
                 ovf_output_offsets=self.overflow_output_offsets_,
                 refused=refused,
                 table_global_capacities=self.table_global_capacities_,
-                num_valid=full_count(vk),
             )
             h_num_ev = num_ev.cpu().item()
             if h_num_ev > 0:
@@ -2460,7 +2510,6 @@ class LinearBucketTable(ScoredHashTable):
             ovf_bucket_capacity=self.overflow_bucket_capacity_,
             ovf_output_offsets=self.overflow_output_offsets_,
             table_global_capacities=self.table_global_capacities_,
-            num_valid=full_count(keys),
         )
         result = (
             indices,

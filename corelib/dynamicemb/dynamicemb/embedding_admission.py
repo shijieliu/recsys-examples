@@ -19,6 +19,7 @@ import warnings
 from typing import List, Optional
 
 import torch
+from dynamicemb.device_count import read_host_count
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -40,7 +41,9 @@ from dynamicemb.types import (
 from dynamicemb_extensions import flagged_compact, gather_embedding
 
 
-def _check_num_valid(keys: torch.Tensor, num_valid: torch.Tensor) -> None:
+def _check_num_valid(keys: torch.Tensor, num_valid: Optional[torch.Tensor]) -> None:
+    if num_valid is None:
+        return
     if not isinstance(num_valid, torch.Tensor):
         raise TypeError("num_valid must be a tensor")
     if (
@@ -116,9 +119,11 @@ class MultiTableKVCounter(Counter):
     def add(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         _check_num_valid(keys, num_valid)
         self.score_arg_.value = frequencies
@@ -129,17 +134,22 @@ class MultiTableKVCounter(Counter):
             self.score_arg_,
             score_out=scores_out,
             num_valid=num_valid,
+            host_num_valid=host_num_valid,
         )
         return scores_out
 
     def erase(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
+        host_num_valid: Optional[int] = None,
     ) -> None:
         _check_num_valid(keys, num_valid)
-        self.table_.erase(keys, table_ids, num_valid=num_valid)
+        self.table_.erase(
+            keys, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
+        )
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)
@@ -301,9 +311,11 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
     def admit(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         given = frequencies is not None
         if frequencies is None:
@@ -316,7 +328,13 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
                 f"{keys.shape[0]} and {frequencies.shape[0]}"
             )
 
-        accumulated = self._counter.add(keys, num_valid, table_ids, frequencies)
+        accumulated = self._counter.add(
+            keys,
+            num_valid,
+            table_ids=table_ids,
+            frequencies=frequencies,
+            host_num_valid=host_num_valid,
+        )
         admit_mask = accumulated >= self._threshold
         # What the caller gave is a per-batch increment; what it gets back is the
         # running total, which an LFU table takes as the admitted key's score.
@@ -326,6 +344,7 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
                 accumulated.to(frequencies.dtype),
                 output=frequencies,
                 num_valid=num_valid,
+                host_num_valid=host_num_valid,
             )
 
         # A key that got in is no longer waiting, so it stops taking up room.
@@ -333,9 +352,14 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         # one pass over the missing keys is worth keeping the counter's whole
         # lifecycle in the one place that knows the counter exists.
         num_admitted, _, (admitted_keys, admitted_table_ids) = flagged_compact(
-            admit_mask, [keys, table_ids], num_valid
+            admit_mask, [keys, table_ids], num_valid, host_num_valid=host_num_valid
         )
-        self._counter.erase(admitted_keys, num_admitted, admitted_table_ids)
+        self._counter.erase(
+            admitted_keys,
+            num_admitted,
+            table_ids=admitted_table_ids,
+            host_num_valid=host_num_valid,
+        )
         return admit_mask
 
     def state(self) -> Optional[Counter]:
@@ -368,10 +392,9 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
     -----
     The draws come from ``torch.rand``, so they follow ``torch.manual_seed``
     and survive CUDA graph capture. A seeded run repeats, but every step draws
-    one number per entry of the arrays it is given (one per key of the batch's
-    capacity, whatever the number of keys that are missing), and the keys that
-    go missing take the first of them in the order they go missing, so changing
-    the batch size or the data order changes which keys get in.
+    one number per entry up to the host upper bound (the batch capacity when
+    omitted). Missing keys take the first draws in the order they go missing;
+    changing the host bound or the data order can change which keys get in.
     """
 
     def __init__(
@@ -418,32 +441,36 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
     def admit(
         self,
         keys: torch.Tensor,
-        num_valid: torch.Tensor,
+        num_valid: Optional[torch.Tensor] = None,
+        *,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        host_num_valid: Optional[int] = None,
     ) -> torch.Tensor:
         _check_num_valid(keys, num_valid)
-        # One draw per entry of the arrays, not per live key (see the Notes of
-        # ProbabilisticAdmissionStrategy).
-        num_keys = keys.shape[0]
-        if self._probability <= 0.0:
-            return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)
-        if self._probability >= 1.0:
-            return torch.ones(num_keys, dtype=torch.bool, device=keys.device)
+        # Produce a capacity-sized mask. The caller consumes its live prefix.
+        host_limit = read_host_count(keys.size(0), None, host_num_valid)
+        mask = torch.empty_like(keys, dtype=torch.bool)
+        bounded_mask = mask[:host_limit]
+        if self._probability in (0.0, 1.0):
+            bounded_mask.fill_(self._probability == 1.0)
+            return mask
 
         # torch.rand draws from [0, 1), so the comparison is strict: nothing
         # passes at probability 0 and everything does at 1. (curand_uniform,
         # which the initializers use, is (0, 1] and wants the opposite.)
-        draws = torch.rand(num_keys, device=keys.device)
+        draws = torch.rand(host_limit, device=keys.device)
         if frequencies is None:
-            return draws < self._probability
+            torch.lt(draws, self._probability, out=bounded_mask)
+            return mask
 
         # A key the batch holds k times deserves k tosses. Tossing k times and
         # taking any success is exactly one toss against 1 - (1 - p)^k, so that
         # is what this compares to -- through log1p/expm1, because float32
         # loses a small p outright in 1 - p (at p = 1e-8 it rounds to 1).
-        occurrences = frequencies.to(torch.float32).clamp(min=1.0)
-        return draws < -torch.expm1(occurrences * self._log_miss)
+        occurrences = frequencies[:host_limit].to(torch.float32).clamp(min=1.0)
+        torch.lt(draws, -torch.expm1(occurrences * self._log_miss), out=bounded_mask)
+        return mask
 
     @property
     def non_admitted_initializer(self):
