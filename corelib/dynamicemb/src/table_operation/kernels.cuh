@@ -151,7 +151,8 @@ __device__ __forceinline__ int64_t cache_warp_find(
 }
 
 template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
-          bool EnableOverflow = false, bool CachePrefetch = false>
+          bool EnableOverflow = false, bool CachePrefetch = false,
+          bool BackingRows = false>
 __global__ void table_lookup_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int64_t batch, typename Table::KeyType const *__restrict__ input_keys,
@@ -159,7 +160,10 @@ __global__ void table_lookup_kernel(
     IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
     int64_t *__restrict__ score_output, Table ovf_table,
     int64_t const *__restrict__ ovf_output_offsets,
-    int64_t const *__restrict__ num_valid, CacheLookupRows cache = {}) {
+    int64_t const *__restrict__ num_valid, CacheLookupRows cache = {},
+    int64_t const *__restrict__ slot_to_row = nullptr,
+    bool const *__restrict__ need_row = nullptr) {
+  static_assert(!BackingRows || (!EnableOverflow && !CachePrefetch));
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -199,11 +203,11 @@ __global__ void table_lookup_kernel(
                         &bkt_begin, &table_cap);
     }
     if (table_cap == 0) {
-      if constexpr (!CachePrefetch)
+      if constexpr (!CachePrefetch && !BackingRows)
         score_output[i] = static_cast<int64_t>(score);
       // Cache prefetch exposes the miss mask. Table lookup exposes the hit mask.
       if (leader) {
-        flags[i] = CachePrefetch;
+        if constexpr (!BackingRows) flags[i] = CachePrefetch;
         indices[i] = -1;
       }
       continue;
@@ -230,7 +234,7 @@ __global__ void table_lookup_kernel(
       if constexpr (PolicyType == ScorePolicyType::Const) {
         // Return the reduction score (frequency for LruLfu; word 0 otherwise),
         // not word 0 which for LruLfu is the timestamp.
-        if constexpr (!CachePrefetch)
+        if constexpr (!CachePrefetch && !BackingRows)
           score = *bucket.reduction_score(iter);
       } else {
         KeyType expected_key = key;
@@ -297,9 +301,22 @@ __global__ void table_lookup_kernel(
       }
     }
 
-    if constexpr (!CachePrefetch)
-      score_output[i] = static_cast<int64_t>(score);
-    flags[i] = CachePrefetch ? !found : found;
+    if constexpr (BackingRows) {
+      // The score update above also applies to cache hits. Only cache misses
+      // consume backing values, so omit the indirect read for unneeded keys.
+      if (found && (!need_row || need_row[i])) {
+        if (slot_to_row) {
+          index = slot_to_row[bucket_id * bucket.capacity() + iter];
+          if (index < 0) __trap();  // A resident backing key must own a row.
+        }
+      } else {
+        index = -1;
+      }
+    } else {
+      if constexpr (!CachePrefetch)
+        score_output[i] = static_cast<int64_t>(score);
+      flags[i] = CachePrefetch ? !found : found;
+    }
     indices[i] = index;
   }
 }

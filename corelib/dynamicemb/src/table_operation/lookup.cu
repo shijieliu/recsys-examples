@@ -16,19 +16,21 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "kernels.cuh"
-#include "table.cuh"
+#include "../cache_batch.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <limits>
 
 namespace dyn_emb {
 
-void table_lookup_single_score(
+template <bool BackingRows = false>
+static void table_lookup_single_score(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     int64_t num_scores, int64_t const *global_caps_ptr,
-    int64_t num_total, int64_t const *num_valid_ptr) {
+    int64_t num_total, int64_t const *num_valid_ptr,
+    int64_t const *slot_to_row = nullptr, bool const *need_row = nullptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -44,9 +46,9 @@ void table_lookup_single_score(
     }
   }
 
-  auto score_output_ptr = score_output.data_ptr<int64_t>();
+  auto score_output_ptr = BackingRows ? nullptr : score_output.data_ptr<int64_t>();
   auto indices_ptr = indices.data_ptr<IndexType>();
-  auto founds_ptr = founds.data_ptr<bool>();
+  auto founds_ptr = BackingRows ? nullptr : founds.data_ptr<bool>();
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
 
@@ -77,15 +79,33 @@ void table_lookup_single_score(
     // its last wave (10.5M keys: 3.27 ms against 2.65 ms with a thread each).
     // The threads past the count return at once.
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      table_lookup_kernel<Table, 1, PolicyTypeV, false>
+      table_lookup_kernel<Table, 1, PolicyTypeV, false, false, BackingRows>
           <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE,
              BLOCK_SIZE, 0, stream>>>(
               table, table_bucket_offsets_ptr, num_total, keys_ptr,
               table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
-              score_output_ptr, Table(), nullptr, num_valid_ptr);
+              score_output_ptr, Table(), nullptr, num_valid_ptr, {}, slot_to_row, need_row);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor lookup_backing_rows(const BackingLookupMap &map, at::Tensor keys,
+                              at::Tensor tids, const CacheScoreArg &score,
+                              const CacheOptionalTensor &num_valid,
+                              const CacheOptionalTensor &needed) {
+  const auto &[table, offsets, capacity, rows, words, global_caps] = map;
+  const auto &[scores, policy] = score;
+  auto result = at::empty_like(tids);
+  if (keys.numel()) {
+    table_lookup_single_score<true>(
+        table, offsets, capacity, keys, tids, scores, policy, {}, {}, result, words,
+        global_capacities_ptr(global_caps, offsets), keys.numel(),
+        counted_num_valid_ptr(num_valid, keys.device()),
+        rows ? rows->data_ptr<int64_t>() : nullptr,
+        needed ? needed->data_ptr<bool>() : nullptr);
+  }
+  return result;
 }
 
 template <bool CachePrefetch = false>

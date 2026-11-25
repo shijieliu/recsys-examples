@@ -26,17 +26,11 @@ using InitializerSpec = std::tuple<std::string, std::vector<float>,
                                    CacheOptionalTensor, CacheOptionalTensor,
                                    float, bool, bool>;
 
-// All addresses are in compact cache-miss order, except backing_slots, whose
-// score-updating lookup covers the full unique batch. Each lane group stages
-// one value before exchange can recycle its source row.
+// All per-row inputs and outputs share the compact cache-miss order.
 struct StagingRows {
   const int64_t *num_misses;
-  const int64_t *miss_positions;
   const int64_t *miss_table_ids;
-  const int64_t *backing_slots;
-  const int64_t *slot_to_row;
-  const int64_t *bucket_offsets;
-  int64_t bucket_capacity;
+  const int64_t *backing_rows;
   const int64_t *value_ptrs;
   const int64_t *embedding_dims;
   const int64_t *value_dims;
@@ -59,21 +53,13 @@ __global__ void stage_cache_misses_kernel(StagingRows rows, V *values,
   Generator generator(args);
   for (int64_t m = worker >> lane_shift; m < *rows.num_misses; m += stride) {
     const auto tid = rows.miss_table_ids[m];
-    const auto slot = rows.backing_slots[rows.miss_positions[m]];
+    const auto row = rows.backing_rows[m];
     const auto emb = rows.embedding_dims[tid];
     const auto width = rows.value_dims[tid];
     auto *dst = values + m * rows.max_value_dim;
     if (lane == 0)
-      rows.missing[m] = slot < 0;
-    if (slot >= 0) {
-      auto row = slot;
-      if (rows.slot_to_row) {
-        const int64_t begin = rows.bucket_offsets[tid];
-        CUDA_KERNEL_ASSERT(slot < (rows.bucket_offsets[tid + 1] - begin) *
-                                      rows.bucket_capacity);
-        row = rows.slot_to_row[begin * rows.bucket_capacity + slot];
-        CUDA_KERNEL_ASSERT(row >= 0);
-      }
+      rows.missing[m] = row < 0;
+    if (row >= 0) {
       const auto *src = reinterpret_cast<const V *>(rows.value_ptrs[tid]) +
                         row * width;
       copy_cache_row(src, dst, width, emb, emb, rows.max_embedding_dim, lane, lanes);
@@ -250,18 +236,15 @@ PrepareResult prepare_cache_lookup(
       std::get<1>(cache_score), score_words, global_caps, {}, {});
   try {
     // Scores live in storage even when the newest value is in cache.
-    auto result = table_lookup(back_table, back_buckets, back_capacity, keys, tids,
-                               score_values, policy, {}, 0, {}, back_words, back_global,
-                               num_unique);
+    auto backing_rows = lookup_backing_rows(backing, keys, tids, backing_score,
+                                           num_unique, cache_miss);
     auto [count, positions, fields] = flagged_compact(
-        cache_miss, {keys, tids, weights, scores}, num_unique, false, {});
+        cache_miss, {keys, tids, weights, scores, backing_rows}, num_unique, false, {});
     auto &miss_keys = *fields[0];
     auto &miss_ids = *fields[1];
     if (keys.numel()) {
-      StagingRows rows{count.data_ptr<int64_t>(), positions.data_ptr<int64_t>(),
-                       miss_ids.data_ptr<int64_t>(), std::get<2>(result).data_ptr<int64_t>(),
-                       back_rows ? back_rows->data_ptr<int64_t>() : nullptr,
-                       back_buckets.data_ptr<int64_t>(), back_capacity,
+      StagingRows rows{count.data_ptr<int64_t>(), miss_ids.data_ptr<int64_t>(),
+                       fields[4]->data_ptr<int64_t>(),
                        ptrs.data_ptr<int64_t>(), edims.data_ptr<int64_t>(),
                        vdims.data_ptr<int64_t>(), max_emb, max_value, initial_accum,
                        words, ftrl, missing.data_ptr<bool>()};

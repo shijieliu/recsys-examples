@@ -189,9 +189,9 @@ __global__ void install_rows(ValuePointers table, SlotLayout map, const int64_t 
 // in a negative slot and spills the staged input, including optimizer state.
 template <typename Word>
 __global__ void copy_victims(ValuePointers from, SlotLayout from_map,
-                             ValuePointers to, SlotLayout to_map,
+                             ValuePointers to,
                              const int64_t *slots, const int64_t *tids,
-                             const int64_t *dest_slots, const int64_t *input_rows,
+                             const int64_t *dest_rows, const int64_t *input_rows,
                              const Word *staged, Word *spill, int64_t stride,
                              int64_t bound, const int64_t *count, int lane_shift) {
   const int lanes = 1 << lane_shift;
@@ -201,7 +201,7 @@ __global__ void copy_victims(ValuePointers from, SlotLayout from_map,
   for (int64_t i = int64_t(blockIdx.x) * groups_per_block + (threadIdx.x >> lane_shift);
        i < n; i += int64_t(gridDim.x) * groups_per_block) {
     const int64_t tid = tids[i], slot = slots[i];
-    const int64_t target = dest_slots ? resolve_row(to_map, tid, dest_slots[i], false) : -1;
+    const int64_t target = dest_rows ? dest_rows[i] : -1;
     if (target < 0 && !spill) continue;
     const int64_t width = from.value_dims[tid], emb = from.emb_dims[tid];
     const Word *src;
@@ -391,7 +391,7 @@ ExchangeResult exchange_cache_storage(
       launch_rows(values, backing_bound, [&](auto word, int grid, int shift) {
         using W = decltype(word);
         copy_victims<W><<<grid, kThreads, 0, stream>>>(
-            bv, bm, {}, {}, victim_slots.data_ptr<int64_t>(), victim_tids.data_ptr<int64_t>(),
+            bv, bm, {}, victim_slots.data_ptr<int64_t>(), victim_tids.data_ptr<int64_t>(),
             nullptr, back_inputs, static_cast<const W *>(values.data_ptr()),
             static_cast<W *>(displaced.data_ptr()), values.stride(0), backing_bound,
             back_count.data_ptr<int64_t>(), shift);
@@ -424,14 +424,16 @@ ExchangeResult exchange_cache_storage(
         ev_slots = fields[1]->narrow(0, 0, victims);
         ev_tids = fields[2]->narrow(0, 0, victims);
       }
-      // Look up the backing slot after new keys have had a chance to evict it.
-      auto dest = back.lookup(ev_keys, ev_tids);
+      // Resolve each victim's physical destination after backing insertions
+      // have had a chance to evict it.
+      auto dest = lookup_backing_rows(backing_map, ev_keys, ev_tids,
+                                      {std::nullopt, ScorePolicyType::Const});
       Opt gone_values;
       if (spill) gone_values = at::empty({victims, values.size(1)}, values.options());
       launch_rows(values, victims, [&](auto word, int grid, int shift) {
         using W = decltype(word);
         copy_victims<W><<<grid, kThreads, 0, stream>>>(
-            cv, cm, bv, bm, ev_slots.data_ptr<int64_t>(), ev_tids.data_ptr<int64_t>(),
+            cv, cm, bv, ev_slots.data_ptr<int64_t>(), ev_tids.data_ptr<int64_t>(),
             dest.data_ptr<int64_t>(), nullptr, nullptr,
             gone_values ? static_cast<W *>(gone_values->data_ptr()) : nullptr,
             values.stride(0), victims, nullptr, shift);

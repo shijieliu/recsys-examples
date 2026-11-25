@@ -42,6 +42,13 @@ using CacheValueLayout =
     std::tuple<at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t,
                at::ScalarType>;
 
+// Update scores for all live keys. Resolve a backing value row only when the
+// caller needs it (cache misses in preparation, every dirty key in exchange).
+at::Tensor lookup_backing_rows(const BackingLookupMap &map, at::Tensor keys,
+                              at::Tensor tids, const CacheScoreArg &score,
+                              const CacheOptionalTensor &num_valid = {},
+                              const CacheOptionalTensor &needed = {});
+
 std::optional<EvictionResult> try_ranked_cache_reservation(
     const CacheLookupMap &map, at::Tensor sizes, at::Tensor overflow_sizes,
     at::Tensor keys, at::Tensor tids, at::Tensor count, at::Tensor backing_count,
