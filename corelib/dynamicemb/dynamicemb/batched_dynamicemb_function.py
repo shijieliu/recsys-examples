@@ -1213,6 +1213,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # dtype, loads each key's row straight into the output: no unique
             # rows to write and read back in between.
             direct = False
+            pool_from_cache = False
             num_unique = prefetch_state.num_unique
             writeback_mask = None
             if use_counter:
@@ -1226,7 +1227,15 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     and prefetch_state.non_admitted is None
                     and output_dtype == state.emb_dtype
                 )
-                if not direct:
+                # The pooler can follow the reverse map straight to pinned
+                # cache slots. A rejected key needs an initialized staging row.
+                pool_from_cache = (
+                    is_pooling
+                    and prefetch_state.storage_mode == StorageMode.CACHE
+                    and prefetch_state.non_admitted is None
+                    and state.all_dims_vec4
+                )
+                if not direct and not pool_from_cache:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
                         unique_embs = load_from_flat(
                             state,
@@ -1284,9 +1293,20 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     dtype=output_dtype,
                     device=device,
                 )
+                source = (
+                    (
+                        state.table_ptrs_dev,
+                        state.table_value_dims,
+                        prefetch_state.value_row_indices,
+                        prefetch_state.unique_table_ids,
+                        state.emb_dtype,
+                    )
+                    if pool_from_cache
+                    else unique_embs
+                )
                 with torch.cuda.nvtx.range("op:gather_embedding"):
                     gather_embedding_pooled(
-                        unique_embs,
+                        source,
                         output_embs,
                         prefetch_state.reverse_indices,
                         offsets,

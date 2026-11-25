@@ -27,6 +27,15 @@ namespace dyn_emb {
 // input's order; ``layout`` maps that to the output's columns.  Source rows use
 // src_stride, which exceeds the copy width when optimizer state follows the
 // embedding in a row.
+// A pooled cache read goes from input to unique row to the pinned table slot.
+// The flat key/value tables keep their native per-table optimizer-state stride.
+struct PooledCacheRows {
+  const int64_t *table_ptrs = nullptr;
+  const int64_t *value_dims = nullptr;
+  const int64_t *slots = nullptr;
+  const int64_t *table_ids = nullptr;
+};
+
 template <typename SrcType, typename DstType, typename IndexType>
 struct ForwardMultiToOneFMLayoutDesc {
   using SrcT = SrcType;
@@ -45,8 +54,14 @@ struct ForwardMultiToOneFMLayoutDesc {
     return weights_ptr ? weights_ptr[i] : 1.0f;
   }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    int idx = inverse_idx_ptr[i];
-    return src_ptr + (int64_t)src_stride * idx;
+    const auto idx = inverse_idx_ptr[i];
+    if (cache.table_ptrs) {
+      const auto slot = cache.slots[idx];
+      if (slot < 0) return nullptr;
+      const auto tid = cache.table_ids[idx];
+      return reinterpret_cast<const SrcType *>(cache.table_ptrs[tid]) + slot * cache.value_dims[tid];
+    }
+    return src_ptr + int64_t(src_stride) * idx;
   }
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
     const int f = layout.feature_of_input(i);
@@ -66,6 +81,7 @@ struct ForwardMultiToOneFMLayoutDesc {
   const SrcType *__restrict__ src_ptr;
   DstType *dst_ptr;
   const float *__restrict__ weights_ptr; // nullptr -> unweighted
+  PooledCacheRows cache;
 };
 
 // Unified pooled gather (scatter-combine).  ``layout`` carries the shapes, the
@@ -79,10 +95,10 @@ void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
                      const IndexType *inverse_idx_ptr, PoolingMode pooling_mode,
                      const PooledLayout &layout, int src_stride,
                      bool feature_dims_vec4, cudaStream_t stream,
-                     const float *weights_ptr = nullptr) {
+                     const float *weights_ptr = nullptr, PooledCacheRows cache = {}) {
   ForwardMultiToOneFMLayoutDesc<SrcType, DstType, IndexType> desc{
       pooling_mode, layout,  src_stride,  offset_ptr, inverse_idx_ptr,
-      src_ptr,      dst_ptr, weights_ptr};
+      src_ptr,      dst_ptr, weights_ptr, cache};
   copy_multi_to_one(desc, feature_dims_vec4, stream);
 }
 

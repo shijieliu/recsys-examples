@@ -28,6 +28,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "lookup_kernel.cuh"
 #include "pooled_layout.cuh"
 #include "torch_utils.h"
+#include <variant>
 #include "utils.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
@@ -158,8 +159,12 @@ static at::Tensor gather_embedding_rows(at::Tensor input, at::Tensor index,
   return output;
 }
 
+using CachePoolingSource = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                                      at::ScalarType>;
+using PoolingSource = std::variant<at::Tensor, CachePoolingSource>;
+
 void gather_embedding_pooled(
-    at::Tensor input, at::Tensor output, at::Tensor inverse_index,
+    const PoolingSource &input, at::Tensor output, at::Tensor inverse_index,
     at::Tensor offsets, PoolingMode pooling_mode, int total_D, int batch_size,
     const std::optional<at::Tensor> &D_offsets = std::nullopt, int max_D = 0,
     const std::optional<at::Tensor> &weights = std::nullopt,
@@ -180,7 +185,25 @@ void gather_embedding_pooled(
   TORCH_CHECK(num_slots % batch_size == 0, "offsets holds ", num_slots,
               " bags, which is not divisible by batch_size (", batch_size, ")");
 
-  const auto src_type = get_data_type(input);
+  const auto *dense = std::get_if<at::Tensor>(&input);
+  PooledCacheRows cache;
+  DataType src_type;
+  if (dense) {
+    src_type = get_data_type(*dense);
+  } else {
+    const auto &[ptrs, widths, slots, ids, dtype] = std::get<CachePoolingSource>(input);
+    for (const auto *t : {&ptrs, &widths, &slots, &ids}) {
+      TORCH_CHECK(t->device() == output.device() && t->is_cuda() &&
+                      t->dim() == 1 && t->is_contiguous() && t->scalar_type() == at::kLong,
+                  "pooled cache row maps must be contiguous int64 vectors on the output GPU");
+    }
+    TORCH_CHECK(ptrs.numel() == widths.numel() && slots.numel() == ids.numel(),
+                "pooled cache table maps and slot maps must have matching lengths");
+    TORCH_CHECK(max_D > 0, "pooled cache reads require max_D");
+    cache = {ptrs.data_ptr<int64_t>(), widths.data_ptr<int64_t>(),
+             slots.data_ptr<int64_t>(), ids.data_ptr<int64_t>()};
+    src_type = scalartype_to_datatype(dtype);
+  }
   const auto dst_type = get_data_type(output);
   // One index type serves both: the descriptor reads the offsets and the
   // inverse indices through the same pointer type, so a mismatch here would
@@ -191,8 +214,8 @@ void gather_embedding_pooled(
               inverse_index.scalar_type(), " vs ", offsets.scalar_type());
   const auto offset_type = get_data_type(offsets);
 
-  int dim = D_offsets.has_value() ? max_D : static_cast<int>(input.size(1));
-  int src_stride = static_cast<int>(input.stride(0));
+  int dim = !dense || D_offsets ? max_D : static_cast<int>(dense->size(1));
+  int src_stride = dense ? static_cast<int>(dense->stride(0)) : 0;
   if (D_offsets.has_value()) {
     TORCH_CHECK(D_offsets.value().scalar_type() == at::kInt,
                 "D_offsets must be int32, got ",
@@ -229,12 +252,12 @@ void gather_embedding_pooled(
     DISPATCH_VALUE_DATATYPE_FUNCTION(src_type, src_t, [&] {
       DISPATCH_VALUE_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
         dyn_emb::scatter_combine<src_t, dst_t, index_t>(
-            get_pointer<const src_t>(input),
+            dense ? get_pointer<const src_t>(*dense) : nullptr,
             get_pointer<dst_t>(output),
             get_pointer<const index_t>(offsets),
             get_pointer<const index_t>(inverse_index),
             pooling_mode,
-            layout, src_stride, feature_dims_vec4, stream, d_weights);
+            layout, src_stride, feature_dims_vec4, stream, d_weights, cache);
       });
     });
   });

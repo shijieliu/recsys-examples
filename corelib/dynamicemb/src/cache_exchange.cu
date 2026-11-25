@@ -140,7 +140,7 @@ constexpr int kThreads = 128;
 
 // A lane group copies the table's actual row width. Its leader assigns the
 // backing slot's value row or publishes and pins a new cache slot.
-template <typename Word>
+template <typename Word, bool Cache>
 __global__ void install_rows(ValuePointers table, SlotLayout map, const int64_t *slots,
                              const int64_t *tids, const Word *staged, int64_t stride,
                              const int64_t *input_rows, int64_t staged_rows,
@@ -157,10 +157,21 @@ __global__ void install_rows(ValuePointers table, SlotLayout map, const int64_t 
     if (slot < 0) continue;
     const int64_t tid = tids[i], src = input_rows ? input_rows[i] : i;
     CUDA_KERNEL_ASSERT(src >= 0 && src < staged_rows);
-    int64_t row = 0;
-    if (lane == 0) {
-      row = resolve_row(map, tid, slot, true);
-      if (unique_slots) {
+    // Cache slots directly address their value rows. Backing insertions may
+    // allocate a row, in which case the group needs its leader's result.
+    int64_t row = slot;
+    if constexpr (!Cache) {
+      if (lane == 0)
+        row = resolve_row(map, tid, slot, true);
+      const unsigned mask = (~0u >> (32 - lanes)) << ((threadIdx.x & 31) - lane);
+      row = __shfl_sync(mask, static_cast<long long>(row), 0, lanes);
+    }
+    const int64_t width = table.value_dims[tid], emb = table.emb_dims[tid];
+    auto *dst = reinterpret_cast<Word *>(table.ptrs[tid]) + row * width;
+    copy_cache_row(staged + src * stride, dst, width, emb, table.max_emb, emb,
+                   lane, lanes);
+    if constexpr (Cache) {
+      if (lane == 0 && unique_slots) {
         const int64_t flat = slot < map.overflow_offsets[tid]
                                  ? map.bucket_offsets[tid] * map.bucket_capacity + slot
                                  : map.total_main_slots + tid * map.overflow_capacity +
@@ -170,12 +181,6 @@ __global__ void install_rows(ValuePointers table, SlotLayout map, const int64_t 
         unique_slots[out_rows[i]] = slot;
       }
     }
-    const unsigned mask = (~0u >> (32 - lanes)) << ((threadIdx.x & 31) - lane);
-    row = __shfl_sync(mask, static_cast<long long>(row), 0, lanes);
-    const int64_t width = table.value_dims[tid], emb = table.emb_dims[tid];
-    auto *dst = reinterpret_cast<Word *>(table.ptrs[tid]) + row * width;
-    copy_cache_row(staged + src * stride, dst, width, emb, table.max_emb, emb,
-                   lane, lanes);
   }
 }
 
@@ -400,7 +405,7 @@ ExchangeResult exchange_cache_storage(
     // admitted key that needs one and install its pre-staged value.
     launch_rows(values, backing_bound, [&](auto word, int grid, int shift) {
       using W = decltype(word);
-      install_rows<W><<<grid, kThreads, 0, stream>>>(
+      install_rows<W, false><<<grid, kThreads, 0, stream>>>(
           bv, bm, back_slots.data_ptr<int64_t>(), back_tids,
           static_cast<const W *>(values.data_ptr()), values.stride(0), back_inputs,
           values.size(0), nullptr, nullptr, 0, backing_bound, new_count, shift);
@@ -442,7 +447,7 @@ ExchangeResult exchange_cache_storage(
     // belongs to this failed batch and no slot is published for backward.
     launch_rows(values, attempted, [&](auto word, int grid, int shift) {
       using W = decltype(word);
-      install_rows<W><<<grid, kThreads, 0, stream>>>(
+      install_rows<W, true><<<grid, kThreads, 0, stream>>>(
           cv, cm, slots.data_ptr<int64_t>(), cache_tids,
           static_cast<const W *>(values.data_ptr()), values.stride(0), cache_inputs,
           values.size(0), outputs, refused ? nullptr : unique_slots,

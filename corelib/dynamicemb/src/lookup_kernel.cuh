@@ -982,6 +982,7 @@ __global__ void multi_to_one_cta_per_ev_kernel(CopyDesc copy_desc) {
     float accum[kMaxElemPerThread] = {0.f};
     for (int r = 0; r < (end - start); ++r) {
       const src_type *src_ev = copy_desc.get_src_ptr(r + start);
+      if (!src_ev) continue;
       float w = copy_desc.get_weight(r + start);
 #pragma unroll kMaxElemPerThread
       for (int i = 0;
@@ -1035,6 +1036,7 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
       for (int j = 0; j < kWarpSize && r + j < L; ++j) {
         int j_ev = __shfl_sync(0xFFFFFFFF, l, j);
         const src_type *src_ev = copy_desc.get_src_ptr(j_ev);
+        if (!src_ev) continue;
 	float w = copy_desc.get_weight(j_ev);
 
 #pragma unroll kMaxElemPerThread

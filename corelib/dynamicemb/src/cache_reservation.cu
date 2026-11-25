@@ -115,7 +115,8 @@ std::optional<EvictionResult> try_ranked_cache_reservation(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   DISPATCH_KEY_TYPE(get_data_type(keys), Key, [&] {
     using Table = LinearBucketTable<LinearBucket<Key>>;
-    using Traits = InsertKernelTraits<kThreads, 1, 1, 1, 8,
+    constexpr int lanes_per_probe = 32;
+    using Traits = InsertKernelTraits<kThreads, lanes_per_probe, 1, 1, 8,
                                       ScorePolicyType::GlobalTimer, false, true, true>;
     Table table(storage.data_ptr<uint8_t>(), buckets, capacity, words,
                 global_caps ? global_caps->data_ptr<int64_t>() : nullptr);
@@ -125,7 +126,8 @@ std::optional<EvictionResult> try_ranked_cache_reservation(
     auto *status_ptr = status.data_ptr<int64_t>();
     rank_cache_victims<<<buckets, kThreads, 0, stream>>>(
         table, pins_ptr, n, live, ranked, backing_count.data_ptr<int64_t>(), status_ptr);
-    const auto grid = table_grid_size(n, kThreads);
+    constexpr int keys_per_block = kThreads / lanes_per_probe;
+    const auto grid = counted_grid((n + keys_per_block - 1) / keys_per_block, kThreads);
     table_insert_and_evict_kernel<Table, Traits, RankedCacheLru>
         <<<grid, kThreads, 0, stream>>>(
             table, offsets.data_ptr<int64_t>(), sizes.data_ptr<int>(), n, keys.data_ptr<Key>(),
@@ -135,7 +137,7 @@ std::optional<EvictionResult> try_ranked_cache_reservation(
             evicted_tids.data_ptr<int64_t>(), pins_ptr, ovf, overflow_sizes.data_ptr<int>(),
             pins_ptr + buckets * capacity, overflow_offsets.data_ptr<int64_t>(), live, status_ptr,
             RefusedOutput::PackedStatus, ranked);
-    table_unlock_kernel<Table><<<grid, kThreads, 0, stream>>>(
+    table_unlock_kernel<Table><<<table_grid_size(n, kThreads), kThreads, 0, stream>>>(
         table, n, keys.data_ptr<Key>(), key_slots, live);
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();

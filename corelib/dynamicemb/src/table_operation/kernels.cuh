@@ -99,7 +99,7 @@ struct CacheLookupRows {
 // A full main bucket is a common negative probe during cache churn. Its
 // 32 lanes inspect consecutive groups of four digests and fetch full keys
 // only for matching tags. Overflow uses its original linear key order.
-template <bool Overflow, typename Bucket>
+template <bool Overflow, bool DistinguishEmpty = false, typename Bucket>
 __device__ __forceinline__ int64_t cache_warp_find(
     Bucket bucket, typename Bucket::KeyType key, int64_t hash) {
   constexpr unsigned full = 0xffffffff;
@@ -142,7 +142,8 @@ __device__ __forceinline__ int64_t cache_warp_find(
     // taking an empty slot. Across groups the first hit or empty wins.
     const unsigned stop = __ballot_sync(full, match >= 0 || empty);
     if (stop) {
-      const int64_t result = match < 0 ? -1 : pos + match;
+      // Insertion distinguishes an empty probe chain from a full bucket.
+      const int64_t result = match >= 0 ? pos + match : (DistinguishEmpty ? -2 : -1);
       return __shfl_sync(full, static_cast<long long>(result), __ffs(stop) - 1);
     }
   }
@@ -670,6 +671,8 @@ __device__ __forceinline__ void insert_and_evict_body(
   static constexpr bool UseOverflow = KernelTraits::EnableOverflow;
 
   using Policy = ScorePolicy<PolicyType>;
+  static_assert(ProbingGroupSize == 1 || ProbingGroupSize == 32);
+  static_assert(ProbingGroupSize == 1 || KernelTraits::CompactTileSize == 1);
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   // The live prefix may end mid-warp. A one-lane tile keeps the eviction
@@ -686,10 +689,10 @@ __device__ __forceinline__ void insert_and_evict_body(
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
-  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
+  for (int64_t i = tid / ProbingGroupSize; i < n;
+       i += int64_t(gridDim.x) * blockDim.x / ProbingGroupSize) {
 
     KeyType key = input_keys[i];
-    ScoreType score = Policy::get(score_input, i);
 
     int64_t hashcode = 0;
     int64_t bucket_id = 0;
@@ -704,14 +707,25 @@ __device__ __forceinline__ void insert_and_evict_body(
     }
     InsertResult result = InsertResult::Illegal;
     Bucket bucket = table[bucket_id];
+    // For a full bucket with a live miss, the warp has already checked every
+    // digest. An observed key or empty slot still goes through insert_probe's
+    // regular CAS/retry sequence, including changes since cache preparation.
+    bool exhausted = false;
+    if constexpr (ProbingGroupSize == 32) {
+      if (table_cap > 0)
+        exhausted = cache_warp_find<false, true>(bucket, key, hashcode) == -1;
+      if (threadIdx.x % 32 != 0) continue;
+    }
+    ScoreType score = Policy::get(score_input, i);
     Iter iter = Iter();
     KeyType evict_key = KeyType();
     ScoreType evict_score = ScoreType();
 
     if (table_cap > 0) {
       iter = Iter(hashcode % table.bucket_capacity());
-      insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
-                                     &iter, &result);
+      result = InsertResult::Init;
+      if (!exhausted)
+        insert_probe<1>(bucket, key, bucket_sizes, bucket_id, iter, &iter, &result);
 
       {
         // Match update_counter_with_layout_kernel's global main-table index.

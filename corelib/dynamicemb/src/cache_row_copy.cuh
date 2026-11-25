@@ -22,6 +22,11 @@ __device__ __forceinline__ void copy_cache_region(
   if (!(alignment & (alignof(uint4) - 1)) && words >= words_per_vector) {
     const auto *in = reinterpret_cast<const uint4 *>(src);
     auto *out = reinterpret_cast<uint4 *>(dst);
+    // A short aligned row fits in one vector access per lane.
+    if (words == lanes * words_per_vector) {
+      out[lane] = in[lane];
+      return;
+    }
     const int64_t n = words / words_per_vector;
     for (int64_t i = lane; i < n; i += lanes)
       out[i] = in[i];
