@@ -4772,7 +4772,9 @@ def _exchange_ps_model(*, admit=False):
         index_type=torch.int64,
         embedding_dtype=torch.float32,
         device_id=torch.cuda.current_device(),
-        score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+        score_strategy=(
+            DynamicEmbScoreStrategy.LFU if admit else DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED
+        ),
         caching=True,
         local_hbm_for_values=1024,
         external_storage=PyDictStorage,
@@ -4851,8 +4853,8 @@ def test_exchange_admission_with_external_hit_and_new_keys():
     with torch.no_grad():
         # Prime the counter for 33. In the mixed batch 33 reaches the threshold,
         # 55 is rejected on its first sight, and external key 23 skips admission.
-        model(keys[:1], keys.new_tensor([0, 1]), scores=keys[:1])
-        values = model(keys, keys.new_tensor([0, keys.numel()]), scores=keys)
+        model(keys[:1], keys.new_tensor([0, 1]))
+        values = model(keys, keys.new_tensor([0, keys.numel()]))
     expected = keys.float()[:, None].expand(-1, 8).clone()
     expected[1] = expected[3] = ps_row[0]
     torch.testing.assert_close(values, expected)
