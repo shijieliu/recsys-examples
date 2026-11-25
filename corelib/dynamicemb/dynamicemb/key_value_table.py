@@ -93,7 +93,6 @@ from dynamicemb_extensions import (
     fill_rows,
     flagged_compact,
     gather_embedding,
-    lookup_in_cache,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
@@ -2849,34 +2848,6 @@ class DynamicEmbCache(Cache):
                 "A previous cache placement failed. Restore the module from a "
                 "known-good checkpoint into a fresh instance before continuing."
             )
-
-    def lookup_and_pin(
-        self, unique_keys: torch.Tensor, key_table_offsets: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Probe the cache and pin each hit. Return miss mask, slots and table IDs.
-
-        Segmented unique supplies the table boundaries. Their final offset is
-        the device count of live rows in each of the three outputs.
-        """
-        self._check_placement()
-        state = self._state
-        table = state.key_index_map
-        score = get_find_score_arg(state, unique_keys.numel(), unique_keys.device)
-        return lookup_in_cache(
-            unique_keys,
-            key_table_offsets,
-            table.table_storage_,
-            table.table_bucket_offsets_,
-            table.bucket_capacity_,
-            table._ref_counter,
-            table.overflow_table_storage_,
-            table.overflow_bucket_capacity_,
-            table.overflow_output_offsets_,
-            score.value,
-            score.policy,
-            num_scores=table.num_scores_,
-            table_global_capacities=table.table_global_capacities_,
-        )
 
     # -- Cache interface --
 

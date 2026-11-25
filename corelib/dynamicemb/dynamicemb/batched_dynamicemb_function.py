@@ -33,6 +33,7 @@ from dynamicemb.key_value_table import (
     _lookup_keys,
     _write_back_evicted,
     eval_lookup,
+    get_find_score_arg,
     get_insert_score_arg,
     load_from_flat,
     load_from_flat_by,
@@ -52,6 +53,7 @@ from dynamicemb_extensions import (
     gather_embedding,
     gather_embedding_pooled,
     get_table_range,
+    lookup_in_cache,
     reduce_grads,
     segmented_unique_cuda,
     select_insert_failed_values,
@@ -494,8 +496,23 @@ def _prefetch_cache_path(
         # 1. Resolve table IDs, probe main and overflow buckets, and pin hits.
         # Placement later fills the -1 slots at the original miss positions.
         with torch.cuda.nvtx.range("op:cache_lookup"):
-            miss_in_cache, slot_indices, unique_table_ids = cache.lookup_and_pin(
-                unique_keys, unique_table_offsets
+            cache._check_placement()
+            table = state.key_index_map
+            cache_score = get_find_score_arg(state, unique_keys.numel(), device)
+            miss_in_cache, slot_indices, unique_table_ids = lookup_in_cache(
+                unique_keys,
+                unique_table_offsets,
+                table.table_storage_,
+                table.table_bucket_offsets_,
+                table.bucket_capacity_,
+                table._ref_counter,
+                table.overflow_table_storage_,
+                table.overflow_bucket_capacity_,
+                table.overflow_output_offsets_,
+                cache_score.value,
+                cache_score.policy,
+                num_scores=table.num_scores_,
+                table_global_capacities=table.table_global_capacities_,
             )
 
         placing = False
