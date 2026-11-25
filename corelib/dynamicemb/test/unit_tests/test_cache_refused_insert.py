@@ -28,6 +28,7 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import get_insert_score_arg, store_to_flat
+from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.types import CopyMode
 
 DIM = 8
@@ -146,6 +147,42 @@ def test_a_batch_that_fits_is_not_refused():
     assert bool((state.slot_indices >= 0).all())
     counter = model._cache._state.key_index_map._ref_counter
     assert counter.sum().item() == keys.numel()
+
+
+def test_dense_reservation_evicts_oldest_unpinned_rows(monkeypatch):
+    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
+    model = make_model()
+    # One full main bucket. Hold 25 rows for an outstanding prefetch and set
+    # explicit LRU times so the pinned rows are also the oldest ones.
+    old = torch.arange(CACHE_ROWS, device="cuda")
+    tids = torch.zeros_like(old)
+    with torch.no_grad():
+        model(old, old.new_tensor([0, old.numel()]))
+    prefetch(model, old[:25])
+    table = model._cache._state.key_index_map
+    name = table.score_names_[0]
+    _, present, _ = table.lookup(old, tids, ScoreArg(name, old, ScorePolicy.ASSIGN))
+    assert present.all()
+
+    # More than 4K input rows choose ranked reservation; 500 unique misses
+    # must displace exactly the first 500 unpinned rows.
+    incoming = torch.arange(CACHE_ROWS, CACHE_ROWS + 500, device="cuda")
+    exchange = lookup.exchange_cache_storage
+
+    def publish_before_exchange(*args, **kwargs):
+        # A callback or another stream can make a prepared miss resident.
+        # Reservation must find it and use its existing slot.
+        table.insert(incoming[:1], tids[:1], ScoreArg(name, None, ScorePolicy.GLOBAL_TIMER))
+        return exchange(*args, **kwargs)
+
+    monkeypatch.setattr(lookup, "exchange_cache_storage", publish_before_exchange)
+    prefetch(model, incoming.repeat(10))
+    readonly = ScoreArg(name, None, ScorePolicy.CONST)
+    _, present, _ = table.lookup(old, tids, readonly)
+    torch.testing.assert_close(present, (old < 25) | (old >= 525))
+    _, present, slots = table.lookup(incoming, torch.zeros_like(incoming), readonly)
+    assert present.all() and slots.unique().numel() == incoming.numel()
+    assert int(table._ref_counter.sum()) == 525
 
 
 def test_failed_preparation_preserves_dirty_victim_and_hit_pins(monkeypatch):

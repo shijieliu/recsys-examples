@@ -148,10 +148,12 @@ static void table_lookup_with_overflow_single_score(
     auto ovf_table = Table(reinterpret_cast<uint8_t *>(ovf_storage.data_ptr()),
                            ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
-    // A thread per entry, as in table_lookup_single_score.
+    // Segmented cache prefetch scans a full bucket with one warp per key.
+    constexpr int probe_group = CachePrefetch ? 32 : 1;
+    constexpr int keys_per_block = BLOCK_SIZE / probe_group;
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      table_lookup_kernel<Table, 1, PolicyTypeV, true, CachePrefetch>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE,
+      table_lookup_kernel<Table, probe_group, PolicyTypeV, true, CachePrefetch>
+          <<<(num_total + keys_per_block - 1) / keys_per_block,
              BLOCK_SIZE, 0, stream>>>(
               table, table_bucket_offsets_ptr, num_total, keys_ptr,
               table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,

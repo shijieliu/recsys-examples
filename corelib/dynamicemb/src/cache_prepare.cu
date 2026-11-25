@@ -16,6 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "cache_batch.cuh"
+#include "cache_row_copy.cuh"
 #include "initializer.cuh"
 
 namespace dyn_emb {
@@ -26,8 +27,8 @@ using InitializerSpec = std::tuple<std::string, std::vector<float>,
                                    float, bool, bool>;
 
 // All addresses are in compact cache-miss order, except backing_slots, whose
-// score-updating lookup covers the full unique batch. A warp stages a complete
-// value before the exchange can recycle any of its source rows.
+// score-updating lookup covers the full unique batch. Each lane group stages
+// one value before exchange can recycle its source row.
 struct StagingRows {
   const int64_t *num_misses;
   const int64_t *miss_positions;
@@ -49,13 +50,14 @@ struct StagingRows {
 
 template <typename V, typename Generator>
 __global__ void stage_cache_misses_kernel(StagingRows rows, V *values,
-                                          typename Generator::Args args) {
-  constexpr int warp = 32;
-  const int lane = threadIdx.x % warp;
+                                          typename Generator::Args args,
+                                          int lane_shift) {
+  const int lanes = 1 << lane_shift;
+  const int lane = threadIdx.x & (lanes - 1);
   const int64_t worker = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t stride = int64_t(gridDim.x) * blockDim.x / warp;
+  const int64_t stride = (int64_t(gridDim.x) * blockDim.x) >> lane_shift;
   Generator generator(args);
-  for (int64_t m = worker / warp; m < *rows.num_misses; m += stride) {
+  for (int64_t m = worker >> lane_shift; m < *rows.num_misses; m += stride) {
     const auto tid = rows.miss_table_ids[m];
     const auto slot = rows.backing_slots[rows.miss_positions[m]];
     const auto emb = rows.embedding_dims[tid];
@@ -74,16 +76,13 @@ __global__ void stage_cache_misses_kernel(StagingRows rows, V *values,
       }
       const auto *src = reinterpret_cast<const V *>(rows.value_ptrs[tid]) +
                         row * width;
-      for (int64_t col = lane; col < width; col += warp) {
-        const auto padded = col < emb ? col : rows.max_embedding_dim + col - emb;
-        dst[padded] = src[col];
-      }
+      copy_cache_row(src, dst, width, emb, emb, rows.max_embedding_dim, lane, lanes);
     } else {
-      for (int64_t col = lane; col < rows.max_embedding_dim; col += warp)
+      for (int64_t col = lane; col < rows.max_embedding_dim; col += lanes)
         dst[col] = TypeConvertFunc<V, float>::convert(generator.generate(m));
       auto *state = dst + rows.max_embedding_dim;
       for (int64_t col = lane; col < rows.max_value_dim - rows.max_embedding_dim;
-           col += warp) {
+           col += lanes) {
         if (rows.fp32_words) {
           const uint32_t bits = __float_as_uint(rows.initial_accumulator);
           if constexpr (sizeof(V) == 1)
@@ -107,14 +106,14 @@ __global__ void stage_cache_misses_kernel(StagingRows rows, V *values,
 struct StageLaunch {
   const StagingRows &rows;
   const at::Tensor &values;
-  int grid;
+  int grid, lane_shift;
   static constexpr int block = 128;
   cudaStream_t stream;
 
   template <typename Generator> void run(typename Generator::Args args) const {
     DISPATCH_VALUE_DATATYPE_FUNCTION(get_data_type(values), V, [&] {
       stage_cache_misses_kernel<V, Generator><<<grid, block, 0, stream>>>(
-          rows, get_pointer<V>(values), args);
+          rows, get_pointer<V>(values), args, lane_shift);
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -267,10 +266,13 @@ PrepareResult prepare_cache_lookup(
                        vdims.data_ptr<int64_t>(), max_emb, max_value, initial_accum,
                        words, ftrl, missing.data_ptr<bool>()};
       constexpr int block = StageLaunch::block;
-      int grid = counted_grid((keys.numel() + block / 32 - 1) / (block / 32), block);
+      // Preserve the random generator's worker-to-element assignment.
+      const int lane_shift = rng ? 5 : cache_copy_lane_shift(max_value * values.element_size());
+      const int groups = block >> lane_shift;
+      int grid = counted_grid((keys.numel() + groups - 1) / groups, block);
       if (rng && mode != "debug" && mode != "constant")
         grid = std::min<int64_t>(grid, rng->numel() / sizeof(curandState) / block);
-      StageLaunch launch{rows, values, grid, at::cuda::getCurrentCUDAStream().stream()};
+      StageLaunch launch{rows, values, grid, lane_shift, at::cuda::getCurrentCUDAStream().stream()};
       if (mode == "debug") {
         // MappingEmbeddingGenerator takes the key modulo an unsigned uint64_t.
         launch.run<MappingEmbeddingGenerator<uint64_t>>(

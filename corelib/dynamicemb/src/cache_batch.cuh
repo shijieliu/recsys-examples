@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include "cache_deterministic.h"
 #include "table_operation/table.cuh"
 
 namespace dyn_emb {
@@ -40,6 +41,11 @@ using BackingLookupMap =
 using CacheValueLayout =
     std::tuple<at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t,
                at::ScalarType>;
+
+std::optional<EvictionResult> try_ranked_cache_reservation(
+    const CacheLookupMap &map, at::Tensor sizes, at::Tensor overflow_sizes,
+    at::Tensor keys, at::Tensor tids, at::Tensor count, at::Tensor backing_count,
+    at::Tensor status);
 
 std::tuple<at::Tensor, at::Tensor, std::vector<CacheOptionalTensor>>
 flagged_compact(at::Tensor flags, std::vector<CacheOptionalTensor> inputs,
