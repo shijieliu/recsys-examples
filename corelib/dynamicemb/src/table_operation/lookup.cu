@@ -30,7 +30,7 @@ static void table_lookup_single_score(
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     int64_t num_scores, int64_t const *global_caps_ptr,
     int64_t num_total, int64_t const *num_valid_ptr,
-    int64_t const *slot_to_row = nullptr, bool const *need_row = nullptr) {
+    BackingValueLookup values = {}) {
 
   auto key_type = get_data_type(keys);
 
@@ -84,28 +84,39 @@ static void table_lookup_single_score(
              BLOCK_SIZE, 0, stream>>>(
               table, table_bucket_offsets_ptr, num_total, keys_ptr,
               table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
-              score_output_ptr, Table(), nullptr, num_valid_ptr, {}, slot_to_row, need_row);
+              score_output_ptr, Table(), nullptr, num_valid_ptr, {}, values);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-at::Tensor lookup_backing_rows(const BackingLookupMap &map, at::Tensor keys,
-                              at::Tensor tids, const CacheScoreArg &score,
-                              const CacheOptionalTensor &num_valid,
-                              const CacheOptionalTensor &needed) {
+BackingValueAddresses lookup_backing_values(
+    const BackingLookupMap &map, const CacheValueLayout &values, at::Tensor keys,
+    at::Tensor tids, const CacheScoreArg &score, const CacheOptionalTensor &num_valid,
+    const CacheOptionalTensor &needed, const CacheOptionalTensor &source_ptrs,
+    const CacheOptionalTensor &source_slots) {
   const auto &[table, offsets, capacity, rows, words, global_caps] = map;
+  const auto &[ptrs, emb, widths, max_emb, max_width, dtype] = values;
   const auto &[scores, policy] = score;
-  auto result = at::empty_like(tids);
+  BackingValueAddresses out{at::empty_like(tids), {}, {}};
+  if (widths) out.layout_tags = at::empty_like(tids);
+  if (source_slots) out.sources = at::empty_like(tids);
   if (keys.numel()) {
+    BackingValueLookup addresses{
+        rows ? rows->data_ptr<int64_t>() : nullptr, ptrs.data_ptr<int64_t>(),
+        emb ? emb->data_ptr<int64_t>() : nullptr, widths ? widths->data_ptr<int64_t>() : nullptr,
+        needed ? needed->data_ptr<bool>() : nullptr,
+        source_ptrs ? source_ptrs->data_ptr<int64_t>() : nullptr,
+        source_slots ? source_slots->data_ptr<int64_t>() : nullptr,
+        out.layout_tags ? out.layout_tags->data_ptr<int64_t>() : nullptr,
+        out.sources ? out.sources->data_ptr<int64_t>() : nullptr, max_emb, max_width,
+        static_cast<int64_t>(c10::elementSize(dtype))};
     table_lookup_single_score<true>(
-        table, offsets, capacity, keys, tids, scores, policy, {}, {}, result, words,
+        table, offsets, capacity, keys, tids, scores, policy, {}, {}, out.backing, words,
         global_capacities_ptr(global_caps, offsets), keys.numel(),
-        counted_num_valid_ptr(num_valid, keys.device()),
-        rows ? rows->data_ptr<int64_t>() : nullptr,
-        needed ? needed->data_ptr<bool>() : nullptr);
+        counted_num_valid_ptr(num_valid, keys.device()), addresses);
   }
-  return result;
+  return out;
 }
 
 template <bool CachePrefetch = false>

@@ -10,11 +10,34 @@ from dynamicemb.scored_hashtable import (
     get_scored_table,
 )
 from dynamicemb.utils import decode_table_values
-from dynamicemb_extensions import CurandStateContext, prepare_cache_lookup
+from dynamicemb_extensions import CurandStateContext, exchange_cache_storage, prepare_cache_lookup
 
 
 def _ids(values):
     return torch.tensor(values, dtype=torch.int64, device="cuda")
+
+
+def _maps(cache, backing):
+    cache_map = (
+        cache.table_storage_,
+        cache.table_bucket_offsets_,
+        cache.bucket_capacity_,
+        cache._ref_counter,
+        cache.overflow_table_storage_,
+        cache.overflow_bucket_capacity_,
+        cache.overflow_output_offsets_,
+        cache.num_scores_,
+        cache.table_global_capacities_,
+    )
+    backing_map = (
+        backing.table_storage_,
+        backing.table_bucket_offsets_,
+        backing.bucket_capacity_,
+        backing.rows_,
+        backing.num_scores_,
+        backing.table_global_capacities_,
+    )
+    return cache_map, backing_map
 
 
 def _fixture(dtype):
@@ -47,25 +70,7 @@ def _fixture(dtype):
         (torch.arange(2 * width, device="cuda").reshape(2, width) + t * 16).to(dtype)
         for t, width in enumerate(widths)
     ]
-    cache_map = (
-        cache.table_storage_,
-        cache.table_bucket_offsets_,
-        cache.bucket_capacity_,
-        cache._ref_counter,
-        cache.overflow_table_storage_,
-        cache.overflow_bucket_capacity_,
-        cache.overflow_output_offsets_,
-        cache.num_scores_,
-        cache.table_global_capacities_,
-    )
-    backing_map = (
-        backing.table_storage_,
-        backing.table_bucket_offsets_,
-        backing.bucket_capacity_,
-        backing.rows_,
-        backing.num_scores_,
-        backing.table_global_capacities_,
-    )
+    cache_map, backing_map = _maps(cache, backing)
     layout = (
         _ids([b.data_ptr() for b in buffers]),
         _ids([3, 4]),
@@ -178,3 +183,106 @@ def test_prepare_releases_hits_on_failure():
             *args, init, torch.zeros_like(args[0], dtype=torch.float32)
         )
     assert buffers and not bool(args[2][3].any())
+
+
+@pytest.mark.parametrize("mode,params", [
+    ("normal", [0.0, 0.75]),
+    ("uniform", [-0.75, 0.75]),
+    ("truncated_normal", [0.0, 0.4, -0.5, 0.5]),
+])
+def test_dense_copy_retains_rng_sequence(mode, params):
+    # Use the same initialized curandStateXORWOW workers for both preparations.
+    # Four warps repeatedly process interleaved backing hits and new rows.
+    state = CurandStateContext().state[: 128 * 48].clone()
+    uniform_state = state.clone()
+    n, dim, width = 149, 64, 128
+    cache = get_scored_table([512], bucket_capacity=128, enable_overflow=True)
+    backing = get_scored_table([512], bucket_capacity=128, use_rows=True)
+    keys = torch.arange(1, n + 1, device="cuda")
+    held = torch.nonzero(keys % 11 < 8).flatten()
+    physical = backing.insert(
+        keys[held], torch.zeros_like(held), ScoreArg("timestamp", None, ScorePolicy.CONST)
+    )
+    buffer = torch.empty((n, width), device="cuda", dtype=torch.float16)
+    buffer[physical] = keys[held, None].expand(-1, width).to(buffer.dtype)
+    cache_map, backing_map = _maps(cache, backing)
+
+    def prepare(widths, rng):
+        layout = (_ids([buffer.data_ptr()]), *widths, dim, width, buffer.dtype)
+        const = (None, ScorePolicy.CONST)
+        return prepare_cache_lookup(
+            keys, _ids([0, n]), cache_map, backing_map, layout, const, const,
+            (mode, params, None, rng, 0.625, False, False))
+    generic = prepare((_ids([dim]), _ids([width])), state)
+    dense = prepare((None, None), uniform_state)
+    assert int(generic[3]) == int(dense[3]) == n
+    assert int(dense[6][2]) == n - held.numel()
+    assert torch.equal(dense[5][2], generic[5][2])
+    assert torch.equal(dense[5][5], generic[5][5])
+    assert torch.equal(dense[5][2][held], buffer[physical])
+    assert torch.equal(state, uniform_state)
+
+    # Once every row exists, dense preparation only copies. The raw-copy
+    # branch must leave all random workers at the same position.
+    rest = torch.nonzero(keys % 11 >= 8).flatten()
+    added = backing.insert(
+        keys[rest], torch.zeros_like(rest), ScoreArg("timestamp", None, ScorePolicy.CONST)
+    )
+    buffer[added] = keys[rest, None].expand(-1, width).to(buffer.dtype)
+    before = state.clone()
+    generic = prepare((_ids([dim]), _ids([width])), state)
+    dense = prepare((None, None), uniform_state)
+    assert int(dense[6][2]) == 0 and not bool(dense[5][5].any())
+    assert torch.equal(dense[5][2], generic[5][2])
+    assert torch.equal(dense[5][2], keys[:, None].expand(-1, width).to(buffer.dtype))
+    assert torch.equal(before, state) and torch.equal(before, uniform_state)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float8_e4m3fn])
+def test_unaligned_dense_cache_moves_raw_words(dtype):
+    def buffer(rows):
+        element = torch.empty((), dtype=dtype).element_size()
+        raw = torch.full((rows * 256 + 2 * element,), 91, device="cuda", dtype=torch.uint8)
+        payload = raw[element:-element].view(rows, 256)
+        values = payload.view(dtype)
+        assert values.data_ptr() % 16 != 0
+        layout = (_ids([values.data_ptr()]), None, None, values.shape[1], values.shape[1], dtype)
+        return raw, payload, values, layout
+
+    cache = get_scored_table([128], bucket_capacity=128, enable_overflow=True)
+    backing = get_scored_table([1024], bucket_capacity=128, use_rows=True)
+    cache_map, backing_map = _maps(cache, backing)
+    keys = torch.arange(1, 130, device="cuda")
+    tids = torch.zeros_like(keys)
+    score = ScoreArg("timestamp", None, ScorePolicy.CONST)
+    held = cache.insert(keys[:-1], tids[:-1], score)
+    physical = backing.insert(keys, tids, score)
+    cache_owner, cache_raw, _, cache_values = buffer(128 + cache.overflow_bucket_capacity_)
+    back_owner, back_raw, _, backing_values = buffer(keys.numel())
+    col = torch.arange(256, device="cuda")
+    newest = (keys[:-1, None] + col).to(torch.uint8)
+    cache_raw[held] = newest
+    back_raw[physical[-1]] = (3 * col).to(torch.uint8)
+
+    const = (None, ScorePolicy.CONST)
+    _, slots, _, count, positions, staged, new = prepare_cache_lookup(
+        keys[-1:], _ids([0, 1]), cache_map, backing_map, backing_values, const, const,
+        ("constant", [0.0], None, None, 0.0, False, False))
+    assert int(count) == 1 and int(new[2]) == 0
+    assert torch.equal(staged[2][0].view(torch.uint8), back_raw[physical[-1]])
+    stage_owner, stage_raw, stage_values, _ = buffer(1)
+    stage_raw.copy_(staged[2].view(torch.uint8))
+    mutation = (cache.bucket_sizes, cache.overflow_bucket_sizes, cache.score_fn_key_,
+                backing.bucket_sizes, backing.row_counters_, backing.row_limits_, backing.score_fn_key_)
+    attempted, evicted, refused, _ = exchange_cache_storage(
+        cache_map, backing_map, cache_values, backing_values, mutation,
+        (None, ScorePolicy.GLOBAL_TIMER), const, (staged[0], staged[1], None, positions, count),
+        (new[0], new[1], new[3], new[2]), stage_values, slots, False, False)
+    assert (attempted, evicted, refused) == (1, 1, 0)
+    _, found, _ = cache.lookup(keys[:-1], tids[:-1], score)
+    gone = torch.nonzero(~found).flatten()
+    assert gone.numel() == 1
+    assert torch.equal(back_raw[physical[gone]], newest[gone])
+    assert torch.equal(cache_raw[slots[0]], stage_raw[0])
+    for owner in (cache_owner, back_owner, stage_owner):
+        assert int(owner[0]) == int(owner[-1]) == 91

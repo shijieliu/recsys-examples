@@ -37,17 +37,24 @@ using BackingLookupMap =
     std::tuple<at::Tensor, at::Tensor, int64_t, CacheOptionalTensor,
                int64_t, CacheOptionalTensor>;
 // Per-table value-buffer pointers, embedding and value widths, maximum
-// embedding and value widths, and the dtype of the stored words.
+// embedding and value widths, and the dtype of the stored words. Uniform
+// tables use the two scalar widths and omit both per-table width tensors.
 using CacheValueLayout =
-    std::tuple<at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t,
+    std::tuple<at::Tensor, CacheOptionalTensor, CacheOptionalTensor, int64_t, int64_t,
                at::ScalarType>;
 
-// Update scores for all live keys. Resolve a backing value row only when the
-// caller needs it (cache misses in preparation, every dirty key in exchange).
-at::Tensor lookup_backing_rows(const BackingLookupMap &map, at::Tensor keys,
-                              at::Tensor tids, const CacheScoreArg &score,
-                              const CacheOptionalTensor &num_valid = {},
-                              const CacheOptionalTensor &needed = {});
+// Byte addresses and a layout tag for each selected row. Zero is a missing
+// address. Tag zero means a contiguous full-width row; tag t+1 identifies a
+// narrower table. Exchange also asks for each dirty cache slot's source.
+struct BackingValueAddresses {
+  at::Tensor backing;
+  CacheOptionalTensor layout_tags, sources;
+};
+BackingValueAddresses lookup_backing_values(
+    const BackingLookupMap &map, const CacheValueLayout &values, at::Tensor keys,
+    at::Tensor tids, const CacheScoreArg &score, const CacheOptionalTensor &num_valid = {},
+    const CacheOptionalTensor &needed = {}, const CacheOptionalTensor &source_ptrs = {},
+    const CacheOptionalTensor &source_slots = {});
 
 std::optional<EvictionResult> try_ranked_cache_reservation(
     const CacheLookupMap &map, at::Tensor sizes, at::Tensor overflow_sizes,
@@ -58,5 +65,9 @@ std::tuple<at::Tensor, at::Tensor, std::vector<CacheOptionalTensor>>
 flagged_compact(at::Tensor flags, std::vector<CacheOptionalTensor> inputs,
                 const CacheOptionalTensor &num_valid, bool invert,
                 std::optional<int64_t> host_num_valid);
+
+std::tuple<at::Tensor, at::Tensor, std::vector<CacheOptionalTensor>>
+compact_missing_values(at::Tensor addresses, std::vector<CacheOptionalTensor> fields,
+                       const CacheOptionalTensor &num_valid);
 
 } // namespace dyn_emb

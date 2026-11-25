@@ -150,6 +150,32 @@ __device__ __forceinline__ int64_t cache_warp_find(
   return -1;
 }
 
+struct BackingValueLookup {
+  const int64_t *slot_to_row, *ptrs, *emb_dims, *widths;
+  const bool *needed;
+  const int64_t *source_ptrs, *source_slots;
+  int64_t *layout_tags, *sources;
+  int64_t max_emb, max_width, word_bytes;
+
+  __device__ int64_t address(int64_t input, int64_t tid, int64_t local_slot,
+                             int64_t flat_slot) const {
+    if (needed && !needed[input]) {
+      if (layout_tags) layout_tags[input] = 0;
+      return 0;
+    }
+    const int64_t width = widths ? widths[tid] : max_width;
+    const int64_t row_bytes = width * word_bytes;
+    if (layout_tags)
+      layout_tags[input] = width == max_width && emb_dims[tid] == max_emb ? 0 : tid + 1;
+    if (sources)
+      sources[input] = source_ptrs[tid] + source_slots[input] * row_bytes;
+    if (local_slot < 0) return 0;
+    const int64_t row = slot_to_row ? slot_to_row[flat_slot] : local_slot;
+    if (row < 0) __trap();  // A resident backing key must own a value row.
+    return ptrs[tid] + row * row_bytes;
+  }
+};
+
 template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
           bool EnableOverflow = false, bool CachePrefetch = false,
           bool BackingRows = false>
@@ -161,8 +187,7 @@ __global__ void table_lookup_kernel(
     int64_t *__restrict__ score_output, Table ovf_table,
     int64_t const *__restrict__ ovf_output_offsets,
     int64_t const *__restrict__ num_valid, CacheLookupRows cache = {},
-    int64_t const *__restrict__ slot_to_row = nullptr,
-    bool const *__restrict__ need_row = nullptr) {
+    BackingValueLookup values = {}) {
   static_assert(!BackingRows || (!EnableOverflow && !CachePrefetch));
 
   using KeyType = typename Table::KeyType;
@@ -208,7 +233,10 @@ __global__ void table_lookup_kernel(
       // Cache prefetch exposes the miss mask. Table lookup exposes the hit mask.
       if (leader) {
         if constexpr (!BackingRows) flags[i] = CachePrefetch;
-        indices[i] = -1;
+        if constexpr (BackingRows)
+          indices[i] = values.address(i, table_ids[i], -1, -1);
+        else
+          indices[i] = -1;
       }
       continue;
     }
@@ -302,16 +330,7 @@ __global__ void table_lookup_kernel(
     }
 
     if constexpr (BackingRows) {
-      // The score update above also applies to cache hits. Only cache misses
-      // consume backing values, so omit the indirect read for unneeded keys.
-      if (found && (!need_row || need_row[i])) {
-        if (slot_to_row) {
-          index = slot_to_row[bucket_id * bucket.capacity() + iter];
-          if (index < 0) __trap();  // A resident backing key must own a row.
-        }
-      } else {
-        index = -1;
-      }
+      index = values.address(i, t_id, index, bucket_id * bucket.capacity() + iter);
     } else {
       if constexpr (!CachePrefetch)
         score_output[i] = static_cast<int64_t>(score);

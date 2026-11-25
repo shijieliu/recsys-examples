@@ -37,11 +37,13 @@ struct CastI32ToI64 {
 // Candidates beyond the optional device count must never read a flag.
 struct CountedFlag {
   bool const *flags;
+  int64_t const *addresses;
   int64_t const *num_valid;
   int64_t host_n;
   bool invert;
   __host__ __device__ __forceinline__ bool operator()(int64_t i) const {
-    return i < counted_limit(num_valid, host_n) && (flags[i] != invert);
+    if (i >= counted_limit(num_valid, host_n)) return false;
+    return addresses ? addresses[i] == 0 : flags[i] != invert;
   }
 };
 
@@ -140,13 +142,14 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
 
 // Return the device selection count, positions, and aligned fields. Outputs
 // retain input capacity and only their selected prefix is initialized.
-std::tuple<at::Tensor, at::Tensor, std::vector<c10::optional<at::Tensor>>>
-flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
-                const std::optional<at::Tensor> &num_valid, bool invert,
-                std::optional<int64_t> host_num_valid) {
-
+using Selection = std::tuple<at::Tensor, at::Tensor, std::vector<c10::optional<at::Tensor>>>;
+static Selection compact_fields(
+    at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
+    const std::optional<at::Tensor> &num_valid, bool invert,
+    std::optional<int64_t> host_num_valid, bool null_addresses) {
   TORCH_CHECK(flags.is_cuda(), "flags must be on CUDA");
-  TORCH_CHECK(flags.dtype() == at::kBool, "flags must be bool");
+  TORCH_CHECK(flags.dtype() == (null_addresses ? at::kLong : at::kBool),
+              null_addresses ? "expected 64-bit value addresses" : "flags must be bool");
   TORCH_CHECK(flags.dim() == 1 && flags.is_contiguous(),
               "flags must be a contiguous 1D tensor");
   auto device = flags.device();
@@ -198,7 +201,9 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
   // The host bound sizes the CUB dispatch, and the iterator applies the device bound.
   auto d_flags = thrust::make_transform_iterator(
       thrust::counting_iterator<int64_t>(0),
-      CountedFlag{flags.data_ptr<bool>(), d_num_valid, host_n, invert});
+      CountedFlag{null_addresses ? nullptr : flags.data_ptr<bool>(),
+                  null_addresses ? flags.data_ptr<int64_t>() : nullptr,
+                  d_num_valid, host_n, invert});
   auto *d_out_idx = out_indices.data_ptr<int64_t>();
   auto *d_num_sel = num_selected.data_ptr<int64_t>();
 
@@ -235,6 +240,19 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {num_selected, out_indices, full_outputs};
+}
+
+Selection flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
+                          const std::optional<at::Tensor> &num_valid, bool invert,
+                          std::optional<int64_t> host_num_valid) {
+  return compact_fields(flags, std::move(inputs), num_valid, invert, host_num_valid, false);
+}
+
+// The null-address predicate fuses the backing-miss test into CUB selection.
+Selection compact_missing_values(at::Tensor addresses,
+                                 std::vector<c10::optional<at::Tensor>> fields,
+                                 const std::optional<at::Tensor> &num_valid) {
+  return compact_fields(addresses, std::move(fields), num_valid, false, {}, true);
 }
 
 } // namespace dyn_emb

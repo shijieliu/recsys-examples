@@ -103,8 +103,8 @@ struct ValuePointers {
 
 ValuePointers value_pointers(const CacheValueLayout &layout) {
   const auto &[ptrs, edims, vdims, max_emb, max_value, dtype] = layout;
-  return {ptrs.data_ptr<int64_t>(), edims.data_ptr<int64_t>(),
-          vdims.data_ptr<int64_t>(), max_emb};
+  return {ptrs.data_ptr<int64_t>(), edims ? edims->data_ptr<int64_t>() : nullptr,
+          vdims ? vdims->data_ptr<int64_t>() : nullptr, max_emb};
 }
 
 struct SlotLayout {
@@ -138,6 +138,65 @@ __device__ int64_t resolve_row(SlotLayout map, int64_t tid, int64_t slot, bool a
 
 constexpr int kThreads = 128;
 
+__device__ __forceinline__ void publish_cache_slot(
+    SlotLayout map, int64_t tid, int64_t slot, int64_t output_row,
+    int64_t *unique_slots, int64_t output_size) {
+  const int64_t overflow = map.overflow_offsets[tid];
+  const int64_t flat = slot < overflow ? map.bucket_offsets[tid] * map.bucket_capacity + slot
+                                      : map.total_main_slots + tid * map.overflow_capacity + slot - overflow;
+  CUDA_KERNEL_ASSERT(output_row >= 0 && output_row < output_size);
+  ::atomicAdd(map.pins + flat, 1);
+  unique_slots[output_row] = slot;
+}
+
+// Assign each tile's destination pointers with contiguous metadata loads, then
+// let all four warps issue independent reads from the staged value matrix.
+// Keeping the row list in shared memory avoids an extra launch or global list.
+template <int RowVectors>
+__global__ void install_rows_tiled(ValuePointers table, SlotLayout map, const int64_t *slots,
+                                   const int64_t *tids, const uint4 *staged,
+                                   const int64_t *outputs, int64_t *unique_slots,
+                                   int64_t output_size, int64_t count) {
+  constexpr int vectors_per_tile = 512;
+  constexpr int tile_rows = vectors_per_tile / RowVectors;
+  constexpr int iterations = vectors_per_tile / kThreads;
+  __shared__ uintptr_t dst[tile_rows];
+  const int t = threadIdx.x;
+  const int64_t begin = int64_t(blockIdx.x) * tile_rows;
+  int64_t tid = 0, slot = -1;
+  if (t < tile_rows) {
+    const auto i = begin + t;
+    if (i < count) {
+      tid = tids[i];
+      slot = slots[i];
+    }
+    dst[t] = slot < 0 ? 0 : uintptr_t(table.ptrs[tid]) + slot * RowVectors * sizeof(uint4);
+  }
+  __syncthreads();
+  uint4 payload[iterations];
+  uintptr_t to[iterations];
+#pragma unroll
+  for (int j = 0; j < iterations; ++j) {
+    int item = j * kThreads + t;
+    to[j] = dst[item / RowVectors];
+    if (to[j]) payload[j] = staged[begin * RowVectors + item];
+  }
+  if (t < tile_rows && slot >= 0 && unique_slots)
+    publish_cache_slot(map, tid, slot, outputs[begin + t], unique_slots, output_size);
+#pragma unroll
+  for (int j = 0; j < iterations; ++j) {
+    if (!to[j]) continue;
+    const auto column = (j * kThreads + t) % RowVectors;
+    if (to[j] % alignof(uint4) == 0) {
+      reinterpret_cast<uint4 *>(to[j])[column] = payload[j];
+    } else {
+      // The native binding also accepts raw pointers into sliced tensors.
+      memcpy(reinterpret_cast<char *>(to[j]) + column * sizeof(uint4), &payload[j], sizeof(uint4));
+    }
+  }
+}
+
+
 // A lane group copies the table's actual row width. Its leader assigns the
 // backing slot's value row or publishes and pins a new cache slot.
 template <typename Word, bool Cache>
@@ -166,57 +225,77 @@ __global__ void install_rows(ValuePointers table, SlotLayout map, const int64_t 
       const unsigned mask = (~0u >> (32 - lanes)) << ((threadIdx.x & 31) - lane);
       row = __shfl_sync(mask, static_cast<long long>(row), 0, lanes);
     }
-    const int64_t width = table.value_dims[tid], emb = table.emb_dims[tid];
+    const int64_t width = table.value_dims ? table.value_dims[tid] : stride;
+    const int64_t emb = table.emb_dims ? table.emb_dims[tid] : table.max_emb;
     auto *dst = reinterpret_cast<Word *>(table.ptrs[tid]) + row * width;
     copy_cache_row(staged + src * stride, dst, width, emb, table.max_emb, emb,
                    lane, lanes);
     if constexpr (Cache) {
-      if (lane == 0 && unique_slots) {
-        const int64_t flat = slot < map.overflow_offsets[tid]
-                                 ? map.bucket_offsets[tid] * map.bucket_capacity + slot
-                                 : map.total_main_slots + tid * map.overflow_capacity +
-                                       slot - map.overflow_offsets[tid];
-        CUDA_KERNEL_ASSERT(out_rows[i] >= 0 && out_rows[i] < output_size);
-        ::atomicAdd(map.pins + flat, 1);
-        unique_slots[out_rows[i]] = slot;
-      }
+      if (lane == 0 && unique_slots)
+        publish_cache_slot(map, tid, slot, out_rows[i], unique_slots, output_size);
     }
   }
 }
 
-// A displaced value moves directly from its old slot to its backing row, or
-// into a spill buffer. A rejected backing insertion encodes its input position
-// in a negative slot and spills the staged input, including optimizer state.
+// A backing victim (or rejected incoming key) leaves the two native tiers.
 template <typename Word>
-__global__ void copy_victims(ValuePointers from, SlotLayout from_map,
-                             ValuePointers to,
-                             const int64_t *slots, const int64_t *tids,
-                             const int64_t *dest_rows, const int64_t *input_rows,
-                             const Word *staged, Word *spill, int64_t stride,
-                             int64_t bound, const int64_t *count, int lane_shift) {
-  const int lanes = 1 << lane_shift;
-  const int lane = threadIdx.x & (lanes - 1);
+__global__ void copy_victims_to_spill(ValuePointers from, SlotLayout map,
+                                      const int64_t *slots, const int64_t *tids,
+                                      const int64_t *input_rows, const Word *staged,
+                                      Word *spill, int64_t stride, int64_t bound,
+                                      const int64_t *count, int lane_shift) {
+  const int lanes = 1 << lane_shift, lane = threadIdx.x & (lanes - 1);
+  const int groups = kThreads >> lane_shift;
   const int64_t n = counted_limit(count, bound);
-  const int groups_per_block = kThreads >> lane_shift;
-  for (int64_t i = int64_t(blockIdx.x) * groups_per_block + (threadIdx.x >> lane_shift);
-       i < n; i += int64_t(gridDim.x) * groups_per_block) {
+  for (int64_t i = int64_t(blockIdx.x) * groups + (threadIdx.x >> lane_shift);
+       i < n; i += int64_t(gridDim.x) * groups) {
     const int64_t tid = tids[i], slot = slots[i];
-    const int64_t target = dest_rows ? dest_rows[i] : -1;
-    if (target < 0 && !spill) continue;
-    const int64_t width = from.value_dims[tid], emb = from.emb_dims[tid];
-    const Word *src;
-    if (slot >= 0) {
-      src = reinterpret_cast<const Word *>(from.ptrs[tid]) +
-            resolve_row(from_map, tid, slot, false) * width;
-    } else {
-      CUDA_KERNEL_ASSERT(staged && input_rows);
-      src = staged + input_rows[-slot - 1] * stride;
-    }
-    Word *dst = target < 0 ? spill + i * stride
-                           : reinterpret_cast<Word *>(to.ptrs[tid]) + target * width;
-    copy_cache_row(src, dst, width, emb, slot < 0 ? from.max_emb : emb,
-                   target < 0 ? from.max_emb : emb, lane, lanes);
+    const int64_t width = from.value_dims ? from.value_dims[tid] : stride;
+    const int64_t emb = from.emb_dims ? from.emb_dims[tid] : from.max_emb;
+    const Word *src = slot >= 0
+        ? reinterpret_cast<const Word *>(from.ptrs[tid]) + resolve_row(map, tid, slot, false) * width
+        : staged + input_rows[-slot - 1] * stride;
+    copy_cache_row(src, spill + i * stride, width, emb, slot < 0 ? from.max_emb : emb,
+                   from.max_emb, lane, lanes);
   }
+}
+
+// The backing probe already resolved both ends of each dirty cache row.
+template <typename Word>
+__global__ void copy_victims(ValuePointers from, const int64_t *sources,
+                             const int64_t *targets, const int64_t *layout_tags,
+                             Word *spill, int64_t stride, int64_t n, int lane_shift) {
+  const int lanes = 1 << lane_shift, lane = threadIdx.x & (lanes - 1);
+  const int groups = kThreads >> lane_shift;
+  for (int64_t i = int64_t(blockIdx.x) * groups + (threadIdx.x >> lane_shift);
+       i < n; i += int64_t(gridDim.x) * groups) {
+    const auto *src = reinterpret_cast<const Word *>(sources[i]);
+    auto *dst = reinterpret_cast<Word *>(targets[i]);
+    if (!dst && !spill) continue;
+    const int64_t tag = layout_tags ? layout_tags[i] : 0;
+    auto *out = dst ? dst : spill + i * stride;
+    if (!tag) {
+      copy_cache_region(src, out, stride, lane, lanes);
+    } else {
+      const int64_t width = from.value_dims[tag - 1], emb = from.emb_dims[tag - 1];
+      copy_cache_row(src, out, width, emb, emb, dst ? emb : from.max_emb, lane, lanes);
+    }
+  }
+}
+
+__global__ void copy_victims_dense_256(const int64_t *sources, const int64_t *targets,
+                                      int64_t n) {
+  const int lane = threadIdx.x & 15;
+  constexpr int groups = kThreads / 16;
+  const int64_t first = int64_t(blockIdx.x) * groups * 4 + threadIdx.x / 16;
+  CacheTransfer256 transfers[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int64_t i = first + j * groups;
+    transfers[j].src = i < n ? reinterpret_cast<const uint4 *>(sources[i]) : nullptr;
+    transfers[j].dst = i < n ? reinterpret_cast<uint4 *>(targets[i]) : nullptr;
+  }
+  copy_cache_transfers_256(transfers, lane);
 }
 
 template <typename F>
@@ -335,8 +414,12 @@ ExchangeResult exchange_cache_storage(
   }
   for (auto layout : {&cache_values, &backing_values}) {
     check(std::get<0>(*layout), at::kLong, num_tables);
-    check(std::get<1>(*layout), at::kLong, num_tables);
-    check(std::get<2>(*layout), at::kLong, num_tables);
+    const auto &emb = std::get<1>(*layout), &widths = std::get<2>(*layout);
+    TORCH_CHECK(emb.has_value() == widths.has_value(), "expected both per-table width tensors");
+    if (emb) {
+      check(*emb, at::kLong, num_tables);
+      check(*widths, at::kLong, num_tables);
+    }
   }
   MutableMap cache{cache_storage, cache_offsets, cache_sizes, cache_cap,
                    cache_words, cache_fn, cache_global, pins, overflow, ovf_sizes,
@@ -390,9 +473,9 @@ ExchangeResult exchange_cache_storage(
       auto displaced = at::empty({b_keys.numel(), values.size(1)}, values.options());
       launch_rows(values, backing_bound, [&](auto word, int grid, int shift) {
         using W = decltype(word);
-        copy_victims<W><<<grid, kThreads, 0, stream>>>(
-            bv, bm, {}, victim_slots.data_ptr<int64_t>(), victim_tids.data_ptr<int64_t>(),
-            nullptr, back_inputs, static_cast<const W *>(values.data_ptr()),
+        copy_victims_to_spill<W><<<grid, kThreads, 0, stream>>>(
+            bv, bm, victim_slots.data_ptr<int64_t>(), victim_tids.data_ptr<int64_t>(),
+            back_inputs, static_cast<const W *>(values.data_ptr()),
             static_cast<W *>(displaced.data_ptr()), values.stride(0), backing_bound,
             back_count.data_ptr<int64_t>(), shift);
       });
@@ -426,35 +509,66 @@ ExchangeResult exchange_cache_storage(
       }
       // Resolve each victim's physical destination after backing insertions
       // have had a chance to evict it.
-      auto dest = lookup_backing_rows(backing_map, ev_keys, ev_tids,
-                                      {std::nullopt, ScorePolicyType::Const});
+      auto addresses = lookup_backing_values(
+          backing_map, backing_values, ev_keys, ev_tids, {std::nullopt, ScorePolicyType::Const},
+          {}, {}, std::get<0>(cache_values), ev_slots);
       Opt gone_values;
       if (spill) gone_values = at::empty({victims, values.size(1)}, values.options());
-      launch_rows(values, victims, [&](auto word, int grid, int shift) {
-        using W = decltype(word);
-        copy_victims<W><<<grid, kThreads, 0, stream>>>(
-            cv, cm, bv, ev_slots.data_ptr<int64_t>(), ev_tids.data_ptr<int64_t>(),
-            dest.data_ptr<int64_t>(), nullptr, nullptr,
-            gone_values ? static_cast<W *>(gone_values->data_ptr()) : nullptr,
-            values.stride(0), victims, nullptr, shift);
-      });
+      if (!spill && !addresses.layout_tags && values.size(1) * values.element_size() == 256) {
+        constexpr int rows_per_block = kThreads / 16 * 4;
+        copy_victims_dense_256<<<(victims + rows_per_block - 1) / rows_per_block,
+                                 kThreads, 0, stream>>>(
+            addresses.sources->data_ptr<int64_t>(), addresses.backing.data_ptr<int64_t>(), victims);
+        DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+      } else {
+        launch_rows(values, victims, [&](auto word, int grid, int shift) {
+          using W = decltype(word);
+          copy_victims<W><<<grid, kThreads, 0, stream>>>(
+              cv, addresses.sources->data_ptr<int64_t>(), addresses.backing.data_ptr<int64_t>(),
+              addresses.layout_tags ? addresses.layout_tags->data_ptr<int64_t>() : nullptr,
+              gone_values ? static_cast<W *>(gone_values->data_ptr()) : nullptr,
+              values.stride(0), victims, shift);
+        });
+      }
       if (spill || retain) {
         auto [gone_count, gone_rows, fields] = flagged_compact(
-            dest.lt(0), {ev_keys, ev_tids}, {}, false, {});
+            addresses.backing.eq(0), {ev_keys, ev_tids}, {}, false, {});
         spills.emplace_back(*fields[0], *fields[1], gone_values, gone_count, gone_rows);
       }
     }
     // Dirty cache slots have reached backing or spill buffers. On partial
     // refusal the accepted rows still receive their values, but no new pin
     // belongs to this failed batch and no slot is published for backward.
-    launch_rows(values, attempted, [&](auto word, int grid, int shift) {
-      using W = decltype(word);
-      install_rows<W, true><<<grid, kThreads, 0, stream>>>(
-          cv, cm, slots.data_ptr<int64_t>(), cache_tids,
-          static_cast<const W *>(values.data_ptr()), values.stride(0), cache_inputs,
-          values.size(0), outputs, refused ? nullptr : unique_slots,
-          slot_indices.numel(), attempted, nullptr, shift);
-    });
+    const auto row_bytes = values.stride(0) * values.element_size();
+    // A null width vector guarantees contiguous uniformly sized rows. Keep
+    // the gathered sources and ragged table layouts on the general copier.
+    if (!cv.value_dims && !cache_inputs && attempted >= 4096 &&
+        reinterpret_cast<uintptr_t>(values.data_ptr()) % alignof(uint4) == 0 &&
+        (row_bytes == 256 || row_bytes == 1024)) {
+      const auto launch_tile = [&](auto row_vectors) {
+        constexpr int width = decltype(row_vectors)::value;
+        constexpr int rows_per_tile = 512 / width;
+        const auto grid = (attempted + rows_per_tile - 1) / rows_per_tile;
+        install_rows_tiled<width><<<grid, kThreads, 0, stream>>>(
+            cv, cm, slots.data_ptr<int64_t>(), cache_tids,
+            static_cast<const uint4 *>(values.data_ptr()), outputs,
+            refused ? nullptr : unique_slots, slot_indices.numel(), attempted);
+      };
+      if (row_bytes == 256)
+        launch_tile(std::integral_constant<int, 16>{});
+      else
+        launch_tile(std::integral_constant<int, 64>{});
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+      launch_rows(values, attempted, [&](auto word, int grid, int shift) {
+        using W = decltype(word);
+        install_rows<W, true><<<grid, kThreads, 0, stream>>>(
+            cv, cm, slots.data_ptr<int64_t>(), cache_tids,
+            static_cast<const W *>(values.data_ptr()), values.stride(0), cache_inputs,
+            values.size(0), outputs, refused ? nullptr : unique_slots,
+            slot_indices.numel(), attempted, nullptr, shift);
+      });
+    }
     return {attempted, evicted, refused, std::move(spills)};
   } catch (const std::exception &e) {
     throw CachePlacementError(e.what());

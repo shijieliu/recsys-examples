@@ -445,8 +445,8 @@ def _select_cache_rows(
 def _cache_value_layout(state: DynamicEmbTableState):
     return (
         state.table_ptrs_dev,
-        state.table_emb_dims,
-        state.table_value_dims,
+        None if state.uniform_value_shape else state.table_emb_dims,
+        None if state.uniform_value_shape else state.table_value_dims,
         state.emb_dim,
         state.value_dim,
         state.emb_dtype,

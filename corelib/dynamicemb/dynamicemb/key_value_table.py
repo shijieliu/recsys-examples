@@ -345,6 +345,7 @@ class DynamicEmbTableState:
     value_dim: int
     emb_dtype: torch.dtype
     all_dims_vec4: bool
+    uniform_value_shape: bool
     optimizer: BaseDynamicEmbeddingOptimizer
     threads_in_wave: int
     score: Optional[int] = None
@@ -625,6 +626,7 @@ def create_table_state(
         value_dim=value_dim,
         emb_dtype=emb_dtype,
         all_dims_vec4=all_dims_vec4,
+        uniform_value_shape=min(dims) == emb_dim and min(value_dims) == value_dim,
         optimizer=optimizer,
         threads_in_wave=threads_in_wave,
         score=None,

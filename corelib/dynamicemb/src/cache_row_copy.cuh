@@ -7,10 +7,22 @@
 
 namespace dyn_emb {
 
-// Each lane can transfer 16 bytes at once. A group covers a short row in one
-// instruction, while the rest of its warp handles independent rows.
+// Give short rows a fraction of a warp. Two independent vector accesses per
+// lane keep more rows in flight for the usual 256- and 512-byte cases.
 inline int cache_copy_lane_shift(int64_t row_bytes) {
-  return row_bytes <= 128 ? 3 : row_bytes <= 256 ? 4 : 5;
+  return row_bytes <= 256 ? 3 : row_bytes <= 512 ? 4 : 5;
+}
+
+template <int Stripes>
+__device__ __forceinline__ void copy_cache_stripes(
+    const uint4 *src, uint4 *dst, int lane, int lanes) {
+  uint4 values[Stripes];
+#pragma unroll
+  for (int j = 0; j < Stripes; ++j)
+    values[j] = src[lane + j * lanes];
+#pragma unroll
+  for (int j = 0; j < Stripes; ++j)
+    dst[lane + j * lanes] = values[j];
 }
 
 template <typename Word>
@@ -22,9 +34,17 @@ __device__ __forceinline__ void copy_cache_region(
   if (!(alignment & (alignof(uint4) - 1)) && words >= words_per_vector) {
     const auto *in = reinterpret_cast<const uint4 *>(src);
     auto *out = reinterpret_cast<uint4 *>(dst);
-    // A short aligned row fits in one vector access per lane.
-    if (words == lanes * words_per_vector) {
-      out[lane] = in[lane];
+    const int stripe = lanes * words_per_vector;
+    if (words == stripe) {
+      copy_cache_stripes<1>(in, out, lane, lanes);
+      return;
+    }
+    if (words == 2 * stripe) {
+      copy_cache_stripes<2>(in, out, lane, lanes);
+      return;
+    }
+    if (words == 4 * stripe) {
+      copy_cache_stripes<4>(in, out, lane, lanes);
       return;
     }
     const int64_t n = words / words_per_vector;
@@ -37,6 +57,41 @@ __device__ __forceinline__ void copy_cache_region(
   }
   for (int64_t i = lane; i < words; i += lanes)
     dst[i] = src[i];
+}
+
+// Four independent 256-byte vectors per half warp. Issue the aligned
+// loads before waiting on any one transfer. Plain tensor inputs may also
+// provide an unaligned FP8 row; its raw bytes still follow the scalar path.
+struct CacheTransfer256 {
+  const uint4 *src;
+  uint4 *dst;
+  uint4 data;
+
+  __device__ bool aligned() const {
+    return !((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15);
+  }
+};
+
+__device__ __forceinline__ void copy_cache_transfers_256(CacheTransfer256 (&rows)[4],
+                                                         int lane) {
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    auto &row = rows[j];
+    if (row.src && row.dst && row.aligned())
+      asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" :
+                   "=r"(row.data.x), "=r"(row.data.y), "=r"(row.data.z), "=r"(row.data.w) :
+                   "l"(row.src + lane));
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const auto &row = rows[j];
+    if (!row.src || !row.dst) continue;
+    if (row.aligned())
+      row.dst[lane] = row.data;
+    else
+      copy_cache_region(reinterpret_cast<const uint8_t *>(row.src),
+                        reinterpret_cast<uint8_t *>(row.dst), 256, lane, 16);
+  }
 }
 
 template <typename Word>
