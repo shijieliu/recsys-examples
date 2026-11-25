@@ -76,30 +76,51 @@ __device__ void stage_full_rows_256(const StagingRows &rows, uint4 *values) {
   const int64_t n = *rows.num_misses;
   const int64_t stride = int64_t(gridDim.x) * tile_rows;
   for (int64_t begin = int64_t(blockIdx.x) * tile_rows; begin < n; begin += stride) {
+    bool unsafe = false;
     if (t < tile_rows) {
-      sources[t] = begin + t < n ? reinterpret_cast<const uint4 *>(rows.addresses[begin + t]) : nullptr;
+      auto ptr = begin + t < n ? rows.addresses[begin + t] : 0;
+      sources[t] = reinterpret_cast<const uint4 *>(ptr);
+      unsafe = !ptr || (ptr & 15);
       if (begin + t < n) rows.missing[begin + t] = false;
     }
-    __syncthreads();
-    CacheTransfer256 transfers[4];
+    if (!__syncthreads_or(unsafe)) {
+      // The block-wide metadata barrier verified every row is present and
+      // aligned. Adjacent threads now write adjacent vectors of staging.
+      uint4 data[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int row = j * groups + t / 16;
-      transfers[j].src = sources[row];
-      transfers[j].dst = sources[row] ? values + (begin + row) * 16 : nullptr;
+      for (int j = 0; j < 4; ++j) {
+        const auto *src = sources[j * groups + t / 16] + t % 16;
+        auto &v = data[j];
+        asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" :
+                     "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src));
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        values[begin * 16 + t + j * 128] = data[j];
+    } else {
+      CacheTransfer256 transfers[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int row = j * groups + t / 16;
+        transfers[j].src = sources[row];
+        transfers[j].dst = sources[row] ? values + (begin + row) * 16 : nullptr;
+      }
+      copy_cache_transfers_256(transfers, t % 16);
     }
-    copy_cache_transfers_256(transfers, t % 16);
     if (begin + stride < n) __syncthreads();
   }
 }
 
-template <typename V, typename Generator>
-__global__ void stage_cache_misses_kernel(StagingRows rows, V *values,
+template <typename V, typename Generator, bool Dense256>
+__global__ __launch_bounds__(128, Dense256 ? 8 : 1)
+void stage_cache_misses_kernel(StagingRows rows, V *values,
                                           typename Generator::Args args,
                                           int lane_shift) {
-  if (!rows.layout_tags && rows.max_value_dim * sizeof(V) == 256 && *rows.num_new == 0) {
-    stage_full_rows_256(rows, reinterpret_cast<uint4 *>(values));
-    return;
+  if constexpr (Dense256) {
+    if (*rows.num_new == 0) {
+      stage_full_rows_256(rows, reinterpret_cast<uint4 *>(values));
+      return;
+    }
   }
   const int lanes = 1 << lane_shift;
   const int lane = threadIdx.x & (lanes - 1);
@@ -139,8 +160,13 @@ struct StageLaunch {
 
   template <typename Generator> void run(typename Generator::Args args) const {
     DISPATCH_VALUE_DATATYPE_FUNCTION(get_data_type(values), V, [&] {
-      stage_cache_misses_kernel<V, Generator><<<grid, block, 0, stream>>>(
-          rows, get_pointer<V>(values), args, lane_shift);
+      if (!rows.layout_tags && rows.max_value_dim * sizeof(V) == 256) {
+        stage_cache_misses_kernel<V, Generator, true><<<grid, block, 0, stream>>>(
+            rows, get_pointer<V>(values), args, lane_shift);
+      } else {
+        stage_cache_misses_kernel<V, Generator, false><<<grid, block, 0, stream>>>(
+            rows, get_pointer<V>(values), args, lane_shift);
+      }
     });
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
