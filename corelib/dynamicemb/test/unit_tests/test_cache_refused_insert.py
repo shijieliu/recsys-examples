@@ -148,7 +148,7 @@ def test_a_batch_that_fits_is_not_refused():
     assert counter.sum().item() == keys.numel()
 
 
-def test_failed_backing_load_preserves_dirty_victim_and_hit_pins(monkeypatch):
+def test_failed_preparation_preserves_dirty_victim_and_hit_pins(monkeypatch):
     model = make_model()
     warm = torch.tensor([1, 10001], device="cuda")
     offsets = warm.new_tensor([0, 2])
@@ -163,18 +163,22 @@ def test_failed_backing_load_preserves_dirty_victim_and_hit_pins(monkeypatch):
     # Key 1 is a cache hit. Filling the remaining slots displaces key 10001.
     keys = torch.arange(1, CACHE_SLOTS + 1, device="cuda")
     offsets = keys.new_tensor([0, keys.numel()])
-    load_rows = lookup.load_from_flat
+    prepare = lookup.prepare_cache_lookup
     fail_once = True
 
-    def fail_backing_load(state, *args, **kwargs):
+    def fail_during_compaction(*args):
         nonlocal fail_once
-        if state is model._storage._state and fail_once:
+        if fail_once:
             fail_once = False
-            raise torch.cuda.OutOfMemoryError("injected backing load failure")
-        return load_rows(state, *args, **kwargs)
+            # The first probe pins the warm row. An invalid weight column then
+            # fails while the native op is packing the misses.
+            return prepare(
+                *args[:-2], torch.zeros_like(args[0], dtype=torch.float32), args[-1]
+            )
+        return prepare(*args)
 
-    monkeypatch.setattr(lookup, "load_from_flat", fail_backing_load)
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="injected backing load"):
+    monkeypatch.setattr(lookup, "prepare_cache_lookup", fail_during_compaction)
+    with pytest.raises(RuntimeError, match="8-byte"):
         model.prefetch(keys, offsets)
     torch.testing.assert_close(counter, pins)
     in_flight.backward(torch.zeros_like(in_flight))
@@ -268,3 +272,31 @@ def test_storage_host_bound_guards_table_ids_and_value_row_maps():
         keys, invalid_table_ids, CopyMode.VALUE, host_num_valid=2
     )
     assert missing.is_cuda and missing.item() == 0
+
+
+def test_exchange_deterministic_waves_protect_earlier_placements(monkeypatch):
+    model = make_model()
+    # Keep every slot but one main-table slot pinned by another batch. A
+    # deterministic insert processes these two cache misses in separate waves.
+    residents = torch.arange(1, CACHE_SLOTS + 1, device="cuda")
+    with torch.no_grad():
+        model(residents, residents.new_tensor([0, residents.numel()]))
+    _, hits, slots = model._cache.lookup(residents, torch.zeros_like(residents))
+    assert hits.all()
+    held = residents[slots != 0]
+    in_flight = model(held, held.new_tensor([0, held.numel()]))
+    counter = model._cache.key_index_map._ref_counter
+    pins = counter.clone()
+    assert pins.sum().item() == CACHE_SLOTS - 1 and pins[0].item() == 0
+
+    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    incoming = residents.new_tensor([10000, 10001])
+    with pytest.raises(RuntimeError, match="could not place 1 keys"):
+        prefetch(model, incoming)
+    # The first wave holds the last available slot until the second wave
+    # reports refusal. Neither wave leaves a pin on the failed batch's behalf.
+    _, found, _ = model._cache.lookup(incoming, torch.zeros_like(incoming))
+    assert found.tolist() == [True, False]
+    torch.testing.assert_close(counter, pins)
+    in_flight.backward(torch.zeros_like(in_flight))
+    assert counter.count_nonzero().item() == 0

@@ -35,29 +35,34 @@ public:
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto &deviceProp = DeviceProp::getDeviceProp();
     num_worker_ = deviceProp.total_threads;
-    CUDACHECK(
-        cudaMallocAsync(&states_, sizeof(curandState) * num_worker_, stream));
+    curandState *states;
+    const int64_t bytes = num_worker_ * sizeof(curandState);
+    CUDACHECK(cudaMallocAsync(&states, bytes, stream));
+    // The standalone preparation op receives this tensor directly. Its storage
+    // owns the allocation even if it outlives the initializer context.
+    const auto device = at::Device(at::kCUDA, c10::cuda::current_device());
+    state_ = at::from_blob(states, {bytes}, [device](void *ptr) {
+      c10::cuda::CUDAGuard guard(device);
+      CUDACHECK(cudaDeviceSynchronize());
+      CUDACHECK(cudaFree(ptr));
+    }, at::TensorOptions().dtype(at::kByte).device(device));
     std::random_device rd;
     auto seed = rd();
     int block_size = deviceProp.max_thread_per_block;
     int grid_size = num_worker_ / block_size;
     init_curand_state_kernel<<<grid_size, block_size, 0, stream>>>(seed,
-                                                                   states_);
+                                                                   states);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-  }
-
-  ~CurandStateContext() {
-    // not async to avoid stream destroy case.
-    CUDACHECK(cudaDeviceSynchronize());
-    CUDACHECK(cudaFree(states_));
   }
 
   int64_t num_worker() { return num_worker_; }
 
-  curandState *ptr() { return states_; }
+  curandState *ptr() { return reinterpret_cast<curandState *>(state_.data_ptr()); }
+
+  at::Tensor state() const { return state_; }
 
 private:
-  curandState *states_;
+  at::Tensor state_;
   int64_t num_worker_;
 };
 
@@ -374,6 +379,7 @@ void bind_initializer_op(py::module &m) {
 
   py::class_<dyn_emb::CurandStateContext>(m, "CurandStateContext")
       .def(py::init<>())
+      .def_property_readonly("state", &dyn_emb::CurandStateContext::state)
       .def("ptr", &dyn_emb::CurandStateContext::ptr,
            py::return_value_policy::reference);
 

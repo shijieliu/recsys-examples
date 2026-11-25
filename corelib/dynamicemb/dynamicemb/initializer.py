@@ -121,6 +121,16 @@ class MultiTableInitializer(abc.ABC):
         self._args = args
         self._table_params = table_params
 
+    def native_parameters(self):
+        """Mode, scalar or per-table parameters, and the CUDA RNG state for staging."""
+        rng = getattr(self, "_curand_state", None)
+        return (
+            self._args.mode.value,
+            self.table_param_rows([self._args])[0],
+            self._table_params,
+            None if rng is None else rng.state,
+        )
+
     @staticmethod
     def table_param_rows(
         args_list: List[DynamicEmbInitializerArgs],

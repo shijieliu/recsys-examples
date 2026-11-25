@@ -4761,3 +4761,103 @@ def test_large_batch_matches_the_oracle(layout):
     sample = torch.randint(0, key_space, (100_000,), generator=gen).cuda()
     sample_offsets = torch.arange(0, 100_001, 25_000, device="cuda")
     eval_and_compare(module, oracle, sample, sample_offsets)
+
+
+def _exchange_ps_model(*, admit=False):
+    options = DynamicEmbTableOptions(
+        dim=8,
+        init_capacity=256,
+        max_capacity=256,
+        bucket_capacity=128,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=torch.cuda.current_device(),
+        score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+        caching=True,
+        local_hbm_for_values=1024,
+        external_storage=PyDictStorage,
+        admit_strategy=FrequencyAdmissionStrategy(threshold=2, counter=KVCounter(256))
+        if admit
+        else None,
+        initializer_args=DynamicEmbInitializerArgs(mode=DynamicEmbInitializerMode.DEBUG),
+    )
+    return BatchedDynamicEmbeddingTablesV2(
+        table_names=["exchange"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.1,
+    )
+
+
+def test_exchange_deterministic_backing_spills_staged_inputs(monkeypatch):
+    model = _exchange_ps_model()
+    backing = model._storage.key_index_map
+    # More keys than fit in one backing bucket, supplied in reverse score
+    # order. Deterministic waves process them in increasing key order, so a
+    # later, higher-scoring key evicts a key staged earlier in this same batch.
+    population = torch.arange(1, 4097, device="cuda")
+    by_bucket, offsets, _ = backing.bucketize_keys(population, torch.zeros_like(population))
+    count = backing.bucket_capacity_ + 3
+    assert offsets[1].item() >= count
+    keys = by_bucket[:count].flip(0).contiguous()
+    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    with torch.no_grad():
+        values = model(keys, keys.new_tensor([0, count]), scores=keys)
+    torch.testing.assert_close(values, keys.float()[:, None].expand(-1, 8))
+    expected_evicted = sorted(keys.tolist())[:3]
+    ps = model._external_storage
+    assert sorted(key for table, key in ps.dict if table == 0) == expected_evicted
+    for key in expected_evicted:
+        row = ps.dict[0, key]
+        torch.testing.assert_close(row, torch.full_like(row, key))
+
+
+def test_exchange_external_failure_releases_only_current_batch_pins(monkeypatch):
+    model = _exchange_ps_model()
+    # Fill the main cache bucket and backing table, then let an in-flight
+    # forward hold key 1. Replacing another row must leave key 1's old pin.
+    keys = torch.arange(1, model._cache.key_index_map.capacity_ + 1, device="cuda")
+    with torch.no_grad():
+        model(keys, keys.new_tensor([0, keys.numel()]), scores=keys)
+    held = keys[:1]
+    in_flight = model(held, held.new_tensor([0, 1]), scores=held)
+    counter = model._cache.key_index_map._ref_counter
+    before = counter.clone()
+    assert before.sum().item() == 1
+
+    def fail_spill(*args, num_valid, **kwargs):
+        if num_valid.item() > 0:
+            raise RuntimeError("injected external spill failure")
+
+    monkeypatch.setattr(model._external_storage, "insert", fail_spill)
+    incoming = keys.new_tensor([1, 10000])
+    with pytest.raises(RuntimeError, match="injected external spill failure"):
+        model.prefetch(incoming, incoming.new_tensor([0, 2]), scores=incoming)
+    torch.testing.assert_close(counter, before)
+    with pytest.raises(RuntimeError, match="previous cache placement failed"):
+        model.prefetch(incoming, incoming.new_tensor([0, 2]), scores=incoming)
+    in_flight.backward(torch.zeros_like(in_flight))
+    assert counter.count_nonzero().item() == 0
+
+
+def test_exchange_admission_with_external_hit_and_new_keys():
+    model = _exchange_ps_model(admit=True)
+    ps_key = torch.tensor([23], device="cuda")
+    ps_row = torch.arange(8, dtype=torch.float32, device="cuda").view(1, 8)
+    model._external_storage.insert(ps_key, torch.zeros_like(ps_key), ps_row)
+    keys = ps_key.new_tensor([33, 23, 55, 23])
+    with torch.no_grad():
+        # Prime the counter for 33. In the mixed batch 33 reaches the threshold,
+        # 55 is rejected on its first sight, and external key 23 skips admission.
+        model(keys[:1], keys.new_tensor([0, 1]), scores=keys[:1])
+        values = model(keys, keys.new_tensor([0, keys.numel()]), scores=keys)
+    expected = keys.float()[:, None].expand(-1, 8).clone()
+    expected[1] = expected[3] = ps_row[0]
+    torch.testing.assert_close(values, expected)
+    queried = keys[:3]
+    tids = torch.zeros_like(queried)
+    cache_hits = model._cache.lookup(queried, tids)[1]
+    backing_hits = model._storage.find(queried, tids, copy_mode=CopyMode.VALUE)[5]
+    assert cache_hits.tolist() == backing_hits.tolist() == [True, True, False]

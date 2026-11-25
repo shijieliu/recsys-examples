@@ -18,7 +18,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include "check.h"
-#include "lookup_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
 #include <ATen/ATen.h>
