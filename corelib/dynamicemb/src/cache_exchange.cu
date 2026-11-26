@@ -544,7 +544,7 @@ ExchangeResult exchange_cache_storage(
     // the gathered sources and ragged table layouts on the general copier.
     if (!cv.value_dims && !cache_inputs && attempted >= 4096 &&
         reinterpret_cast<uintptr_t>(values.data_ptr()) % alignof(uint4) == 0 &&
-        (row_bytes == 256 || row_bytes == 1024)) {
+        (row_bytes == 256 || row_bytes == 1024 || row_bytes == 2048)) {
       const auto launch_tile = [&](auto row_vectors) {
         constexpr int width = decltype(row_vectors)::value;
         constexpr int rows_per_tile = 512 / width;
@@ -556,8 +556,10 @@ ExchangeResult exchange_cache_storage(
       };
       if (row_bytes == 256)
         launch_tile(std::integral_constant<int, 16>{});
-      else
+      else if (row_bytes == 1024)
         launch_tile(std::integral_constant<int, 64>{});
+      else
+        launch_tile(std::integral_constant<int, 128>{});
       DEMB_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       launch_rows(values, attempted, [&](auto word, int grid, int shift) {

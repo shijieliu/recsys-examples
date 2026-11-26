@@ -1046,8 +1046,19 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
           Vec4T<src_type> src_elem;
           int idx4 = 4 * kWarpSize * i + 4 * lane_id;
           int n = min(vec_length - idx4, copy_width);
-          src_elem.load(src_ev + idx4, n);
-          accum[i].accumulate_multiply(src_elem, w);
+          // Raw cache table pointers can refer to a slice of an allocation.
+          // Vector loads require four-element alignment even at uniform widths.
+          if (copy_desc.cache.table_ptrs &&
+              reinterpret_cast<uintptr_t>(src_ev) % (4 * sizeof(src_type))) {
+            auto &a = accum[i].val;
+            a.x += w * static_cast<float>(src_ev[idx4]);
+            a.y += w * static_cast<float>(src_ev[idx4 + 1]);
+            a.z += w * static_cast<float>(src_ev[idx4 + 2]);
+            a.w += w * static_cast<float>(src_ev[idx4 + 3]);
+          } else {
+            src_elem.load(src_ev + idx4, n);
+            accum[i].accumulate_multiply(src_elem, w);
+          }
         }
       }
     }
@@ -1089,6 +1100,12 @@ void copy_multi_to_one(CopyDesc &copy_desc, bool feature_dims_vec4,
   // Vec4T does a 16-byte load, so every address it touches -- dst_ptr +
   // b*total_D + col_begin(f) -- has to be 4-element aligned.
   const bool vec4_aligned = ev_size % 4 == 0 &&
+                            reinterpret_cast<uintptr_t>(copy_desc.dst_ptr) %
+                                    (4 * sizeof(typename CopyDesc::DstT)) == 0 &&
+                            (copy_desc.cache.table_ptrs ||
+                             (copy_desc.src_stride % 4 == 0 &&
+                              reinterpret_cast<uintptr_t>(copy_desc.src_ptr) %
+                                      (4 * sizeof(typename CopyDesc::SrcT)) == 0)) &&
                             copy_desc.layout.total_D % 4 == 0 &&
                             (!copy_desc.layout.mixed_D() || feature_dims_vec4);
   if (!vec4_aligned) {

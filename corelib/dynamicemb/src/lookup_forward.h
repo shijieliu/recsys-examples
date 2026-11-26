@@ -97,31 +97,36 @@ __global__ void pool_cache_rows_kernel(ForwardMultiToOneFMLayoutDesc<float, floa
   Vec4T<float> sum[vectors];
   // Four-key bags are common. Expose all four independent cache reads to
   // the scheduler before the dependent sum, which preserves input order.
-  if constexpr (Dim == 64) {
+  if constexpr (Dim == 64 || Dim == 512) {
     if (end - start == 4 && !desc.weights_ptr) {
       const auto ptr = lane < 4 ? desc.get_src_ptr(start + lane) : nullptr;
       const auto addr = reinterpret_cast<unsigned long long>(ptr);
       if (__all_sync(mask, lane >= 4 || (addr && (addr & 15u) == 0))) {
-        float4 values[4];
+        float *dst = desc.get_dst_ptr(bag);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const auto row = __shfl_sync(mask, addr, j, Group);
-          values[j] = reinterpret_cast<const float4 *>(row)[lane];
-        }
+        for (int v = 0; v < vectors; ++v) {
+          float4 values[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          sum[0].val.x += values[j].x;
-          sum[0].val.y += values[j].y;
-          sum[0].val.z += values[j].z;
-          sum[0].val.w += values[j].w;
+          for (int j = 0; j < 4; ++j) {
+            const auto row = __shfl_sync(mask, addr, j, Group);
+            values[j] = reinterpret_cast<const float4 *>(row)[v * Group + lane];
+          }
+          auto &a = sum[v].val;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            a.x += values[j].x;
+            a.y += values[j].y;
+            a.z += values[j].z;
+            a.w += values[j].w;
+          }
+          if (desc.pooling_mode == PoolingMode::kMean) {
+            a.x *= 0.25f;
+            a.y *= 0.25f;
+            a.z *= 0.25f;
+            a.w *= 0.25f;
+          }
+          sum[v].store(dst + 4 * (v * Group + lane), 4);
         }
-        if (desc.pooling_mode == PoolingMode::kMean) {
-          sum[0].val.x *= 0.25f;
-          sum[0].val.y *= 0.25f;
-          sum[0].val.z *= 0.25f;
-          sum[0].val.w *= 0.25f;
-        }
-        sum[0].store(desc.get_dst_ptr(bag) + lane * 4, 4);
         return;
       }
     }

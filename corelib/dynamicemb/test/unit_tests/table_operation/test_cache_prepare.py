@@ -10,7 +10,13 @@ from dynamicemb.scored_hashtable import (
     get_scored_table,
 )
 from dynamicemb.utils import decode_table_values
-from dynamicemb_extensions import CurandStateContext, exchange_cache_storage, prepare_cache_lookup
+from dynamicemb_extensions import (
+    CurandStateContext,
+    PoolingMode,
+    exchange_cache_storage,
+    gather_embedding_pooled,
+    prepare_cache_lookup,
+)
 
 
 def _ids(values):
@@ -289,3 +295,48 @@ def test_unaligned_dense_cache_moves_raw_words(dtype):
     assert torch.equal(cache_raw[slots[0]], stage_raw[0])
     for owner in (cache_owner, back_owner, stage_owner):
         assert int(owner[0]) == int(owner[-1]) == 91
+
+
+@pytest.mark.parametrize("dim", [32, 64, 256, 512])
+@pytest.mark.parametrize("mode, weighted", [
+    (PoolingMode.KSum, False), (PoolingMode.KMean, False), (PoolingMode.KSum, True)
+])
+def test_pinned_pool_rows(dim, mode, weighted):
+    # Two physical tables with unequal row strides. Some inputs point to a missing slot.
+    # The input includes empty bags, repeated keys, partial thread blocks and long bags.
+    device = "cuda"
+    strides = [dim + 4, dim + 8]
+    tables = [
+        torch.arange(7 * stride + offset, dtype=torch.float, device=device)[offset:].view(7, stride)
+        for offset, stride in enumerate(strides)
+    ]
+    counts = [0, 1, 4, 19, 33, 65, 2, 0, 17, 32]
+    offsets = torch.tensor([0] + counts, device=device, dtype=torch.long).cumsum(0)
+    n = sum(counts)
+    tids = [1, 1, 0, 1, 0, 0, 1]
+    slots = [3, -1, 3, 0, -1, 5, 1]
+    positions = torch.arange(n, device=device) % len(tids)
+    weights = (torch.arange(n, device=device, dtype=torch.float32) % 9 - 4) / 4 if weighted else None
+    # A sliced output also exercises the scalar fallback for unaligned stores.
+    offset = int(dim == 32 and weighted)
+    output = torch.full((10 * dim + offset,), float("nan"), device=device)[offset:].view(5, 2 * dim)
+    source = (
+        torch.tensor([t.data_ptr() for t in tables], device=device), torch.tensor(strides, device=device),
+        torch.tensor(slots, device=device), torch.tensor(tids, device=device), torch.float32,
+    )
+    gather_embedding_pooled(source, output, positions, offsets, mode, 2 * dim, 5,
+                            None, dim, weights, True)
+    zeros = torch.zeros(dim, device=device)
+    values = torch.stack([tables[t][s, :dim] if s >= 0 else zeros for t, s in zip(tids, slots)])[positions]
+    if weights is not None:
+        values *= weights.unsqueeze(1)
+    expected = torch.empty_like(output)
+    start = 0
+    for i, count in enumerate(counts):
+        table, batch = divmod(i, 5)
+        summed = values[start:start + count].sum(0)
+        if mode == PoolingMode.KMean and count:
+            summed /= count
+        expected[batch, table * dim:(table + 1) * dim] = summed
+        start += count
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-4)
