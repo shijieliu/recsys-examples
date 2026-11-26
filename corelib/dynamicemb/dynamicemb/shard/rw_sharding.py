@@ -17,6 +17,7 @@
 
 import logging
 import warnings
+import weakref
 from functools import partial
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -46,6 +47,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
 )
 from torchrec.distributed.sharding.rw_sequence_sharding import (
+    RwSequenceEmbeddingDist,
     RwSequenceEmbeddingSharding,
 )
 from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingSharding
@@ -547,7 +549,7 @@ class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
 class HierGroupedPooledEmbeddingsLookup(GroupedPooledEmbeddingsLookup):
     """Use the same tables and optimizer for owner-row and owner-pooled calls."""
 
-    def __init__(self, hier, **kwargs):
+    def __init__(self, hier, row_inputs, **kwargs):
         # TorchRec's pooled lookup receives no requester frequency counters.
         # An LFU group still needs occurrence counts after the requester
         # deduplicates. An admission-only group counts each owner-unique key.
@@ -555,35 +557,39 @@ class HierGroupedPooledEmbeddingsLookup(GroupedPooledEmbeddingsLookup):
             config.fused_params["admission_counts_occurrences"] = False
         super().__init__(**kwargs)
         self._hier = hier
-        for module in self._emb_modules:
-            emb = module.emb_module
-            if emb.output_dtype != hier.dtype:
-                raise ValueError(
-                    "Hierarchical pooling requires one lookup output dtype"
-                )
-            emb.output_alloc = hier.lookup_buffer
+        self._row_inputs = row_inputs
+        if hier is not None:
+            for module in self._emb_modules:
+                emb = module.emb_module
+                if emb.output_dtype != hier.dtype:
+                    raise ValueError(
+                        "Hierarchical pooling requires one lookup output dtype"
+                    )
+                emb.output_alloc = hier.lookup_buffer
 
     def forward(self, features):
-        if not self._hier.owns(features):
+        hierarchical = self._hier is not None and self._hier.owns(features)
+        if not hierarchical and features not in self._row_inputs:
             return super().forward(features)
         groups = (
             [features]
             if len(self._emb_modules) == 1
             else features.split(self._feature_splits)
         )
-        return self._hier.lookup(
-            features,
-            [
-                partial(
-                    module.emb_module,
-                    indices=group.values().long(),
-                    offsets=group.offsets().long(),
-                    frequency_counters=group.weights_or_none(),
-                    unpooled=True,
-                )
-                for module, group in zip(self._emb_modules, groups)
-            ],
-        )
+        lookups = [
+            partial(
+                module.emb_module,
+                indices=group.values().long(),
+                offsets=group.offsets().long(),
+                frequency_counters=group.weights_or_none(),
+                unpooled=True,
+            )
+            for module, group in zip(self._emb_modules, groups)
+        ]
+        if hierarchical:
+            return self._hier.lookup(features, lookups)
+        outputs = [lookup().reshape(-1) for lookup in lookups]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
 class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSharding):
@@ -595,6 +601,7 @@ class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSh
         need_pos: bool = False,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         device_type_from_sharding_infos: Optional[Union[str, Tuple[str, ...]]] = None,
+        local_pooling: bool = False,
     ) -> None:
         super().__init__(
             sharding_infos=sharding_infos,
@@ -605,7 +612,36 @@ class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSh
             device_type_from_sharding_infos=device_type_from_sharding_infos,
         )
 
+        self._local_pooling = False
+        if not local_pooling:
+            self._dist_type_per_feature = dist_type_per_feature(sharding_infos)
+            self._per_key_score = sharding_takes_scores(sharding_infos)
+            self._hier = None
+            return
         self._init_customized_distributor(sharding_infos)
+        dims = {info.embedding_config.embedding_dim for info in sharding_infos}
+        self._local_pooling = (
+            len(dims) == 1
+            and not self._per_key_score
+            and not self._has_feature_processor
+            and all(
+                info.param_sharding.compute_kernel
+                == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+                and not (info.fused_params or {}).get("gradient_clipping", False)
+                for info in sharding_infos
+            )
+        )
+        if not self._local_pooling:
+            warnings.warn(
+                "Requester-side pooling requires uniform dimensions, DynamicEmb kernels, "
+                "and tables without feature processors, per-key scores or gradient clipping; "
+                "using owner-pooled distribution."
+            )
+            self._hier = None
+            return
+        self._dim = next(iter(dims))
+        self._row_inputs = weakref.WeakSet()
+        self._local_qcomm_codecs = qcomm_codecs_registry
 
         options = [
             (info.fused_params or {}).get("dynamicemb_options")
@@ -627,7 +663,7 @@ class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSh
         feature_hash_sizes = self._get_feature_hash_sizes()
         distributor = RwSparseFeaturesDist
         kwargs = {}
-        if self._hier is not None:
+        if self._local_pooling:
             distributor = RwPooledHierInputDist
             kwargs = dict(
                 table_offsets=torch.tensor(
@@ -638,13 +674,14 @@ class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSh
                 is_weighted=self._grouped_embedding_configs[0].is_weighted,
                 frequency_counters=self._frequency_counters,
                 hier=self._hier,
+                row_inputs=self._row_inputs,
             )
         return distributor(
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
             device=device if device is not None else self._device,
-            is_sequence=False,
+            is_sequence=self._local_pooling,
             has_feature_processor=self._has_feature_processor,
             need_pos=self._need_pos,
             dist_types=[
@@ -660,9 +697,10 @@ class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSh
         fused_params: Optional[Dict[str, Any]] = None,
         feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
     ) -> BaseEmbeddingLookup:
-        if self._hier is not None:
+        if self._local_pooling:
             return HierGroupedPooledEmbeddingsLookup(
                 self._hier,
+                self._row_inputs,
                 grouped_configs=self._grouped_embedding_configs,
                 pg=self._pg,
                 device=device if device is not None else self._device,
@@ -678,8 +716,12 @@ class RwPooledDynamicEmbeddingSharding(_HierRowWiseSharding, RwPooledEmbeddingSh
 
     def create_output_dist(self, device=None):
         output = super().create_output_dist(device)
-        return (
-            RwPooledHierEmbeddingDist(self._hier, output)
-            if self._hier is not None
-            else output
+        if not self._local_pooling:
+            return output
+        sequence = RwSequenceEmbeddingDist(
+            self._pg,
+            self._get_num_features(),
+            device if device is not None else self._device,
+            qcomm_codecs_registry=self._local_qcomm_codecs,
         )
+        return RwPooledHierEmbeddingDist(self._hier, output, sequence, self._dim)

@@ -79,6 +79,7 @@ from dynamicemb.planner import (
 from dynamicemb.shard import (
     DynamicEmbeddingBagCollectionSharder,
     DynamicEmbeddingCollectionSharder,
+    LocalDynamicEmbeddingBagCollectionSharder,
     ShardedDynamicEmbeddingBagCollection,
     ShardedDynamicEmbeddingCollection,
     quiesce,
@@ -100,6 +101,7 @@ from torchrec.distributed.embedding_sharding import (
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.sharding.rw_sequence_sharding import RwSequenceEmbeddingDist
+from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingDist
 from torchrec.distributed.train_pipeline import (
     PrefetchTrainPipelineSparseDist,
     TrainPipelineSparseDist,
@@ -352,6 +354,12 @@ def build_model(
 ) -> DistributedModelParallel:
     """The EC of ``cfg`` on ``output_dist``, in an :class:`EmbeddingModel`."""
     pooled = cfg.pooling != "none"
+    # Regular EBC always exchanges pooled bags. Only the local sharder can
+    # use a hierarchical transport; leave explicit capacity on the options
+    # so the regular sharder can warn that it is ignored.
+    table_output_dist = (
+        "torchrec" if pooled and not cfg.use_index_dedup else output_dist
+    )
     table_config = torchrec.EmbeddingBagConfig if pooled else torchrec.EmbeddingConfig
     pool_options = {"pooling": PoolingType(cfg.pooling.upper())} if pooled else {}
     tables = [
@@ -387,7 +395,7 @@ def build_model(
                 caching=False,
                 dist_type=cfg.dist_type,
                 initializer_args=DynamicEmbInitializerArgs(mode=init_mode),
-                output_dist=output_dist,
+                output_dist=table_output_dist,
                 output_dist_capacity=cfg.output_dist_capacity,
             ),
         )
@@ -410,7 +418,9 @@ def build_model(
         "learning_rate": cfg.learning_rate,
         "output_dtype": _OUTPUT_DTYPES[cfg.output_dtype],
     }
-    if pooled:
+    if pooled and cfg.use_index_dedup:
+        sharder = LocalDynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
+    elif pooled:
         sharder = DynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
     else:
         sharder = DynamicEmbeddingCollectionSharder(
@@ -435,10 +445,12 @@ def resolve_capacity(
     (``hier_needs``, collective, outside the timed iterations) on nodes of
     ``node_size`` GPUs (:func:`hier_node_size`), times
     ``cfg.capacity_factor``, and at least 4096 entries over the need."""
-    if cfg.output_dist == "torchrec":
-        return cfg
     if cfg.capacity != "measure":
         return replace(cfg, output_dist_capacity=int(cfg.capacity))
+    if cfg.output_dist == "torchrec" or (
+        cfg.pooling != "none" and not cfg.use_index_dedup
+    ):
+        return cfg
     world_size = dist.get_world_size()
     num_features = cfg.num_tables * cfg.features_per_table
     tables = {
@@ -472,6 +484,7 @@ def _hier_dists(model) -> List:
         if isinstance(
             output_dist, (RwSequenceHierEmbeddingDist, RwPooledHierEmbeddingDist)
         )
+        and output_dist._hier is not None
     ]
 
 
@@ -834,12 +847,56 @@ def _time_output_dist_launches() -> None:
         orig = getattr(ext.HierOutputDist, method)
 
         def launch(self, *args, _orig=orig, _direction=direction, **kwargs):
+            _OUTPUT_DIST_COUNTS[_direction] += 1
             if _CALLS is None:
-                _OUTPUT_DIST_COUNTS[_direction] += 1
                 return _orig(self, *args, **kwargs)
             return _CALLS.output_dist_launch(_direction, _orig, self, *args, **kwargs)
 
         setattr(ext.HierOutputDist, method, launch)
+
+
+# Count the TorchRec collectives that actually run, including calls made by a
+# wrapper. Looking at the configured sharder alone would miss a fallback.
+_TORCHREC_POOL_CALLS = defaultdict(int)
+
+
+def _count_pooled_exchanges():
+    for cls, route in (
+        (RwPooledEmbeddingDist, "owner_torchrec"),
+        (RwSequenceEmbeddingDist, "requester_torchrec"),
+    ):
+        original = cls.forward
+
+        def forward(self, *args, _route=route, _orig=original, **kwargs):
+            _TORCHREC_POOL_CALLS[_route] += 1
+            return _orig(self, *args, **kwargs)
+
+        cls.forward = forward
+
+
+def _verify_pooled_route(cfg, iterations, reference_calls=0):
+    """Check every rank's observed route, discounting the check's reference EBC."""
+    counts = [
+        _TORCHREC_POOL_CALLS["owner_torchrec"] - reference_calls,
+        _TORCHREC_POOL_CALLS["requester_torchrec"],
+        _OUTPUT_DIST_COUNTS[0],
+        _OUTPUT_DIST_COUNTS[1],
+    ]
+    all_counts = gather_floats(counts).long().tolist()
+    expected = {"owner_torchrec": [iterations, 0, 0, 0]}
+    if cfg.use_index_dedup:
+        expected = {}
+        if cfg.output_dist in ("auto", "torchrec"):
+            expected["requester_torchrec"] = [0, iterations, 0, 0]
+        if cfg.output_dist in ("auto", "hierarchical"):
+            expected["requester_hierarchical"] = [0, 0, iterations, iterations]
+    for route, signature in expected.items():
+        if all(count == signature for count in all_counts):
+            return route
+    raise RuntimeError(
+        f"expected pooled output route {expected}, observed calls on each rank "
+        f"(owner reduce-scatter, requester all-to-all, hierarchical fwd/bwd): {all_counts}"
+    )
 
 
 def install_stage_markers(pooled: bool) -> None:
@@ -852,6 +909,8 @@ def install_stage_markers(pooled: bool) -> None:
     launched them (see ``_BACKWARD_STAGES``).
     """
     _time_output_dist_launches()
+    if pooled:
+        _count_pooled_exchanges()
 
     def forward(self, *input, **kwargs):
         ctx = self.create_context()
@@ -1831,9 +1890,11 @@ def gather_floats(values: Union[List[float], torch.Tensor]) -> torch.Tensor:
 def check_against_torchrec(
     cfg: BenchConfig, device, world_size, local_size, node_size, rank, steps: int = 4
 ) -> Optional[str]:
-    """Same inputs through a model on TorchRec's dists and one on the
-    hierarchical dist (``--output_dist``'s, or ``hierarchical`` when that is
-    ``torchrec``): None when they match, else why not, the same on every rank.
+    """Train the candidate and TorchRec reference on identical inputs and gradients.
+
+    EBC checks the configured sharder and transport against a regular EBC
+    with TorchRec reduce-scatter. EC checks hierarchical distribution against
+    TorchRec sequence distribution, including when TorchRec is timed.
 
     Both models start from the DEBUG initializer (a key's row is a function of
     the key) and train with SGD at learning rate 1 on the same output
@@ -1859,18 +1920,20 @@ def check_against_torchrec(
     ``local_size`` is the GPUs of a host (the planner's), ``node_size`` those
     of a node of the hierarchical dist (:func:`hier_node_size`).
 
-    The checked model must also have launched its own output dist's kernels
-    at every step, in both directions, and no call may have run on TorchRec's
-    dists (a sharding that fell back, or a call over its capacities): that
-    would compare TorchRec's dists with themselves. Its capacities are
-    ``--capacity``, or measured on the check's own batches.
+    Pooled checks compare the requested path against a regular EBC on
+    TorchRec and verify its observed collectives on every rank. EC checks
+    require the hierarchical kernels in both directions. Hierarchical
+    capacities are measured on the check batches unless given explicitly.
     """
     key_range = min(
         cfg.key_range or cfg.num_embeddings, max(cfg.num_embeddings // 8, 1)
     )
     cfg = replace(cfg, optimizer="sgd", learning_rate=1.0, key_range=key_range)
     debug = DynamicEmbInitializerMode.DEBUG
-    output_dist = cfg.output_dist if cfg.output_dist != "torchrec" else "hierarchical"
+    pooled = cfg.pooling != "none"
+    output_dist = cfg.output_dist
+    if not pooled and output_dist == "torchrec":
+        output_dist = "hierarchical"
     batches = generate_batches(cfg, rank, device, steps)
     low_precision_pool = cfg.pooling != "none" and (
         cfg.emb_dtype != "fp32" or cfg.output_dtype != "fp32"
@@ -1879,9 +1942,18 @@ def check_against_torchrec(
         cfg, rank, device, batches, nonpositive=low_precision_pool
     )
     cfg = resolve_capacity(replace(cfg, output_dist=output_dist), batches, node_size)
-    torchrec_model = build_model(cfg, device, world_size, local_size, "torchrec", debug)
-    hier_model = build_model(cfg, device, world_size, local_size, output_dist, debug)
-    pipeline = train_pipeline(cfg, hier_model) if cfg.pipeline != "none" else None
+    reference_cfg = (
+        replace(cfg, use_index_dedup=False, output_dist_capacity=None)
+        if pooled
+        else cfg
+    )
+    reference_model = build_model(
+        reference_cfg, device, world_size, local_size, "torchrec", debug
+    )
+    candidate_model = build_model(
+        cfg, device, world_size, local_size, output_dist, debug
+    )
+    pipeline = train_pipeline(cfg, candidate_model) if cfg.pipeline != "none" else None
     # every call on a KJT of its own (Batch.fresh), the same gradients
     fed = iter([batch.fresh() for batch in inputs])
     exact = (
@@ -1899,15 +1971,16 @@ def check_against_torchrec(
     atol = 1e-4 if exact else 1e-2
     ok = True
     _OUTPUT_DIST_COUNTS.clear()
+    _TORCHREC_POOL_CALLS.clear()
     for step, batch in enumerate(inputs):
-        loss_torchrec, out_torchrec = torchrec_model(batch.fresh())
-        loss_hier = None
+        reference_loss, reference_out = reference_model(batch.fresh())
+        candidate_loss = None
         if pipeline is None:
-            loss_hier, out_hier = hier_model(batch.fresh())
+            candidate_loss, candidate_out = candidate_model(batch.fresh())
         else:
-            out_hier = pipeline.progress(fed)  # this batch's forward and backward
-        for name in out_torchrec.keys():
-            expected, got = out_torchrec[name], out_hier[name]
+            candidate_out = pipeline.progress(fed)  # this batch's forward and backward
+        for name in reference_out.keys():
+            expected, got = reference_out[name], candidate_out[name]
             if cfg.pooling == "none":
                 expected, got = expected.values(), got.values()
             matches = (
@@ -1925,20 +1998,24 @@ def check_against_torchrec(
                 print(
                     f"[rank {rank}] step {step} {name}: {bad.numel()} of"
                     f" {expected.shape[0]} rows differ, max abs diff {diff:.3e}; row {row}:"
-                    f" torchrec {expected[row, :4].tolist()}"
-                    f" hierarchical {got[row, :4].tolist()}, max relative error "
+                    f" TorchRec reference {expected[row, :4].tolist()}"
+                    f" candidate {got[row, :4].tolist()}, max relative error "
                     f"{rel:.3g}",
                     flush=True,
                 )
-        loss_torchrec.backward()
-        if loss_hier is not None:
-            loss_hier.backward()
-    ran = all(_OUTPUT_DIST_COUNTS[direction] >= steps for direction in (0, 1))
+        reference_loss.backward()
+        if candidate_loss is not None:
+            candidate_loss.backward()
+    if pooled:
+        _verify_pooled_route(cfg, steps, reference_calls=steps)
+        ran = True
+    else:
+        ran = all(_OUTPUT_DIST_COUNTS[direction] >= steps for direction in (0, 1))
     flags = torch.tensor([int(ok), int(ran)], device=device)
     dist.all_reduce(flags, op=dist.ReduceOp.MIN)
     # The models go when this returns: the hierarchical dist then frees its
     # windows at once, without its teardown handshake.
-    quiesce(hier_model)
+    quiesce(candidate_model)
     ok, ran = flags.tolist()
     if not ran:
         return f"the {output_dist} model fell back to TorchRec's dists"
@@ -2048,7 +2125,9 @@ def run(cfg: BenchConfig) -> Dict:
             return hier_traffic.per_iteration(len(hier_traffic.calls))
         # TorchRec EBC uses reduce-scatter, whose physical traffic depends on
         # the NCCL algorithm. Sequence all-to-all split counts do not apply.
-        return {} if pooled else torchrec_traffic.per_iteration(iterations)
+        if pooled and not torchrec_traffic.calls:
+            return {}
+        return torchrec_traffic.per_iteration(iterations)
 
     torch.cuda.synchronize()
     mem0, reserved0 = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
@@ -2094,6 +2173,8 @@ def run(cfg: BenchConfig) -> Dict:
             # syncs.
             train(warmup, "warmup")
             reset_traffic()
+            _OUTPUT_DIST_COUNTS.clear()
+            _TORCHREC_POOL_CALLS.clear()
             held = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
             _CALLS = calls
@@ -2122,6 +2203,7 @@ def run(cfg: BenchConfig) -> Dict:
         dist.all_gather_object(nics, mine)
         # per host, its local rank 0's: per device, bytes sent and received
         nics = [nics[host * local_size] for host in range(world_size // local_size)]
+    pooling_route = _verify_pooled_route(cfg, len(timed)) if pooled else None
     used["timed"] = device_used()
     _CALLS = None
     # The input dist's segment per call (plain loop; the calls that took the
@@ -2308,6 +2390,11 @@ def run(cfg: BenchConfig) -> Dict:
             memory_all,
             extra,
         )
+        if pooling_route is not None:
+            result["pooling_route"] = pooling_route
+            print(
+                f"pooled output route: {pooling_route} ({len(timed)} timed calls per rank)"
+            )
         if cfg.trace_out and extra["records"] is not None:
             import numpy as np
 
@@ -2777,8 +2864,7 @@ def parse_args(argv: List[str]) -> BenchConfig:
     parser.add_argument(
         "--use_index_dedup",
         action="store_true",
-        help="TorchRec's index dedup (a call on the hierarchical dist deduplicates"
-        " its keys without it too)",
+        help="enable EC index dedup, or select requester-local deduplication and pooling for EBC",
     )
     parser.add_argument(
         "--output_dist",
@@ -2880,7 +2966,8 @@ def parse_args(argv: List[str]) -> BenchConfig:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="first compare the hierarchical dist with TorchRec's dists",
+        help="compare four SGD steps against TorchRec. EBC checks the requested route "
+        "against ordinary owner-pooled EBC; EC checks hierarchical against sequence all-to-all.",
     )
     parser.add_argument("--json_out", type=str, default=defaults.json_out)
     cfg = BenchConfig(**vars(parser.parse_args(argv)))

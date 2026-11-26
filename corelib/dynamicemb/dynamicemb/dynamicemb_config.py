@@ -786,7 +786,11 @@ class DynamicEmbTableOptions:
     the sharding is ``"continuous"``, takes a score per key or clips
     gradients without the sharder's index dedup, and TorchRec's dists (with
     a warning) elsewhere.
-    Row-wise pooling supports SUM and MEAN with one embedding dimension per
+    For pooled collections, LocalDynamicEmbeddingBagCollectionSharder chooses
+    the row exchange from this option and pools on the requester.
+    DynamicEmbeddingBagCollectionSharder communicates owner-pooled rows and
+    warns if a capacity is configured.
+    Row-wise local pooling supports SUM and MEAN with one embedding dimension per
     sharding. Variable-stride batches use TorchRec's pooled dists.
     Every DynamicEmb table of a sharding sets ``output_dist``,
     ``output_dist_capacity`` and ``node_dedup`` alike. See

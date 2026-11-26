@@ -259,8 +259,15 @@ every rank before you drop a model (section 4.6).
 
 #### Pooled collections
 
-Set the same `output_dist` and capacity on row-wise DynamicEmb tables in an
-`EmbeddingBagCollection` sharded with `DynamicEmbeddingBagCollectionSharder`.
+Use `LocalDynamicEmbeddingBagCollectionSharder` to deduplicate each
+requester's keys before communication and pool on the requester. Set
+`output_dist="torchrec"` to exchange unique rows with TorchRec's sequence
+all-to-all. Set `output_dist="hierarchical"` and a capacity on all tables
+of the sharding to fetch those rows over the hierarchical dist.
+`DynamicEmbeddingBagCollectionSharder` pools contributions on the owners
+and communicates pooled rows with reduce-scatter. It warns when given an
+`output_dist_capacity`.
+
 Set `EmbeddingBagConfig.pooling` on each table. SUM and MEAN can share a
 sharding, and weighted bags take the collection's per-sample FP32 weights.
 A supported training call fetches one row per requester-unique key into GPU

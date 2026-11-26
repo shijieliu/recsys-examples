@@ -340,6 +340,48 @@ class PooledHierShardingContext(EmbeddingShardingContext):
             self.hier_result.record_stream(stream)
 
 
+class PooledSequenceShardingContext(SequenceShardingContext):
+    """The requester's bags and the TorchRec sequence all-to-all metadata."""
+
+    def __init__(self, features, reverse, weights, row_inputs):
+        super().__init__(batch_size_per_feature_pre_a2a=features.stride_per_key())
+        self.offsets = features.offsets()
+        self.reverse = reverse
+        self.weights = weights
+        self.batch = features.stride()
+        self.num_features = len(features.keys())
+        self._row_inputs = row_inputs
+
+    def prepare_lookup(self, features):
+        self._row_inputs.add(features)
+        self.lengths_after_input_dist = features.lengths().view(-1, features.stride())
+
+    def record_stream(self, stream):
+        super().record_stream(stream)
+        self.offsets.record_stream(stream)
+        self.reverse.record_stream(stream)
+        if self.weights is not None:
+            self.weights.record_stream(stream)
+
+    def pool(self, rows):
+        self.record_stream(torch.cuda.current_stream())
+        # embedding_bag gathers the unique rows through reverse and sums them
+        # directly. Its backward sums all occurrences of each unique row.
+        pooled = torch.nn.functional.embedding_bag(
+            self.reverse,
+            rows.float(),
+            offsets=self.offsets.long(),
+            per_sample_weights=self.weights,
+            mode="sum",
+            include_last_offset=True,
+        ).to(rows.dtype)
+        return (
+            pooled.view(self.num_features, self.batch, rows.size(1))
+            .transpose(0, 1)
+            .reshape(self.batch, self.num_features * rows.size(1))
+        )
+
+
 class HierDist:
     """The hierarchical dist of one row-wise sequence sharding: its operator,
     built at the first ``input_dist()`` (:meth:`setup`), and what its calls
@@ -854,12 +896,18 @@ class _PooledOutputFunction(torch.autograd.Function):
 
 
 class RwPooledHierEmbeddingDist(BaseEmbeddingDist):
-    def __init__(self, hier, torchrec_dist):
+    def __init__(self, hier, torchrec_dist, sequence, dim):
         super().__init__()
         self._hier = hier
         self._torchrec = torchrec_dist
+        self._sequence = sequence
+        self._dim = dim
 
     def forward(self, local_embs, sharding_ctx):
+        if isinstance(sharding_ctx, PooledSequenceShardingContext):
+            request = self._sequence(local_embs.view(-1, self._dim), sharding_ctx)
+            request.callbacks.append(sharding_ctx.pool)
+            return request
         if isinstance(sharding_ctx, PooledHierShardingContext):
             return _OutputAwaitable(
                 _PooledOutputFunction.apply(local_embs, sharding_ctx, self._hier.op)
@@ -883,6 +931,7 @@ def quiesce(model: torch.nn.Module) -> None:
                     output_dist,
                     (RwSequenceHierEmbeddingDist, RwPooledHierEmbeddingDist),
                 )
+                and output_dist._hier is not None
                 and output_dist._hier.op is not None
             ):
                 output_dist._hier.op.quiesce()

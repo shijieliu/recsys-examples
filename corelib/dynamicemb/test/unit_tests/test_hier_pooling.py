@@ -4,6 +4,7 @@
 
 import os
 import sys
+import warnings
 from unittest.mock import patch
 
 import torch
@@ -20,9 +21,14 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
-from dynamicemb.shard import DynamicEmbeddingBagCollectionSharder, quiesce
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    LocalDynamicEmbeddingBagCollectionSharder,
+    quiesce,
+)
 from dynamicemb.shard.hier_output_dist import _PooledOutputFunction
 from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.sharding.rw_sequence_sharding import RwSequenceEmbeddingDist
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import PoolingType
@@ -31,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "benchmar
 from benchmark_utils import init_distributed  # noqa: E402
 
 
-def model(output_dist, weighted, device, world_size, local_size):
+def model(sharder_type, output_dist, weighted, device, world_size, local_size):
     tables = [
         torchrec.EmbeddingBagConfig(
             name="shared",
@@ -70,7 +76,7 @@ def model(output_dist, weighted, device, world_size, local_size):
         )
         for table in tables
     }
-    sharder = DynamicEmbeddingBagCollectionSharder(
+    sharder = sharder_type(
         fused_params={"optimizer": EmbOptimType.SGD, "learning_rate": 1.0}
     )
     planner = DynamicEmbeddingShardingPlanner(
@@ -106,10 +112,31 @@ def batch(rank, weighted, device, long_bag=False):
 
 
 def check(weighted, rank, world_size, local_size, device):
-    reference, hierarchical = (
-        model(which, weighted, device, world_size, local_size)
-        for which in ("torchrec", "hierarchical")
-    )
+    # Even explicitly requesting a hierarchical window cannot silently change
+    # which representation the regular EBC sharder communicates.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        reference = model(
+            DynamicEmbeddingBagCollectionSharder,
+            "hierarchical",
+            weighted,
+            device,
+            world_size,
+            local_size,
+        )
+    assert any("output_dist_capacity" in str(w.message) for w in caught)
+    local, hierarchical = [
+        model(
+            LocalDynamicEmbeddingBagCollectionSharder,
+            mode,
+            weighted,
+            device,
+            world_size,
+            local_size,
+        )
+        for mode in ("torchrec", "hierarchical")
+    ]
+    models = (reference, local, hierarchical)
     with (
         patch.object(
             _PooledOutputFunction, "forward", wraps=_PooledOutputFunction.forward
@@ -117,30 +144,50 @@ def check(weighted, rank, world_size, local_size, device):
         patch.object(
             _PooledOutputFunction, "backward", wraps=_PooledOutputFunction.backward
         ) as bwd,
+        patch.object(
+            RwSequenceEmbeddingDist,
+            "forward",
+            autospec=True,
+            side_effect=RwSequenceEmbeddingDist.forward,
+        ) as row_exchange,
     ):
         for step in range(3):
-            expected = reference(batch(rank, weighted, device, long_bag=(step == 1)))
-            actual = hierarchical(batch(rank, weighted, device, long_bag=(step == 1)))
-            assert actual.keys() == expected.keys()
-            torch.testing.assert_close(
-                actual.values(), expected.values(), atol=1e-4, rtol=1e-5
+            outputs = [
+                m(batch(rank, weighted, device, long_bag=(step == 1))) for m in models
+            ]
+            expected = outputs[0]
+            for actual in outputs[1:]:
+                assert actual.keys() == expected.keys()
+                torch.testing.assert_close(
+                    actual.values(), expected.values(), atol=1e-4, rtol=1e-5
+                )
+            grad = torch.arange(expected.values().numel(), device=device).reshape_as(
+                expected.values()
             )
-            grad = torch.arange(actual.values().numel(), device=device).reshape_as(
-                actual.values()
+            if weighted:
+                grad = (grad + rank + step) % 7 - 3
+            else:
+                # The long bag repeats the same updated row 1024 times. Keep
+                # each column's SGD contributions consistently signed across
+                # ranks and features, so cancellation cannot dominate the
+                # comparison between different FP32 summation orders.
+                sign = 1 - 2 * (grad % 2)
+                grad = sign * (1 + (grad + rank + step) % 5)
+            grad = grad.to(expected.values().dtype)
+            for out in outputs:
+                out.values().backward(grad)
+            assert (
+                fwd.call_count == bwd.call_count == row_exchange.call_count == step + 1
             )
-            grad = ((grad + rank + step) % 7 - 3).to(actual.values().dtype)
-            expected.values().backward(grad)
-            actual.values().backward(grad)
-            assert fwd.call_count == bwd.call_count == step + 1
-        reference.eval()
-        hierarchical.eval()
+        for m in models:
+            m.eval()
         with torch.no_grad():
-            expected = reference(batch(rank, weighted, device))
-            actual = hierarchical(batch(rank, weighted, device))
-            torch.testing.assert_close(
-                actual.values(), expected.values(), atol=1e-4, rtol=1e-5
-            )
-            assert fwd.call_count == 3
+            outputs = [m(batch(rank, weighted, device)) for m in models]
+            for actual in outputs[1:]:
+                torch.testing.assert_close(
+                    actual.values(), outputs[0].values(), atol=1e-4, rtol=1e-5
+                )
+            assert fwd.call_count == row_exchange.call_count == 3
     quiesce(hierarchical)
 
 
@@ -151,4 +198,6 @@ if __name__ == "__main__":
         check(weighted, rank, world_size, local_size, torch.device("cuda", local_rank))
     dist.destroy_process_group()
     if rank == 0:
-        print("Hierarchical mixed SUM/MEAN and weighted SUM passed.")
+        print(
+            "Pooled communication and both deduplicated row paths passed mixed SUM/MEAN and weighted SUM."
+        )

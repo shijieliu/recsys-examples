@@ -233,6 +233,35 @@ With `use_index_dedup=True` and an LFU score strategy or an admission strategy, 
 
 A training call on the hierarchical dist (`output_dist="hierarchical"` or `"auto"`) deduplicates the sharding's keys in the same way whatever `use_index_dedup` is, and its tables count the keys as on TorchRec's dists under the same flag: without it the keys carry the counts for LFU tables alone, and an admission strategy of a table that does not evict by LFU counts each key once per call. Tables that clip gradients need `use_index_dedup=True` there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), sections 6 and 7.4).
 
+## Choosing a sharder for pooled embeddings
+
+For row-wise `EmbeddingBagCollection` training, the sharder selects which
+rows cross the network. `EmbeddingBagConfig.pooling` selects SUM or MEAN
+independently on each table.
+
+| Sharder | Table option | Rows communicated |
+| --- | --- | --- |
+| `DynamicEmbeddingBagCollectionSharder` | Default | The owners pool their contributions and TorchRec reduce-scatters the pooled rows. A configured `output_dist_capacity` produces a warning. |
+| `LocalDynamicEmbeddingBagCollectionSharder` | `output_dist="torchrec"` (default) | The requester deduplicates keys per table. TorchRec exchanges unique rows and the requester pools its original bags. |
+| `LocalDynamicEmbeddingBagCollectionSharder` | `output_dist="hierarchical"` and `output_dist_capacity` | The requester deduplicates keys per table. The hierarchical dist fetches unique rows and pools the original bags. |
+
+```python
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    DynamicEmbeddingCollectionSharder,
+    LocalDynamicEmbeddingBagCollectionSharder,
+)
+
+if pooled and use_index_dedup:
+    sharder = LocalDynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
+elif pooled:
+    sharder = DynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
+else:
+    sharder = DynamicEmbeddingCollectionSharder(
+        fused_params=fused_params, use_index_dedup=use_index_dedup
+    )
+```
+
 ## DynamicEmbCheckMode
 
 When the dynamic embedding table capacity is small, a single feature with a large number of indices may lead to issues where the hashtable cannot insert the indices. Enabling safe check allows you to observe this behavior (the number of times indices cannot be inserted and the number of indices each time) to determine if the dynamic embedding table capacity is set too low.
@@ -1828,7 +1857,13 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 
 ## Hierarchical dist
 
-`output_dist="hierarchical"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` and `EmbeddingBagCollection` shardings with DynamicEmb's hierarchical dist. For a pooled collection, use `DynamicEmbeddingBagCollectionSharder` and set each table's `EmbeddingBagConfig.pooling` to `PoolingType.SUM` or `PoolingType.MEAN`. Training with a common embedding dimension and fixed batch size per feature pools the rows on the requester. Evaluation, mixed embedding dimensions, and variable batch size per feature use TorchRec's pooled dists.
+For a row-wise `EmbeddingCollection`, set
+`DynamicEmbTableOptions(output_dist="hierarchical", output_dist_capacity=...)`
+to use the hierarchical dist. A row-wise `EmbeddingBagCollection` uses those
+same table options with `LocalDynamicEmbeddingBagCollectionSharder`.
+See [Choosing a sharder for pooled embeddings](#choosing-a-sharder-for-pooled-embeddings).
+Evaluation, mixed embedding dimensions, and variable-stride batches use
+TorchRec's pooled distribution.
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
 - Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`. With a `continuous` table, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).

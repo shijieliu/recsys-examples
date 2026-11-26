@@ -47,6 +47,7 @@ from .hier_output_dist import (
     DynamicEmbSequenceShardingContext,
     HierDist,
     PooledHierShardingContext,
+    PooledSequenceShardingContext,
 )
 
 torch.fx.wrap("len")
@@ -474,18 +475,29 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
 class RwPooledHierInputDist(RwSparseFeaturesDist):
     """Keep the bags on the requester and send table-unique keys to the owners."""
 
-    def __init__(self, *args, table_offsets, frequency_counters, is_weighted, **kwargs):
+    def __init__(
+        self,
+        *args,
+        table_offsets,
+        frequency_counters,
+        is_weighted,
+        row_inputs,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.register_buffer("_table_offsets", table_offsets, persistent=False)
         self._frequency_counters = frequency_counters
         self._is_weighted = is_weighted
+        self._row_inputs = row_inputs
 
     def forward(self, features):
-        enabled = self.hier_setup(self._frequency_counters, None)
-        if not enabled or not self.training or features.variable_stride_per_key():
+        if not self.training or features.variable_stride_per_key():
             return super().forward(features)
+        hierarchical = self.hier is not None and self.hier_setup(
+            self._frequency_counters, None
+        )
         keys, reverse, counts, lengths, offsets = deduplicate_features(
-            features, self._table_offsets, self._frequency_counters, True
+            features, self._table_offsets, self._frequency_counters, hierarchical
         )
         unique = KeyedJaggedTensor(
             keys=features.keys(),
@@ -496,8 +508,18 @@ class RwPooledHierInputDist(RwSparseFeaturesDist):
             stride=features.stride(),
         )
         weights = features.weights_or_none() if self._is_weighted else None
-        context = PooledHierShardingContext(features, reverse, weights)
-        return self.hier_forward(unique, features, reverse, context)
+        if hierarchical:
+            context = PooledHierShardingContext(features, reverse, weights)
+            return self.hier_forward(unique, features, reverse, context)
+        # Keep the actual TorchRec awaitable (or fused-pipeline splits
+        # metadata) so TorchRec fills in the sequence splits and recat.
+        request = super().forward(unique)
+        context = PooledSequenceShardingContext(
+            features, reverse, weights, self._row_inputs
+        )
+        context.unbucketize_permute_tensor = self.unbucketize_permute_tensor
+        request.local_pool_context = context
+        return request
 
 
 class HierStartAwaitable(Awaitable[Awaitable[KeyedJaggedTensor]]):
