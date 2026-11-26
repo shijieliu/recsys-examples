@@ -172,26 +172,27 @@ __global__ void install_rows_tiled(ValuePointers table, SlotLayout map, const in
     }
     dst[t] = slot < 0 ? 0 : uintptr_t(table.ptrs[tid]) + slot * RowVectors * sizeof(uint4);
   }
-  __syncthreads();
+  // The staged input is contiguous. Fetch it while the threads assigned
+  // to metadata resolve each destination, then reuse it after the barrier.
   uint4 payload[iterations];
-  uintptr_t to[iterations];
 #pragma unroll
   for (int j = 0; j < iterations; ++j) {
-    int item = j * kThreads + t;
-    to[j] = dst[item / RowVectors];
-    if (to[j]) payload[j] = staged[begin * RowVectors + item];
+    const int item = j * kThreads + t;
+    if (begin + item / RowVectors < count) payload[j] = staged[begin * RowVectors + item];
   }
+  __syncthreads();
   if (t < tile_rows && slot >= 0 && unique_slots)
     publish_cache_slot(map, tid, slot, outputs[begin + t], unique_slots, output_size);
 #pragma unroll
   for (int j = 0; j < iterations; ++j) {
-    if (!to[j]) continue;
+    const uintptr_t to = dst[(j * kThreads + t) / RowVectors];
+    if (!to) continue;
     const auto column = (j * kThreads + t) % RowVectors;
-    if (to[j] % alignof(uint4) == 0) {
-      reinterpret_cast<uint4 *>(to[j])[column] = payload[j];
+    if (to % alignof(uint4) == 0) {
+      reinterpret_cast<uint4 *>(to)[column] = payload[j];
     } else {
       // The native binding also accepts raw pointers into sliced tensors.
-      memcpy(reinterpret_cast<char *>(to[j]) + column * sizeof(uint4), &payload[j], sizeof(uint4));
+      memcpy(reinterpret_cast<char *>(to) + column * sizeof(uint4), &payload[j], sizeof(uint4));
     }
   }
 }
@@ -542,7 +543,7 @@ ExchangeResult exchange_cache_storage(
     const auto row_bytes = values.stride(0) * values.element_size();
     // A null width vector guarantees contiguous uniformly sized rows. Keep
     // the gathered sources and ragged table layouts on the general copier.
-    if (!cv.value_dims && !cache_inputs && attempted >= 4096 &&
+    if (!cv.value_dims && !cache_inputs && attempted >= 4096 && attempted <= values.size(0) &&
         reinterpret_cast<uintptr_t>(values.data_ptr()) % alignof(uint4) == 0 &&
         (row_bytes == 256 || row_bytes == 1024 || row_bytes == 2048)) {
       const auto launch_tile = [&](auto row_vectors) {

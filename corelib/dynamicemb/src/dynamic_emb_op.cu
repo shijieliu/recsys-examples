@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "ATen/ATen.h"
 #include "ATen/cuda/CUDAContext.h"
+#include "cache_sgd_reduce.cuh"
 #include "check.h"
 #include "device_count.h"
 #include "hier_output_dist/common/common.h"
@@ -488,14 +489,15 @@ void reset_ftrl_states(at::Tensor dst,
 }
 
 at::Tensor
-reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
+reduce_grads_impl(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
              int batch_size, int64_t out_dim,
              const std::optional<at::Tensor> &offsets = std::nullopt,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
              PoolingMode pooling_mode = PoolingMode::kNone, int total_D = 0,
 	     const std::optional<at::Tensor> &weights = std::nullopt,
              bool feature_dims_vec4 = false,
-             const std::optional<at::Tensor> &grad_rows = std::nullopt) {
+             const std::optional<at::Tensor> &grad_rows = std::nullopt,
+             const SgdCacheTarget *cache_sgd = nullptr) {
   // Pooled (offsets present): grads is [B, total_D], numbered in the output's
   // order, while offsets numbers bags in the input's.  grad_infos bridges the
   // two -- one entry per key, holding the grads row that key's gradient comes
@@ -531,11 +533,12 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
   // uninitialized memory would feed garbage straight into the optimizer.
   // Mirrors the early return in gather_embedding_pooled.
   if (num_keys <= 0 || num_unique <= 0) {
-    return at::zeros({num_unique, out_dim}, grads.options());
+    return cache_sgd ? at::Tensor{} : at::zeros({num_unique, out_dim}, grads.options());
   }
 
   // num_unique may be a capacity: the rows that no key maps to stay undefined.
-  at::Tensor unique_grads = at::empty({num_unique, out_dim}, grads.options());
+  at::Tensor unique_grads;
+  if (!cache_sgd) unique_grads = at::empty({num_unique, out_dim}, grads.options());
 
   TORCH_CHECK(!grad_rows.has_value() ||
                   (!offsets.has_value() && grad_rows->is_cuda() &&
@@ -669,6 +672,28 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
         get_pointer<index_t>(sorted_inverse_index), d_grad_infos,
         get_pointer<Info>(sorted_grad_infos), num_keys, 0, end_bit, stream);
 
+    if (cache_sgd) {
+      const int64_t chunks = (num_keys + 31) / 32;
+      const int64_t resident_warps =
+          int64_t(device_prop.num_sms) * device_prop.max_thread_per_sm / 32;
+      // Same grouping as get_kernel_config_use_warp in LocalReduce stage 2.
+      const int window = int(std::max<int64_t>(8, std::min<int64_t>(32,
+          chunks <= resident_warps ? 1 : chunks / resident_warps + 1)));
+      auto tails = at::empty({chunks}, inverse_index.options());
+      auto partials = at::empty({chunks, 2, 64}, grads.options());
+      auto *partial = reinterpret_cast<float4 *>(partials.data_ptr<float>());
+      auto *tail = get_pointer<index_t>(tails);
+      auto *ids = get_pointer<const index_t>(sorted_inverse_index);
+      auto *infos = get_pointer<const Info>(sorted_grad_infos);
+      mark_cache_gradient_groups_tiled<<<chunks, 128, 0, stream>>>(
+          ids, infos, grads.data_ptr<float>(), num_keys, *cache_sgd, tail, partial);
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+      reduce_cache_groups_and_unpin_tiled<<<(chunks + 7) / 8, 128, 0, stream>>>(
+          ids, tail, partial, chunks, *cache_sgd, window);
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+
     // --- LocalReduce ---
     // MEAN scaling and the pooling weights are both fused inside the reduce
     // kernel, so no separate scaling pass is needed.
@@ -685,6 +710,48 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
   });
 
   return unique_grads;
+}
+
+at::Tensor reduce_grads(at::Tensor inverse, at::Tensor grads, int64_t capacity,
+                        int batch_size, int64_t out_dim, const std::optional<at::Tensor> &offsets,
+                        const std::optional<at::Tensor> &D_offsets, PoolingMode mode,
+                        int total_D, const std::optional<at::Tensor> &weights,
+                        bool vec4, const std::optional<at::Tensor> &grad_rows) {
+  return reduce_grads_impl(inverse, grads, capacity, batch_size, out_dim, offsets,
+                           D_offsets, mode, total_D, weights, vec4, grad_rows);
+}
+
+void reduce_pooled_cache_sgd(at::Tensor inverse, at::Tensor grads, at::Tensor offsets,
+    int batch_size, at::Tensor rows, at::Tensor slots, at::Tensor tids, at::Tensor tables,
+    at::Tensor bucket_offsets, int64_t bucket_capacity, at::Tensor overflow_offsets,
+    int64_t overflow_capacity, at::Tensor pins, at::Tensor num_valid, float lr) {
+  TORCH_CHECK(grads.is_cuda() && grads.is_contiguous() && grads.scalar_type() == at::kFloat &&
+              grads.dim() == 2 && grads.size(0) == batch_size && grads.size(1) % 64 == 0,
+              "cache SGD requires contiguous pooled FP32 gradients, 64 columns per feature");
+  const auto device = grads.device();
+  const auto cap = rows.numel(), nt = tables.numel(), n = inverse.numel();
+  const auto check = [&](const at::Tensor &t, int64_t len, at::ScalarType type) {
+    TORCH_CHECK(t.is_contiguous() && t.device() == device && t.dim() == 1 &&
+                t.numel() == len && t.scalar_type() == type, "invalid cache SGD metadata");
+  };
+  TORCH_CHECK((inverse.scalar_type() == at::kLong || inverse.scalar_type() == at::kUInt64) &&
+              (offsets.scalar_type() == at::kInt || offsets.scalar_type() == at::kLong ||
+               offsets.scalar_type() == at::kUInt64) && n <= std::numeric_limits<int32_t>::max(), "invalid cache SGD indices");
+  check(inverse, n, inverse.scalar_type());
+  check(offsets, int64_t(batch_size) * (grads.size(1) / 64) + 1, offsets.scalar_type());
+  check(rows,cap,at::kLong); check(slots,cap,at::kLong); check(tids,cap,at::kLong);
+  check(tables,nt,at::kLong); check(bucket_offsets,nt+1,at::kLong);
+  check(overflow_offsets,nt,at::kLong); check(pins,pins.numel(),at::kInt);
+  TORCH_CHECK(nt > 0 && bucket_capacity > 0 && overflow_capacity > 0 &&
+              pins.numel() >= nt * overflow_capacity, "invalid cache SGD capacities");
+  const c10::cuda::CUDAGuard guard(device);
+  const SgdCacheTarget target{
+      rows.data_ptr<int64_t>(), slots.data_ptr<int64_t>(), tids.data_ptr<int64_t>(),
+      tables.data_ptr<int64_t>(), bucket_offsets.data_ptr<int64_t>(), bucket_capacity,
+      overflow_offsets.data_ptr<int64_t>(), overflow_capacity, pins.numel() - nt * overflow_capacity,
+      pins.numel(), pins.data_ptr<int32_t>(), cap, counted_num_valid_ptr(num_valid, device), lr};
+  reduce_grads_impl(inverse, grads, cap, batch_size, 64, offsets, std::nullopt, PoolingMode::kSum,
+                    grads.size(1), std::nullopt, true, std::nullopt, &target);
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1398,7 @@ void bind_dyn_emb_op(py::module &m) {
       []() { return dyn_emb::hier_output_dist::kMaxEntries; },
       "Every capacity of the hierarchical dist stays below this many entries");
 
+  m.def("reduce_pooled_cache_sgd", &reduce_pooled_cache_sgd);
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("inverse_index"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),

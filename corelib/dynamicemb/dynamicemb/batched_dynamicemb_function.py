@@ -20,7 +20,7 @@ from typing import Callable, ContextManager, Optional, Tuple
 
 import torch
 from dynamicemb.async_erase import table_section
-from dynamicemb.dynamicemb_config import EvictedItemMode
+from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
     Cache,
@@ -60,6 +60,7 @@ from dynamicemb_extensions import (
     get_table_range,
     prepare_cache_lookup,
     reduce_grads,
+    reduce_pooled_cache_sgd,
     segmented_unique_cuda,
 )
 
@@ -1397,6 +1398,35 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             layout = ctx.layout
             num_unique = ctx.num_unique
+            if (
+                ctx.use_counter
+                and ctx.storage_mode == StorageMode.CACHE
+                and type(optimizer) is SGDDynamicEmbeddingOptimizer
+                and layout.pooling_mode == DynamicEmbPoolingMode.SUM
+                and layout.common_D == 64
+                and ctx.pooling_weights is None
+                and grads.dtype == torch.float32
+                and cache._state.uniform_value_shape
+                and cache._state.value_dim == cache._state.emb_dim == 64
+                and cache._state.emb_dtype == torch.float32
+                and ctx.reverse_indices.dtype in (torch.int64, torch.uint64)
+                and ctx.reverse_indices.numel() < 2**31
+                and "DEMB_DETERMINISM_MODE" not in os.environ
+                and not torch.are_deterministic_algorithms_enabled()
+            ):
+                state = cache._state
+                optimizer.step()
+                refresh_slots_after_rehash(state, ctx)
+                table = state.key_index_map
+                with torch.cuda.nvtx.range("op:reduce_pooled_cache_sgd"):
+                    reduce_pooled_cache_sgd(
+                        ctx.reverse_indices, grads, ctx.offsets, layout.batch_size,
+                        ctx.update_value_rows, ctx.slot_indices, ctx.unique_table_ids,
+                        state.table_ptrs_dev, table.table_bucket_offsets_, table.bucket_capacity_,
+                        table.overflow_output_offsets_, table.overflow_bucket_capacity_,
+                        table._ref_counter, num_unique, optimizer.get_opt_args()["lr"],
+                    )
+                return (None,) * 12
             if layout.is_pooling:
                 with torch.cuda.nvtx.range("op:reduce_grads"):
                     unique_grads = reduce_grads(
