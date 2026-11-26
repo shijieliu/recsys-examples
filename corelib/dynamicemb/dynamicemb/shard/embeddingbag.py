@@ -86,6 +86,9 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
         if (
             self.training
             and self._direct_hier_input
+            # Newer TorchRec versions do this bookkeeping in their input_dist.
+            and not getattr(self, "_enabled_feature_score_auto_collection", False)
+            and not getattr(self, "_free_features_storage_early", False)
             and self._input_dists[0].hier.takes_hier_dist
             and isinstance(features, KeyedJaggedTensor)
             and not features.variable_stride_per_key()
