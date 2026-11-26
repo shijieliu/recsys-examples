@@ -21,49 +21,59 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-template <typename SrcType, typename DstType, typename IndexType>
+template <typename SrcType, typename DstType, bool UseVec4>
 struct ForwardSequenceFusedCopyDesc {
-
   using SrcT = SrcType;
   using DstT = DstType;
-  HOST_DEVICE_INLINE int get_vec_length() {
-    // TODO:now only have one size
-    return ev_size;
-  }
-  HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    IndexType idx = reverse_idx_ptr[i];
-    return src_ptr + idx * src_stride;
-  }
-  // Output row i is row out_row[i] of dst, or row i without out_row.
-  HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
-    const int64_t row = out_row_ptr != nullptr ? out_row_ptr[i] : i;
-    return dst_ptr + row * ev_size;
-  }
-
-  int num_vec_;
-  int ev_size;
-  int src_stride;
-  const IndexType *__restrict__ reverse_idx_ptr;
-  const SrcType *__restrict__ src_ptr;
-  DstType *dst_ptr;
-  const int32_t *__restrict__ out_row_ptr;
+  static constexpr bool kUseVec4 = UseVec4;
+  RowMapping rows;
+  const SrcT *src;
+  DstT *dst;
+  int64_t src_stride, dst_stride, width;
 };
 
-void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, int src_stride, DataType src_type,
-                   DataType dst_type, DataType offset_type, int device_num_sms,
-                   cudaStream_t stream, const int32_t *out_row) {
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
-    DISPATCH_VALUE_DATATYPE_FUNCTION(src_type, src_t, [&] {
-      DISPATCH_VALUE_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
-        using CopyDesc = ForwardSequenceFusedCopyDesc<src_t, dst_t, offset_t>;
-        CopyDesc sequence_copy_desc{
-            num_emb,          ev_size,
-            src_stride,       (offset_t *)inverse_idx_ptr,
-            (src_t *)src_ptr, (dst_t *)dst_ptr,
-            out_row};
-        copy_one_to_one<CopyDesc>(sequence_copy_desc, ev_size, device_num_sms,
-                                  stream);
+template <typename Src, typename Dst, bool UseVec4>
+void launch_row_copy(const void *src, void *dst, const RowMapping &rows,
+                     int64_t width, int64_t src_stride, int64_t dst_stride,
+                     int num_sms, cudaStream_t stream) {
+  ForwardSequenceFusedCopyDesc<Src, Dst, UseVec4> desc{
+      rows, static_cast<const Src *>(src), static_cast<Dst *>(dst),
+      src_stride, dst_stride, width};
+  copy_one_to_one(desc, num_sms, stream);
+}
+
+void scatter_fused(const void *src, void *dst, const RowMapping &rows,
+                   int64_t width, int64_t src_stride, int64_t dst_stride,
+                   size_t raw_element_bytes, DataType src_type,
+                   DataType dst_type, bool vec4_aligned, int num_sms,
+                   cudaStream_t stream) {
+  // Same dtype: copy the original bits, including FP8 weights and optimizer
+  // fields packed in their rows. Use the widest word aligned on every row.
+  if (raw_element_bytes) {
+    const int64_t bytes = width * raw_element_bytes;
+    const int64_t src_pitch = src_stride * raw_element_bytes;
+    const int64_t dst_pitch = dst_stride * raw_element_bytes;
+    const uintptr_t alignment = reinterpret_cast<uintptr_t>(src) |
+                                reinterpret_cast<uintptr_t>(dst) | bytes |
+                                src_pitch | dst_pitch;
+    auto copy = [&](auto word) {
+      using Word = decltype(word);
+      launch_row_copy<Word, Word, false>(
+          src, dst, rows, bytes / sizeof(Word), src_pitch / sizeof(Word),
+          dst_pitch / sizeof(Word), num_sms, stream);
+    };
+    if (!(alignment & 15)) copy(uint4{});
+    else if (!(alignment & 7)) copy(uint64_t{});
+    else if (!(alignment & 3)) copy(uint32_t{});
+    else if (!(alignment & 1)) copy(uint16_t{});
+    else copy(uint8_t{});
+    return;
+  }
+  DISPATCH_VALUE_DATATYPE_FUNCTION(src_type, src_t, [&] {
+    DISPATCH_VALUE_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
+      DISPATCH_BOOLEAN(vec4_aligned && width > 0 && width <= 256, UseVec4, [&] {
+        launch_row_copy<src_t, dst_t, UseVec4>(src, dst, rows, width, src_stride,
+                                               dst_stride, num_sms, stream);
       });
     });
   });

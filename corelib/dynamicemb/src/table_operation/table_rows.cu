@@ -25,14 +25,19 @@ namespace dyn_emb {
 // A new row must also lie below `row_limits[table]`, the rows the table's value
 // buffer has: handing out one past it would make every later read and write of
 // that key run off the buffer, so it is asserted here, where it is first known.
+//
+// Resolve the prefix bounded by n and the optional device count. Entries of
+// out past the live prefix are undefined.
 __global__ void table_resolve_rows_kernel(
     int64_t *__restrict__ rows, int64_t *__restrict__ row_counters,
     int64_t const *__restrict__ row_limits,
     int64_t const *__restrict__ table_bucket_offsets, int64_t bucket_capacity,
     int64_t const *__restrict__ slots, int64_t const *__restrict__ table_ids,
-    int64_t *__restrict__ out, int64_t n, bool allocate) {
+    int64_t *__restrict__ out, int64_t n, bool allocate,
+    int64_t const *__restrict__ num_valid) {
+  const int64_t live = counted_limit(num_valid, n);
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+       i < live; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     int64_t slot = slots[i];
     if (slot < 0) {
       // Not a slot at all: -1 marks a lookup miss, and -(position + 1) marks an
@@ -72,7 +77,10 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               at::Tensor row_limits,
                               at::Tensor table_bucket_offsets,
                               int64_t bucket_capacity, at::Tensor slots,
-                              at::Tensor table_ids, bool allocate) {
+                              at::Tensor table_ids, bool allocate,
+                              const std::optional<at::Tensor> &num_valid,
+                              std::optional<int64_t> host_num_valid) {
+  const auto *num_valid_ptr = counted_num_valid_ptr(num_valid, slots.device());
   TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
   TORCH_CHECK(row_counters.is_cuda() && row_counters.scalar_type() == at::kLong);
   TORCH_CHECK(row_limits.is_cuda() && row_limits.scalar_type() == at::kLong &&
@@ -80,18 +88,19 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
   TORCH_CHECK(slots.is_cuda() && slots.scalar_type() == at::kLong);
   TORCH_CHECK(table_ids.is_cuda() && table_ids.scalar_type() == at::kLong);
   TORCH_CHECK(slots.numel() == table_ids.numel());
-  int64_t n = slots.numel();
+  const int64_t n = counted_host_limit(host_num_valid, slots.numel());
   at::Tensor out = torch::empty_like(slots);
   if (n == 0)
     return out;
   constexpr int BLOCK = 256;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  table_resolve_rows_kernel<<<(n + BLOCK - 1) / BLOCK, BLOCK, 0, stream>>>(
+  table_resolve_rows_kernel<<<
+      table_grid_size(n, BLOCK), BLOCK, 0, stream>>>(
       rows.data_ptr<int64_t>(), row_counters.data_ptr<int64_t>(),
       row_limits.data_ptr<int64_t>(),
       table_bucket_offsets.data_ptr<int64_t>(), bucket_capacity,
       slots.data_ptr<int64_t>(), table_ids.data_ptr<int64_t>(),
-      out.data_ptr<int64_t>(), n, allocate);
+      out.data_ptr<int64_t>(), n, allocate, num_valid_ptr);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }

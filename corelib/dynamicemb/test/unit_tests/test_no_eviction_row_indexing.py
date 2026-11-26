@@ -27,6 +27,7 @@ import tempfile
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import (
     DynamicEmbCheckMode,
     DynamicEmbInitializerArgs,
@@ -177,10 +178,9 @@ def test_resident_keys_reread_correctly(current_device):
     """A second forward over the same keys must return the same embeddings.
 
     Regression: the HBM-direct prefetch returned the *hash slot* for keys that hit
-    in the table (``h_num_missing == 0`` early return), and the forward fed that
-    straight into ``load_from_flat``. For NO_EVICTION the key map is twice the
-    value buffer, so roughly half those slots addressed rows past the end of the
-    buffer -- an illegal memory access.
+    in the table, and the forward fed that straight into ``load_from_flat``. For
+    NO_EVICTION the key map is twice the value buffer, so roughly half those slots
+    addressed rows past the end of the buffer -- an illegal memory access.
     """
     device = torch.device(f"cuda:{current_device}")
     model = build_model(current_device, max_capacity=65536 * 2)
@@ -525,7 +525,9 @@ def test_no_eviction_with_customized_keeps_the_customized_score(
     )
 
     def stored_scores():
-        scores, founds, _ = state.key_index_map.lookup(key_tensor, tids, read_only)
+        scores, founds, _ = state.key_index_map.lookup(
+            key_tensor, tids, read_only, num_valid=full_count(key_tensor)
+        )
         assert bool(founds.all())
         return scores
 
@@ -645,7 +647,8 @@ def test_new_keys_carry_a_flag_and_erased_slots_do_not(current_device):
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
         )
         score_out, founds, _ = state.key_index_map.lookup(
-            tensor, torch.zeros_like(tensor), arg
+            tensor, torch.zeros_like(tensor), arg,
+            num_valid=full_count(tensor),
         )
         return score_out, founds
 

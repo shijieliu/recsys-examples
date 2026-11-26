@@ -622,7 +622,11 @@ class ConstructTwinModule:
                 dtype=torch.int64,
                 device=unique_indices.device,
             )
-            cur_hkv_table.insert(unique_indices, table_ids, padded_values)
+            cur_hkv_table.insert(
+                unique_indices,
+                table_ids,
+                padded_values,
+            )
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).
         # This makes it difficult to accurately test ADAM since the iteration count affects the optimizer's behavior.
         # So we reset the optimizer_step in here

@@ -33,6 +33,7 @@ from typing import Tuple
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -167,7 +168,8 @@ def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4, group_las
     table_value_dims = torch.tensor([row_width], dtype=torch.int64, device=device)
 
     optimizer.update_for_padded_buffer(
-        grads, padded, table_ids, table_emb_dims, emb_dim, row_width, all_dims_vec4
+        grads, padded, table_ids, table_emb_dims, emb_dim, row_width, all_dims_vec4,
+        num_valid=full_count(grads),
     )
 
     optimizer.fused_update_for_flat_table(
@@ -180,6 +182,7 @@ def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4, group_las
         emb_dim,
         all_dims_vec4,
         torch.float32,
+        num_valid=full_count(grads),
     )
 
     torch.testing.assert_close(flat, padded, rtol=0, atol=0)
@@ -209,6 +212,7 @@ def test_ftrl_skipped_rows_are_untouched():
         emb_dim,
         True,
         torch.float32,
+        num_valid=full_count(grads),
     )
 
     untouched = [r for r in range(8) if r != 3]
@@ -283,11 +287,12 @@ def test_ftrl_backward_matches_reference(emb_dim, opt_params):
     values = torch.zeros(num_keys, max_value_dim, dtype=value_type, device=device)
     values[:, :emb_dim] = weights
     optimizer.reset_optimizer_states(
-        values[:, max_emb_dim : max_emb_dim + state_dim], emb_dims=emb_dim
+        values[:, max_emb_dim : max_emb_dim + state_dim], emb_dims=emb_dim,
+        num_valid=full_count(values),
     )
     keys = torch.arange(num_keys, device=device, dtype=key_type)
     storage.set_score(1)
-    storage.insert(keys, torch.zeros_like(keys), values)
+    storage.insert(keys, torch.zeros_like(keys), values, num_valid=full_count(keys))
 
     ref_weight = weights.double()
     ref_linear = values[:, max_emb_dim : max_emb_dim + emb_dim].double().clone()
@@ -357,6 +362,7 @@ def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
         emb_dim,
         row_width,
         all_dims_vec4,
+        num_valid=full_count(grads),
     )
 
 
@@ -530,6 +536,7 @@ def test_ftrl_group_padded_buffer_dtype_and_mixed_dims(dims, dtype):
         max_dim,
         3 * max_dim,
         all(d % 4 == 0 for d in dims),
+        num_valid=full_count(values),
     )
     out = values.cpu()
 

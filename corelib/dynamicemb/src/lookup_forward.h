@@ -23,10 +23,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-// Unified pooled-gather descriptor.  One CTA/warp per bag, indexed in the
-// input's order; ``layout`` maps that to the output's columns.  Source rows use
-// src_stride, which exceeds the copy width when optimizer state follows the
-// embedding in a row.
+// A pooled cache read goes from input to unique row to the pinned table slot.
+// The flat key/value tables keep their native per-table optimizer-state stride.
+struct PooledCacheRows {
+  const int64_t *table_ptrs = nullptr;
+  const int64_t *value_dims = nullptr;
+  const int64_t *slots = nullptr;
+  const int64_t *table_ids = nullptr;
+};
+
+// One group processes each bag in input order. The layout identifies its output
+// columns. Source strides include any optimizer state appended to the embedding.
 template <typename SrcType, typename DstType, typename IndexType>
 struct ForwardMultiToOneFMLayoutDesc {
   using SrcT = SrcType;
@@ -45,8 +52,14 @@ struct ForwardMultiToOneFMLayoutDesc {
     return weights_ptr ? weights_ptr[i] : 1.0f;
   }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    int idx = inverse_idx_ptr[i];
-    return src_ptr + (int64_t)src_stride * idx;
+    const auto idx = inverse_idx_ptr[i];
+    if (cache.table_ptrs) {
+      const auto slot = cache.slots[idx];
+      if (slot < 0) return nullptr;
+      const auto tid = cache.table_ids[idx];
+      return reinterpret_cast<const SrcType *>(cache.table_ptrs[tid]) + slot * cache.value_dims[tid];
+    }
+    return src_ptr + int64_t(src_stride) * idx;
   }
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
     const int f = layout.feature_of_input(i);
@@ -66,7 +79,90 @@ struct ForwardMultiToOneFMLayoutDesc {
   const SrcType *__restrict__ src_ptr;
   DstType *dst_ptr;
   const float *__restrict__ weights_ptr; // nullptr -> unweighted
+  PooledCacheRows cache;
 };
+
+// Resolve a group of independent row addresses before consuming any embedding.
+// Cache rows require two indirect reads (unique row -> slot -> value pointer).
+// Broadcasting the resolved pointer lets those reads overlap across the bag.
+template <int Dim, int Group, typename Index>
+__global__ void pool_cache_rows_kernel(ForwardMultiToOneFMLayoutDesc<float, float, Index> desc) {
+  constexpr int vectors = Dim / (Group * 4);
+  const int bag = (blockIdx.x * blockDim.x + threadIdx.x) / Group;
+  if (bag >= desc.layout.num_bags()) return;
+  const int lane = threadIdx.x % Group;
+  const unsigned mask = Group == 32 ? 0xffffffffu : (0xffffu << (threadIdx.x & 16));
+  const int start = desc.get_offset(bag);
+  const int end = desc.get_offset(bag + 1);
+  Vec4T<float> sum[vectors];
+  // Four-key bags are common. Expose all four independent cache reads to
+  // the scheduler before the dependent sum, which preserves input order.
+  if constexpr (Dim == 64 || Dim == 512) {
+    if (end - start == 4 && !desc.weights_ptr) {
+      const auto ptr = lane < 4 ? desc.get_src_ptr(start + lane) : nullptr;
+      const auto addr = reinterpret_cast<unsigned long long>(ptr);
+      if (__all_sync(mask, lane >= 4 || (addr && (addr & 15u) == 0))) {
+        float *dst = desc.get_dst_ptr(bag);
+#pragma unroll
+        for (int v = 0; v < vectors; ++v) {
+          float4 values[4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const auto row = __shfl_sync(mask, addr, j, Group);
+            values[j] = reinterpret_cast<const float4 *>(row)[v * Group + lane];
+          }
+          auto &a = sum[v].val;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            a.x += values[j].x;
+            a.y += values[j].y;
+            a.z += values[j].z;
+            a.w += values[j].w;
+          }
+          if (desc.pooling_mode == PoolingMode::kMean) {
+            a.x *= 0.25f;
+            a.y *= 0.25f;
+            a.z *= 0.25f;
+            a.w *= 0.25f;
+          }
+          sum[v].store(dst + 4 * (v * Group + lane), 4);
+        }
+        return;
+      }
+    }
+  }
+  for (int first = start; first < end; first += Group) {
+    const int length = min(Group, end - first);
+    const auto ptr = lane < length ? desc.get_src_ptr(first + lane) : nullptr;
+    const auto addr = reinterpret_cast<unsigned long long>(ptr);
+    const float weight = lane < length ? desc.get_weight(first + lane) : 0.0f;
+    for (int j = 0; j < length; ++j) {
+      const auto row = __shfl_sync(mask, addr, j, Group);
+      const float scale = __shfl_sync(mask, weight, j, Group);
+      if (!row) continue;
+#pragma unroll
+      for (int v = 0; v < vectors; ++v) {
+        const auto src = reinterpret_cast<const float *>(row) + 4 * (v * Group + lane);
+        Vec4T<float> val;
+        if ((row & 15u) == 0) val.load(src, 4);
+        else val.val = make_float4(src[0], src[1], src[2], src[3]);
+        sum[v].accumulate_multiply(val, scale);
+      }
+    }
+  }
+  float *dst = desc.get_dst_ptr(bag);
+#pragma unroll
+  for (int v = 0; v < vectors; ++v) {
+    if (desc.pooling_mode == PoolingMode::kMean && end > start) {
+      auto &a = sum[v].val;
+      a.x /= end - start;
+      a.y /= end - start;
+      a.z /= end - start;
+      a.w /= end - start;
+    }
+    sum[v].store(dst + 4 * (v * Group + lane), 4);
+  }
+}
 
 // Unified pooled gather (scatter-combine).  ``layout`` carries the shapes, the
 // bag numbering and the copy width; see pooled_layout.cuh.  ``src_stride`` is
@@ -79,19 +175,51 @@ void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
                      const IndexType *inverse_idx_ptr, PoolingMode pooling_mode,
                      const PooledLayout &layout, int src_stride,
                      bool feature_dims_vec4, cudaStream_t stream,
-                     const float *weights_ptr = nullptr) {
+                     const float *weights_ptr = nullptr, PooledCacheRows cache = {}) {
   ForwardMultiToOneFMLayoutDesc<SrcType, DstType, IndexType> desc{
       pooling_mode, layout,  src_stride,  offset_ptr, inverse_idx_ptr,
-      src_ptr,      dst_ptr, weights_ptr};
+      src_ptr,      dst_ptr, weights_ptr, cache};
+  if constexpr (std::is_same_v<SrcType, float> && std::is_same_v<DstType, float>) {
+    if (cache.table_ptrs && !layout.mixed_D() && layout.num_bags() &&
+        (reinterpret_cast<uintptr_t>(dst_ptr) % alignof(float4)) == 0) {
+      constexpr int threads = 128;
+      const int bags = layout.num_bags();
+      if (layout.max_D == 64) {
+        pool_cache_rows_kernel<64, 16><<<(bags + 7) / 8, threads, 0, stream>>>(desc);
+      } else if (layout.max_D == 256) {
+        pool_cache_rows_kernel<256, 32><<<(bags + 3) / 4, threads, 0, stream>>>(desc);
+      } else if (layout.max_D == 512) {
+        pool_cache_rows_kernel<512, 32><<<(bags + 3) / 4, threads, 0, stream>>>(desc);
+      } else {
+        copy_multi_to_one(desc, feature_dims_vec4, stream);
+        return;
+      }
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+  }
   copy_multi_to_one(desc, feature_dims_vec4, stream);
 }
 
-// Row i of dst (row out_row[i] with out_row, int32) gets row inverse_idx[i]
-// of src.
-void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, int src_stride, DataType src_type,
-                   DataType dst_type, DataType offset_type, int device_num_sms,
-                   cudaStream_t stream, const int32_t *out_row = nullptr);
+// Source and destination row maps are optional. A null map is the identity.
+struct RowMapping {
+  int64_t host_limit, input_rows, output_rows;
+  const int64_t *num_valid;
+  const int64_t *src64, *dst64;
+  const int32_t *src32, *dst32;
+
+  DEVICE_INLINE bool resolve(int64_t i, int64_t &src, int64_t &dst) const {
+    src = src64 ? src64[i] : (src32 ? src32[i] : i);
+    dst = dst64 ? dst64[i] : (dst32 ? dst32[i] : i);
+    return src >= 0 && src < input_rows && dst >= 0 && dst < output_rows;
+  }
+};
+
+void scatter_fused(const void *src, void *dst, const RowMapping &rows,
+                   int64_t width, int64_t src_stride, int64_t dst_stride,
+                   size_t raw_element_bytes, DataType src_type,
+                   DataType dst_type, bool vec4_aligned, int num_sms,
+                   cudaStream_t stream);
 
 void get_new_length_and_offsets(uint64_t *d_unique_offsets,
                                 int64_t *d_table_offsets_in_feature,

@@ -23,6 +23,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // (cuLaunchKernel kernelParams = { &params }), so there is no hand-packed
 // per-argument void* list to get wrong.
 //
+// The host launcher and the cubin both include this header and both are
+// rebuilt from it by setup.py (compile_evict_fatbins), so the layout cannot
+// drift between them: a field added here needs a rebuild of the extension,
+// never a hand-sync.
+//
 // KeyType/IndexType/CounterType are all int64, ScoreType is uint64, InsertResult
 // is a uint8 enum -- fixed for LruLfu (§11.2), so this ABI is monomorphic. The
 // cubin exposes these entry points (all take EvictParams by value; each name
@@ -36,7 +41,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-// The ABI version of EvictParams: bump it whenever the struct changes. The
+// The ABI version of EvictParams: bump it when its layout or field contract changes. The
 // cubin's entry points carry it in their names, so an image built against
 // another layout does not export the names the launcher asks for, and the
 // load raises (load_from_image, jit_link.cpp). Without it a stale fatbin
@@ -45,7 +50,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // table_global_capacities, say) and keys are placed by the old rule.
 //   1: the layout before table_global_capacities (entry points without suffix)
 //   2: + table_global_capacities
-#define DYN_EMB_EVICT_ABI 2
+//   3: + num_valid
+//   4: num_valid may be null when batch is the exact length
+#define DYN_EMB_EVICT_ABI 4
 #define DYN_EMB_STR_(x) #x
 #define DYN_EMB_STR(x) DYN_EMB_STR_(x)
 // An entry point's identifier (device side) and its name string (host side).
@@ -95,6 +102,8 @@ struct EvictParams {
   // Per logical table global capacity for LinearBucketTable::home_bucket;
   // nullptr == every table hashes within its own capacity.
   const int64_t *table_global_capacities;
+  // Optional device bound on the live prefix. nullptr processes batch entries.
+  const int64_t *num_valid;
 };
 
 } // namespace dyn_emb

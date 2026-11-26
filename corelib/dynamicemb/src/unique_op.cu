@@ -18,6 +18,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "check.h"
 #include "dedup_chain.cuh"
 #include "lookup_forward.h"
+#include "segment_offsets.cuh"
 #include "torch_utils.h"
 #include "unique_op.h"
 #include "utils.h"
@@ -184,23 +185,6 @@ __device__ __forceinline__ int64_t unpack_table_id(int64_t packed) {
 
 __device__ __forceinline__ int32_t unpack_local_idx(int64_t packed) {
   return static_cast<int32_t>(packed & 0xFFFFFFFF);
-}
-
-// Binary search helper: largest t such that arr[t] <= val.  Used to derive a
-// key's table_id from segmented_range on the fly (instead of materializing a
-// per-key table_ids array) and to compact from the partitioned layout.
-__device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
-                                                         int n, int64_t val) {
-  int lo = 0, hi = n;
-  while (lo < hi) {
-    int mid = (lo + hi) / 2;
-    if (arr[mid] <= val) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo - 1;
 }
 
 // How the per-key values of one distinct key are combined. kSum is the access
@@ -481,7 +465,7 @@ __global__ void segmented_unique_finalize(
 
 // Expand jagged offsets to per-element table_ids (identity mapping,
 // local_batch_size=1). For each idx, find largest t such that offsets[t] <= idx
-// via binary_search_upper_bound (defined above).
+// via binary_search_upper_bound.
 __global__ void expand_table_ids_kernel(const int64_t *offsets,
                                         int64_t *table_ids, int num_tables,
                                         int64_t num_elements) {

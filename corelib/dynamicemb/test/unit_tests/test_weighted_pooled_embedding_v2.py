@@ -26,6 +26,7 @@ separate inference path against the same reference.
 import pytest
 import torch
 import torchrec
+from dynamicemb.device_count import full_count
 from dynamicemb import (
     DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
@@ -143,6 +144,7 @@ def _seed_dynamicemb_from_reference(module, ref):
             optimizer.reset_optimizer_states(
                 values[:, max_emb_dim : max_emb_dim + opt_state_dim],
                 emb_dims=emb_dim,
+                num_valid=full_count(values),
             )
 
         indices = torch.arange(num_emb, device=w.device, dtype=torch.int64)
@@ -150,7 +152,7 @@ def _seed_dynamicemb_from_reference(module, ref):
             (num_emb,), table_idx, dtype=torch.int64, device=w.device
         )
         storage.set_score(1)
-        storage.insert(indices, table_ids, values)
+        storage.insert(indices, table_ids, values, num_valid=full_count(indices))
 
 
 def _random_kjt(feature_num, batch_size, max_bag, dev, seed):

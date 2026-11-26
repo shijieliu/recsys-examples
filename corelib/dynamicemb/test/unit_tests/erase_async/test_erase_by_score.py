@@ -18,6 +18,7 @@ threshold, over a range of slots, sparing the slots a ref counter pins."""
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb.key_ownership import murmur3_hash_64bits
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import ScorePolicy
@@ -45,7 +46,8 @@ def fill(table, keys, scores, table_id, device):
     scores = torch.as_tensor(scores, dtype=torch.uint64, device=device)
     tids = torch.full_like(keys, table_id)
     return table.insert(
-        keys, tids, ScoreArg(name=SCORE, value=scores, policy=ScorePolicy.ASSIGN)
+        keys, tids, ScoreArg(name=SCORE, value=scores, policy=ScorePolicy.ASSIGN),
+        num_valid=full_count(keys),
     )
 
 
@@ -54,7 +56,8 @@ def find(table, keys, table_id, device):
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
     tids = torch.full_like(keys, table_id)
     score_out, founds, _ = table.lookup(
-        keys, tids, ScoreArg(name=SCORE, value=None, policy=ScorePolicy.CONST)
+        keys, tids, ScoreArg(name=SCORE, value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(keys),
     )
     return score_out, founds
 
@@ -164,7 +167,9 @@ def test_a_pinned_slot_is_spared_whatever_its_score(device, table_id):
     below = [i for i, s in enumerate(scores) if s < 50]
     pinned = below[::4]  # a quarter of what is below the threshold
     pin_slots = slots[torch.tensor(pinned, device=device)]
-    table.increment_counter(pin_slots, torch.full_like(pin_slots, table_id))
+    table.increment_counter(
+        pin_slots, torch.full_like(pin_slots, table_id), num_valid=full_count(pin_slots)
+    )
 
     counts = new_counts(device)
     table.erase_by_score(table_id, 50, counts)
@@ -179,7 +184,9 @@ def test_a_pinned_slot_is_spared_whatever_its_score(device, table_id):
 
     # Released, the same keys go the next time, and nothing is spared. A fresh
     # ``counts``: they add up across calls, so this one says what this scan did.
-    table.decrement_counter(pin_slots, torch.full_like(pin_slots, table_id))
+    table.decrement_counter(
+        pin_slots, torch.full_like(pin_slots, table_id), num_valid=full_count(pin_slots)
+    )
     counts = new_counts(device)
     table.erase_by_score(table_id, 50, counts)
     assert erased_and_spared(counts) == (len(pinned), 0)

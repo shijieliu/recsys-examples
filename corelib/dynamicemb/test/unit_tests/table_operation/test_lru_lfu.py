@@ -23,6 +23,7 @@ import math
 import numpy as np
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
@@ -64,6 +65,7 @@ def _insert(table, keys, tids, freq, policy=ScorePolicy.LRU_LFU):
         ScoreArg(name="frequency", value=freq, policy=policy),
         insert_results,
         score_out=score_out,
+        num_valid=full_count(keys),
     )
     return indices, score_out
 
@@ -95,20 +97,23 @@ def test_lru_lfu_frequency_accumulation(current_device):
 
     # Each LruLfu lookup is an access: accumulate frequency and re-stamp time.
     out2, founds, _ = table.lookup(
-        keys, tids, ScoreArg(name="frequency", value=freq, policy=ScorePolicy.LRU_LFU)
+        keys, tids, ScoreArg(name="frequency", value=freq, policy=ScorePolicy.LRU_LFU),
+        num_valid=full_count(keys),
     )
     assert torch.all(founds)
     assert torch.all(out2 == 2), "frequency after one lookup should be 2"
 
     out3, _, _ = table.lookup(
-        keys, tids, ScoreArg(name="frequency", value=freq, policy=ScorePolicy.LRU_LFU)
+        keys, tids, ScoreArg(name="frequency", value=freq, policy=ScorePolicy.LRU_LFU),
+        num_valid=full_count(keys),
     )
     assert torch.all(out3 == 3)
 
     # CONST (eval) lookup must return the reduction score == frequency (word 1),
     # NOT word 0 (the timestamp).
     out_const, _, _ = table.lookup(
-        keys, tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+        keys, tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(keys),
     )
     assert torch.all(
         out_const == 3
@@ -148,6 +153,7 @@ def test_lru_lfu_eviction_by_frequency(current_device):
             hot,
             hot_tids,
             ScoreArg(name="frequency", value=hot_freq, policy=ScorePolicy.LRU_LFU),
+            num_valid=full_count(hot),
         )
 
     # Sanity: the boost actually raised the hot keys' frequency (word 1).
@@ -169,17 +175,19 @@ def test_lru_lfu_eviction_by_frequency(current_device):
         new_tids,
         ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
         ir,
+        num_valid=full_count(new_keys),
     )
 
     assert num_evicted > 0, "eviction should have occurred (bucket overflowed)"
-    evicted_set = set(int(k) for k in evicted_keys.tolist())
+    evicted_set = set(int(k) for k in evicted_keys[: int(num_evicted)].tolist())
     assert evicted_set.isdisjoint(
         set(int(k) for k in hot.tolist())
     ), "high-frequency (hot) keys must not be evicted by LFU"
 
     # The hot keys must still be present.
     _, founds, _ = table.lookup(
-        hot, hot_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+        hot, hot_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(hot),
     )
     assert torch.all(founds), "high-frequency keys must survive LFU eviction"
 
@@ -277,13 +285,14 @@ def _read_score_blocks(storage, keys, tids):
     """Look up keys and gather their full [N, num_scores] score blocks."""
     name = storage._state.score_policy.name
     _, founds, _ = storage.key_index_map.lookup(
-        keys, tids, ScoreArg(name=name, policy=ScorePolicy.CONST)
+        keys, tids, ScoreArg(name=name, policy=ScorePolicy.CONST),
+        num_valid=full_count(keys),
     )
     assert torch.all(founds), "all keys must be present"
     # Score blocks are keyed by slot, which is not what lookup reports for a
     # table that stores a row per key.
     return storage.key_index_map.gather_score_blocks(
-        0, storage.key_index_map.slots_of(keys, tids)
+        0, storage.key_index_map.slots_of(keys, tids, num_valid=full_count(keys))
     )
 
 
@@ -306,7 +315,9 @@ def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_str
     freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)  # varied
 
     src = _lru_lfu_storage(dim=dim, score_strategy=score_strategy)
-    src.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
+    src.insert(
+        keys, tids, values, scores=freq_ref.to(torch.uint64), num_valid=full_count(keys)
+    )
 
     # Device layout is always physical [timestamp, frequency] regardless of order.
     blocks_src = _read_score_blocks(src, keys, tids)
@@ -362,7 +373,9 @@ def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
     tids = torch.zeros(n, dtype=torch.int64, device=device)
     values = torch.randn(n, dim, dtype=torch.float32, device=device)
     freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
-    storage.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
+    storage.insert(
+        keys, tids, values, scores=freq_ref.to(torch.uint64), num_valid=full_count(keys)
+    )
 
     before = _read_score_blocks(storage, keys, tids)
     assert torch.all(before[:, 1] == freq_ref)
@@ -457,6 +470,7 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
         keys[1:],
         tids[1:],
         ScoreArg(name="frequency", value=ones[1:], policy=ScorePolicy.LRU_LFU),
+        num_valid=full_count(keys[1:]),
     )
     torch.cuda.synchronize()
     for _ in range(28):
@@ -464,6 +478,7 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
             keys[1:2],
             tids[1:2],
             ScoreArg(name="frequency", value=ones[1:2], policy=ScorePolicy.LRU_LFU),
+            num_valid=full_count(keys[1:2]),
         )
     torch.cuda.synchronize()
 
@@ -479,6 +494,7 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
         new_tids,
         ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
         ir,
+        num_valid=full_count(new_keys),
     )
     assert num_evicted > 0, "eviction should have occurred"
 
@@ -488,11 +504,13 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
         ev_keys,
         ev_tids,
         ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(ev_keys),
     )
     _, sv_found, _ = table.lookup(
         sv_keys,
         sv_tids,
         ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(sv_keys),
     )
     assert not torch.any(
         ev_found
@@ -523,6 +541,7 @@ def test_lru_lfu_decay_matches_python_oracle(current_device):
                 one,
                 one_tid,
                 ScoreArg(name="frequency", value=one_val, policy=ScorePolicy.LRU_LFU),
+                num_valid=full_count(one),
             )
         torch.cuda.synchronize()
 
@@ -542,6 +561,7 @@ def test_lru_lfu_decay_matches_python_oracle(current_device):
         new_tids,
         ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
         ir,
+        num_valid=full_count(new_keys),
     )
     m = int(num_evicted)
     assert m == n + n_new - bc, "eviction count must be occupied + new - capacity"
@@ -555,7 +575,7 @@ def test_lru_lfu_decay_matches_python_oracle(current_device):
 
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
+    actual = set(int(k) for k in evicted_keys[: int(num_evicted)].tolist())
     assert actual == predicted, "kernel must evict exactly the oracle-predicted set"
 
 
@@ -580,6 +600,7 @@ def test_lru_lfu_score_function_logical_order_remap(current_device):
                 keys[:r],
                 tids[:r],
                 ScoreArg(name="frequency", value=ones[:r], policy=ScorePolicy.LRU_LFU),
+                num_valid=full_count(keys[:r]),
             )
         torch.cuda.synchronize()
         n_new = 40
@@ -589,10 +610,11 @@ def test_lru_lfu_score_function_logical_order_remap(current_device):
         ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
             InsertResult.INIT.value
         )
-        _, _, evk, _, _, _ = table.insert_and_evict(
-            nk, nt, ScoreArg(name="frequency", value=nf, policy=ScorePolicy.LRU_LFU), ir
+        _, num_evicted, evk, _, _, _ = table.insert_and_evict(
+            nk, nt, ScoreArg(name="frequency", value=nf, policy=ScorePolicy.LRU_LFU), ir,
+            num_valid=full_count(nk),
         )
-        return set(int(k) for k in evk.tolist())
+        return set(int(k) for k in evk[: int(num_evicted)].tolist())
 
     evicted_ts = _run(_evict_high_freq_first, LRU_LFU_TS_FIRST)
     evicted_lfu = _run(_evict_high_freq_first_lfu_first, LRU_LFU_LFU_FIRST)
@@ -712,17 +734,23 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
     ir = torch.empty(n, dtype=table.result_type, device=device).fill_(
         InsertResult.INIT.value
     )
-    idx = table.insert(keys, tids, _sa(ones), ir)  # noqa: F841
+    idx = table.insert(keys, tids, _sa(ones), ir, num_valid=full_count(keys))  # noqa: F841
 
     for i in range(n):
         reps = 1 + (i * 7) % 5
         one, one_tid, one_val = keys[i : i + 1], tids[i : i + 1], ones[i : i + 1]
         for _ in range(reps):
-            table.lookup(one, one_tid, _sa(one_val))
+            table.lookup(one, one_tid, _sa(one_val), num_valid=full_count(one))
         torch.cuda.synchronize()
 
     # Score blocks are keyed by slot; ``idx`` are rows for a table that stores them.
-    blk = table.gather_score_blocks(0, table.slots_of(keys, tids)).cpu().numpy()
+    blk = (
+        table.gather_score_blocks(
+            0, table.slots_of(keys, tids, num_valid=full_count(keys))
+        )
+        .cpu()
+        .numpy()
+    )
     ts = blk[:, 0].astype(np.uint64)
     freq = blk[:, 1].astype(np.float64)
 
@@ -734,7 +762,8 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
         InsertResult.INIT.value
     )
     _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
-        new_keys, new_tids, _sa(new_freq), ir2
+        new_keys, new_tids, _sa(new_freq), ir2,
+        num_valid=full_count(new_keys),
     )
     m = int(num_evicted)
     assert m == n + n_new - bc, "eviction count must be occupied + new - capacity"
@@ -748,7 +777,7 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
     assert rank[order[m]] - rank[order[m - 1]] > 1e-6, "eviction boundary must not tie"
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
+    actual = set(int(k) for k in evicted_keys[: int(num_evicted)].tolist())
     assert actual == predicted, (
         "batched (LFU,TIMESTAMP) custom eviction must match the physical decayed-LFU "
         "oracle (proves both logical->physical index remaps are correct)"
@@ -804,6 +833,7 @@ def test_lru_lfu_default_evictor_timestamp_tiebreak(current_device):
         new_tids,
         ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
         ir,
+        num_valid=full_count(new_keys),
     )
     m = int(num_evicted)
     assert m == n + n_new - bc, "eviction count must be occupied + new - capacity"
@@ -813,7 +843,7 @@ def test_lru_lfu_default_evictor_timestamp_tiebreak(current_device):
     assert ts[order[m]] > ts[order[m - 1]], "eviction boundary must fall on a ts gap"
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
+    actual = set(int(k) for k in evicted_keys[: int(num_evicted)].tolist())
     assert (
         actual == predicted
     ), "default Lex evictor must break equal-frequency ties by evicting oldest timestamps"
@@ -848,6 +878,7 @@ def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
             hot,
             hot_tids,
             ScoreArg(name="frequency", value=hot_ones, policy=ScorePolicy.LRU_LFU),
+            num_valid=full_count(hot),
         )
     torch.cuda.synchronize()
     assert torch.all(
@@ -864,11 +895,13 @@ def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
         new_keys,
         new_tids,
         ScoreArg(name="frequency", value=new_ones, policy=ScorePolicy.LRU_LFU),
+        num_valid=full_count(new_keys),
     )
     torch.cuda.synchronize()
 
     _, founds, _ = table.lookup(
-        hot, hot_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+        hot, hot_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(hot),
     )
     assert not bool(
         founds.any()
@@ -891,7 +924,7 @@ def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
     idx, _ = _insert(table, keys, tids, freq)
 
     # Erase one key: its slot becomes reclaimed with word1 == 2 left stale.
-    table.erase(keys[:1], tids[:1])
+    table.erase(keys[:1], tids[:1], num_valid=full_count(keys[:1]))
     torch.cuda.synchronize()
 
     # Insert a new key (delta 1). Probing skips the reclaimed slot, so the
@@ -932,7 +965,9 @@ def _filled_storage(n_keys, freq, score_strategy=LRU_LFU_TS_FIRST, dim=8):
     keys = torch.arange(1, 1 + n_keys, dtype=torch.int64, device=device)
     tids = torch.zeros(n_keys, dtype=torch.int64, device=device)
     values = torch.randn(n_keys, dim, dtype=torch.float32, device=device)
-    storage.insert(keys, tids, values, scores=freq.to(torch.uint64))
+    storage.insert(
+        keys, tids, values, scores=freq.to(torch.uint64), num_valid=full_count(keys)
+    )
     return storage, keys
 
 
@@ -955,7 +990,13 @@ def _source_dump(tmp_path, name, keys, freq, score_strategy=LRU_LFU_TS_FIRST, di
     keys = keys.to(device)
     tids = torch.zeros(keys.numel(), dtype=torch.int64, device=device)
     values = torch.randn(keys.numel(), dim, dtype=torch.float32, device=device)
-    src.insert(keys, tids, values, scores=freq.to(device).to(torch.uint64))
+    src.insert(
+        keys,
+        tids,
+        values,
+        scores=freq.to(device).to(torch.uint64),
+        num_valid=full_count(keys),
+    )
     d = tmp_path / name
     d.mkdir()
     return _dump(src, str(d))
@@ -1081,10 +1122,11 @@ def test_lru_lfu_non_lru_lfu_policy_on_full_bucket(current_device, policy, op):
     )
     score_arg = ScoreArg(name="frequency", value=value, policy=policy)
     if op == "insert":
-        table.insert(new_keys, new_tids, score_arg)
+        table.insert(new_keys, new_tids, score_arg, num_valid=full_count(new_keys))
     else:
         _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
-            new_keys, new_tids, score_arg
+            new_keys, new_tids, score_arg,
+            num_valid=full_count(new_keys),
         )
         assert int(num_evicted) == n_new
         assert set(evicted_keys[: int(num_evicted)].tolist()) == set(
@@ -1093,8 +1135,8 @@ def test_lru_lfu_non_lru_lfu_policy_on_full_bucket(current_device, policy, op):
     torch.cuda.synchronize()
 
     lookup = ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
-    _, new_found, _ = table.lookup(new_keys, new_tids, lookup)
-    _, old_found, _ = table.lookup(keys, tids, lookup)
+    _, new_found, _ = table.lookup(new_keys, new_tids, lookup, num_valid=full_count(new_keys))
+    _, old_found, _ = table.lookup(keys, tids, lookup, num_valid=full_count(keys))
     assert bool(new_found.all())
     assert set(keys[~old_found].tolist()) == set(range(1, 1 + n_new))
 
@@ -1109,19 +1151,23 @@ def test_lru_lfu_storage_preserve_existing_insert_into_full_bucket(current_devic
     tids = torch.zeros(bc, dtype=torch.int64, device=device)
     freq = torch.arange(1, 1 + bc, dtype=torch.int64, device=device)
     storage.insert(
-        keys, tids, torch.randn(bc, 8, device=device), scores=freq.to(torch.uint64)
+        keys, tids, torch.randn(bc, 8, device=device), scores=freq.to(torch.uint64),
+        num_valid=full_count(keys),
     )
 
     n_new = 16
     new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64, device=device)
     new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
     storage.insert(
-        new_keys, new_tids, torch.randn(n_new, 8, device=device), preserve_existing=True
+        new_keys, new_tids, torch.randn(n_new, 8, device=device), preserve_existing=True,
+        num_valid=full_count(new_keys),
     )
     torch.cuda.synchronize()
 
     lookup = ScoreArg(name=storage._state.score_policy.name, policy=ScorePolicy.CONST)
-    _, old_found, _ = storage.key_index_map.lookup(keys, tids, lookup)
+    _, old_found, _ = storage.key_index_map.lookup(
+        keys, tids, lookup, num_valid=full_count(keys)
+    )
     assert set(keys[~old_found].tolist()) == set(range(1, 1 + n_new))
 
 
@@ -1135,7 +1181,8 @@ def test_lru_lfu_storage_insert_overflow_evicts_lowest_frequency(current_device)
     tids = torch.zeros(bc, dtype=torch.int64, device=device)
     freq = torch.arange(100, 100 + bc, dtype=torch.int64, device=device)
     storage.insert(
-        keys, tids, torch.randn(bc, 8, device=device), scores=freq.to(torch.uint64)
+        keys, tids, torch.randn(bc, 8, device=device), scores=freq.to(torch.uint64),
+        num_valid=full_count(keys),
     )
 
     n_new = 16
@@ -1146,12 +1193,17 @@ def test_lru_lfu_storage_insert_overflow_evicts_lowest_frequency(current_device)
         new_tids,
         torch.randn(n_new, 8, device=device),
         scores=torch.ones(n_new, dtype=torch.uint64, device=device),
+        num_valid=full_count(new_keys),
     )
     torch.cuda.synchronize()
 
     lookup = ScoreArg(name=storage._state.score_policy.name, policy=ScorePolicy.CONST)
-    _, old_found, _ = storage.key_index_map.lookup(keys, tids, lookup)
-    _, new_found, _ = storage.key_index_map.lookup(new_keys, new_tids, lookup)
+    _, old_found, _ = storage.key_index_map.lookup(
+        keys, tids, lookup, num_valid=full_count(keys)
+    )
+    _, new_found, _ = storage.key_index_map.lookup(
+        new_keys, new_tids, lookup, num_valid=full_count(new_keys)
+    )
     assert bool(new_found.all())
     assert set(keys[~old_found].tolist()) == set(range(1, 1 + n_new))
 
@@ -1210,7 +1262,9 @@ def test_lru_lfu_batched_training_overflow(
     storage_map = bdebt._storage.key_index_map
     assert storage_map.size() <= bc
     lookup = ScoreArg(name=storage_map.score_names_[0], policy=ScorePolicy.CONST)
-    _, hot_found, _ = storage_map.lookup(hot, torch.zeros_like(hot), lookup)
+    _, hot_found, _ = storage_map.lookup(
+        hot, torch.zeros_like(hot), lookup, num_valid=full_count(hot)
+    )
     if not caching:
         assert bool(hot_found.all())
 
@@ -1263,6 +1317,7 @@ def test_single_score_load_overflow_evicts_lowest_score(
             tids,
             torch.randn(keys.numel(), 8, device=device),
             scores=scores.to(device).to(torch.uint64),
+            num_valid=full_count(keys),
         )
         d = tmp_path / name
         d.mkdir()
@@ -1284,7 +1339,10 @@ def test_single_score_load_overflow_evicts_lowest_score(
     assert dst.size() == bc
     tids = torch.zeros(n_first, dtype=torch.int64, device=device)
     lookup = ScoreArg(name=dst._state.score_policy.name, policy=ScorePolicy.CONST)
-    _, found, _ = dst.key_index_map.lookup(first_keys.to(device), tids, lookup)
+    device_keys = first_keys.to(device)
+    _, found, _ = dst.key_index_map.lookup(
+        device_keys, tids, lookup, num_valid=full_count(device_keys)
+    )
     num_evicted = n_first + n_new - bc
     assert set(first_keys[~found.cpu()].tolist()) == set(range(1, 1 + num_evicted))
 
@@ -1316,8 +1374,9 @@ def test_lru_lfu_erase_reclaimed_slot_is_reused_before_evicting_live_keys(
             value=torch.full((1,), 4, dtype=torch.uint64, device=device),
             policy=ScorePolicy.LRU_LFU,
         ),
+        num_valid=full_count(keys[:1]),
     )
-    table.erase(keys[:1], tids[:1])
+    table.erase(keys[:1], tids[:1], num_valid=full_count(keys[:1]))
     torch.cuda.synchronize()
     assert table.size() == bc - 1
 
@@ -1332,6 +1391,7 @@ def test_lru_lfu_erase_reclaimed_slot_is_reused_before_evicting_live_keys(
         new_tid,
         ScoreArg(name="frequency", value=ones[:1], policy=ScorePolicy.LRU_LFU),
         ir,
+        num_valid=full_count(new_key),
     )
     torch.cuda.synchronize()
 
@@ -1345,6 +1405,7 @@ def test_lru_lfu_erase_reclaimed_slot_is_reused_before_evicting_live_keys(
         keys[1:],
         tids[1:],
         ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+        num_valid=full_count(keys[1:]),
     )
     assert torch.all(founds), "live keys must survive an insert into a free slot"
 

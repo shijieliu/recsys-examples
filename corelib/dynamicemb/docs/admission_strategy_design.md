@@ -164,7 +164,7 @@ class MultiTableAdmitter(abc.ABC):
     """What a fused module runs, holding everything deciding takes."""
 
     @abc.abstractmethod
-    def admit(self, keys, table_ids, frequencies=None) -> torch.Tensor:
+    def admit(self, keys, num_valid=None, *, table_ids, frequencies=None, host_num_valid=None) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
@@ -173,6 +173,9 @@ class MultiTableAdmitter(abc.ABC):
         It is also where an answer goes back: an admitter that keeps a running
         total overwrites it in place with each key's total, which an LFU table
         takes as the key's score.
+
+        The live length is bounded by the host length and by the CUDA count
+        when provided. The mask has the same capacity as ``keys``.
         """
 
     def state(self) -> Optional[Counter]:
@@ -352,14 +355,15 @@ class UniformInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.lower, args.upper] for args in args_list]
 
-    def __call__(self, buffer, keys, table_ids, indices):
+    def __call__(self, buffer, keys, num_valid=None, table_ids=None, indices=None, host_num_valid=None):
         if self._table_params is None:
             uniform_init(buffer, indices, self._curand_state,
-                         self._args.lower, self._args.upper)
+                         self._args.lower, self._args.upper, num_valid, host_num_valid)
         else:
             uniform_init_table_params(buffer, indices, self._curand_state,
                                       self._table_params,
-                                      self._table_ids_for_kernel(table_ids))
+                                      self._table_ids_for_kernel(table_ids),
+                                      num_valid, host_num_valid)
 ```
 
 `table_param_rows` is where the column order is written down, four
@@ -473,7 +477,7 @@ signature.
 | `DynamicEmbTableOptions.admission_counter=KVCounter(...)` | `FrequencyAdmissionStrategy(counter=KVCounter(...))` | still works, warns |
 | `AdmissionStrategy.initialize_non_admitted_embeddings` | `MultiTableAdmitter.non_admitted_initializer` | removed |
 | `AdmissionStrategy.admit` | `MultiTableAdmitter.admit` | a configuration no longer decides; `create_admitter` builds what does |
-| `admit(keys, frequencies)` | `admit(keys, table_ids, frequencies=None)` | `frequencies` is now a per-batch increment, not a running total |
+| `admit(keys, frequencies)` | `admit(keys, num_valid=None, *, table_ids, frequencies=None, host_num_valid=None)` | `frequencies` is now a per-batch increment, not a running total |
 | `frequencies` of `admit` | same signature | `MultiTableFrequencyAdmitter` writes each key's running total over it, and an LFU table takes that as the admitted key's score, so it starts from all its occurrences instead of the admitting batch's alone. An admitter that keeps no count leaves it as it is |
 
 `admission_counter` keeps working: `__post_init__` warns, then folds it into a

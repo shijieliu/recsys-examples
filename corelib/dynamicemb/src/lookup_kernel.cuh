@@ -19,11 +19,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #define LOOKUP_KERNEL_CUH
 
 #include "check.h"
+#include "device_count.cuh"
 #include "utils.h"
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <type_traits>
 namespace dyn_emb {
 #define EV_NUM 32
 #define WARP_SIZE 32
@@ -919,49 +922,44 @@ HOST_DEVICE_INLINE int64_t bs_upper_bound_sub_one(const T *const arr,
 }
 
 template <typename CopyDesc>
-__global__ void one_to_one_warp_per_ev_kernel(CopyDesc copy_desc) {
-  using vec_length_type = int;
-  using src_type = typename CopyDesc::SrcT;
-  using dst_type = typename CopyDesc::DstT;
-
-  const vec_length_type ev_size = copy_desc.get_vec_length();
-  for (int i_ev = blockIdx.x; i_ev < copy_desc.num_vec_; i_ev += gridDim.x) {
-    auto *dst_ptr = copy_desc.get_dst_ptr(i_ev);
-    auto *src_ptr = copy_desc.get_src_ptr(i_ev);
-    for (int i = threadIdx.x; i < ev_size; i += blockDim.x) {
-      dst_ptr[i] = TypeConvertFunc<dst_type, src_type>::convert(src_ptr[i]);
+__global__ void one_to_one_copy_kernel(CopyDesc desc, int lane_shift) {
+  const int lanes = 1 << lane_shift;
+  const int lane = threadIdx.x & (lanes - 1);
+  const int groups = blockDim.x >> lane_shift;
+  const int64_t n = counted_limit(desc.rows.num_valid, desc.rows.host_limit);
+  using Src = typename CopyDesc::SrcT;
+  using Dst = typename CopyDesc::DstT;
+  for (int64_t i = int64_t(blockIdx.x) * groups + (threadIdx.x >> lane_shift);
+       i < n; i += int64_t(gridDim.x) * groups) {
+    int64_t src_row, dst_row;
+    if (!desc.rows.resolve(i, src_row, dst_row)) continue;
+    for (int64_t col = lane; col < desc.width; col += lanes) {
+      auto &out = desc.dst[dst_row * desc.dst_stride + col];
+      const auto &in = desc.src[src_row * desc.src_stride + col];
+      if constexpr (std::is_same_v<Src, Dst>) out = in;
+      else out = TypeConvertFunc<Dst, Src>::convert(in);
     }
   }
 }
 
 template <typename CopyDesc, int kMaxElemPerThread>
-__global__ void one_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
-  using src_type = typename CopyDesc::SrcT;
-  using dst_type = typename CopyDesc::DstT;
-  using vec_length_type = int;
-
-  constexpr int copy_width = 4;
-  constexpr int kWarpSize = 32;
-
-  const int lane_id = threadIdx.x;
-  const int warp_id = threadIdx.y;
-  const vec_length_type ev_size = copy_desc.get_vec_length();
-
-  Vec4T<src_type> src_elem;
-  for (int i_ev = blockIdx.x * blockDim.y + warp_id; i_ev < copy_desc.num_vec_;
-       i_ev += (gridDim.x * blockDim.y)) {
-
-    const src_type *src_ptr = copy_desc.get_src_ptr(i_ev);
-    dst_type *dst_ptr = copy_desc.get_dst_ptr(i_ev);
-
-#pragma unroll kMaxElemPerThread
-    for (int i = 0;
-         i < kMaxElemPerThread && 4 * kWarpSize * i + 4 * lane_id < ev_size;
-         ++i) {
-      int idx4 = 4 * kWarpSize * i + 4 * lane_id;
-      int n = min(ev_size - idx4, copy_width);
-      src_elem.load(src_ptr + idx4, n);
-      src_elem.store(dst_ptr + idx4, n);
+__global__ void one_to_one_warp_per_ev_vec4_kernel(CopyDesc desc) {
+  const int lane = threadIdx.x;
+  const int64_t n = counted_limit(desc.rows.num_valid, desc.rows.host_limit);
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
+       i < n; i += int64_t(gridDim.x) * blockDim.y) {
+    int64_t src_row, dst_row;
+    if (!desc.rows.resolve(i, src_row, dst_row)) continue;
+    auto src = desc.src + src_row * desc.src_stride;
+    auto dst = desc.dst + dst_row * desc.dst_stride;
+#pragma unroll
+    for (int vec = 0; vec < kMaxElemPerThread; ++vec) {
+      const int col = 4 * (vec * 32 + lane);
+      if (col < desc.width) {
+        Vec4T<typename CopyDesc::SrcT> value;
+        value.load(src + col, 4);
+        value.store(dst + col, 4);
+      }
     }
   }
 }
@@ -984,6 +982,7 @@ __global__ void multi_to_one_cta_per_ev_kernel(CopyDesc copy_desc) {
     float accum[kMaxElemPerThread] = {0.f};
     for (int r = 0; r < (end - start); ++r) {
       const src_type *src_ev = copy_desc.get_src_ptr(r + start);
+      if (!src_ev) continue;
       float w = copy_desc.get_weight(r + start);
 #pragma unroll kMaxElemPerThread
       for (int i = 0;
@@ -1037,6 +1036,7 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
       for (int j = 0; j < kWarpSize && r + j < L; ++j) {
         int j_ev = __shfl_sync(0xFFFFFFFF, l, j);
         const src_type *src_ev = copy_desc.get_src_ptr(j_ev);
+        if (!src_ev) continue;
 	float w = copy_desc.get_weight(j_ev);
 
 #pragma unroll kMaxElemPerThread
@@ -1046,8 +1046,19 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
           Vec4T<src_type> src_elem;
           int idx4 = 4 * kWarpSize * i + 4 * lane_id;
           int n = min(vec_length - idx4, copy_width);
-          src_elem.load(src_ev + idx4, n);
-          accum[i].accumulate_multiply(src_elem, w);
+          // Raw cache table pointers can refer to a slice of an allocation.
+          // Vector loads require four-element alignment even at uniform widths.
+          if (copy_desc.cache.table_ptrs &&
+              reinterpret_cast<uintptr_t>(src_ev) % (4 * sizeof(src_type))) {
+            auto &a = accum[i].val;
+            a.x += w * static_cast<float>(src_ev[idx4]);
+            a.y += w * static_cast<float>(src_ev[idx4 + 1]);
+            a.z += w * static_cast<float>(src_ev[idx4 + 2]);
+            a.w += w * static_cast<float>(src_ev[idx4 + 3]);
+          } else {
+            src_elem.load(src_ev + idx4, n);
+            accum[i].accumulate_multiply(src_elem, w);
+          }
         }
       }
     }
@@ -1089,6 +1100,12 @@ void copy_multi_to_one(CopyDesc &copy_desc, bool feature_dims_vec4,
   // Vec4T does a 16-byte load, so every address it touches -- dst_ptr +
   // b*total_D + col_begin(f) -- has to be 4-element aligned.
   const bool vec4_aligned = ev_size % 4 == 0 &&
+                            reinterpret_cast<uintptr_t>(copy_desc.dst_ptr) %
+                                    (4 * sizeof(typename CopyDesc::DstT)) == 0 &&
+                            (copy_desc.cache.table_ptrs ||
+                             (copy_desc.src_stride % 4 == 0 &&
+                              reinterpret_cast<uintptr_t>(copy_desc.src_ptr) %
+                                      (4 * sizeof(typename CopyDesc::SrcT)) == 0)) &&
                             copy_desc.layout.total_D % 4 == 0 &&
                             (!copy_desc.layout.mixed_D() || feature_dims_vec4);
   if (!vec4_aligned) {
@@ -1123,44 +1140,28 @@ void copy_multi_to_one(CopyDesc &copy_desc, bool feature_dims_vec4,
 }
 
 template <typename CopyDesc>
-void copy_one_to_one(CopyDesc &copy_desc, int ev_size, int num_sms,
-                     cudaStream_t stream) {
-  if (copy_desc.num_vec_ == 0)
-    return;
-  constexpr int MAX_THREADS_PER_BLOCK = 1024;
-  if (ev_size % 4 != 0) {
-    //  need to optimize for small ev_size
-    int grid_dim = copy_desc.num_vec_;
-    int block_dim =
-        ev_size < MAX_THREADS_PER_BLOCK ? ev_size : MAX_THREADS_PER_BLOCK;
-
-    one_to_one_warp_per_ev_kernel<CopyDesc>
-        <<<grid_dim, block_dim, 0, stream>>>(copy_desc);
-  } else {
-    if (ev_size <= 128) {
-      int grid_size = num_sms * 32; // 2048/64 =32
-      if (copy_desc.num_vec_ < grid_size)
-        grid_size = copy_desc.num_vec_;
-      dim3 block_size{32, 2};
+void copy_one_to_one(CopyDesc &desc, int num_sms, cudaStream_t stream) {
+  if (!desc.rows.host_limit) return;
+  if constexpr (CopyDesc::kUseVec4) {
+    const int grid = std::min<int64_t>((desc.rows.host_limit + 1) / 2, num_sms * 32);
+    if (desc.width <= 128)
       one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 1>
-          <<<grid_size, block_size, 0, stream>>>(copy_desc);
-    } else if (ev_size <= 256) {
-      int grid_size = num_sms * 32; // 2048/64 =32
-      if (copy_desc.num_vec_ < grid_size)
-        grid_size = copy_desc.num_vec_;
-      dim3 block_size{32, 2};
+          <<<grid, dim3(32, 2), 0, stream>>>(desc);
+    else
       one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 2>
-          <<<grid_size, block_size, 0, stream>>>(copy_desc);
-    } else if (ev_size <= 1024) {
-      int grid_dim = copy_desc.num_vec_;
-      int block_dim =
-          ev_size < MAX_THREADS_PER_BLOCK ? ev_size : MAX_THREADS_PER_BLOCK;
-      one_to_one_warp_per_ev_kernel<CopyDesc>
-          <<<grid_dim, block_dim, 0, stream>>>(copy_desc);
-    } else {
-      throw std::runtime_error(
-          "dynamic emb does not support emb vector size > 1024");
+          <<<grid, dim3(32, 2), 0, stream>>>(desc);
+  } else {
+    // A scalar key or slot uses one lane. Wider rows share a power-of-two
+    // group so adjacent lanes transfer consecutive words.
+    constexpr int block = 256;
+    int lane_shift = 0;
+    while ((1 << lane_shift) < desc.width && lane_shift < 5) {
+      ++lane_shift;
     }
+    const int groups = block >> lane_shift;
+    const int grid = std::min<int64_t>((desc.rows.host_limit + groups - 1) / groups,
+                                       num_sms * 32);
+    one_to_one_copy_kernel<<<grid, block, 0, stream>>>(desc, lane_shift);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

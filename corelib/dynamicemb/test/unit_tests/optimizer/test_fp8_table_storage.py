@@ -24,6 +24,7 @@ move the weights instead of being rounded away.
 
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb.initializer import fp8_out_of_range_risk
 from dynamicemb.optimizer import OptimizerArgs, RowWiseAdaGradDynamicEmbeddingOptimizer
 from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
@@ -68,7 +69,9 @@ def _train_padded_buffer(
 
     values = torch.empty(num_rows, value_dim, dtype=value_type, device=device)
     values[:, :emb_dim] = encode_table_values(init.to(device), value_type)
-    optimizer.reset_optimizer_states(values[:, emb_dim:], emb_dims=emb_dim)
+    optimizer.reset_optimizer_states(
+        values[:, emb_dim:], emb_dims=emb_dim, num_valid=full_count(values)
+    )
 
     table_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
     table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
@@ -81,6 +84,7 @@ def _train_padded_buffer(
             emb_dim,
             value_dim,
             all_dims_vec4,
+            num_valid=full_count(grad),
         )
     torch.cuda.synchronize()
 

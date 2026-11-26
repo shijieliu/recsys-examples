@@ -33,6 +33,7 @@ oracle (mirroring test_lru_lfu.py) predicts the exact victim set.
 import numpy as np
 import pytest
 import torch
+from dynamicemb.device_count import full_count
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
 from dynamicemb.key_value_table import (
@@ -89,6 +90,7 @@ def _plain_insert(table, keys, tids, value, policy, name):
         tids,
         ScoreArg(name=name, value=value, policy=policy),
         _ir(keys.numel(), table, keys.device),
+        num_valid=full_count(keys),
     )
 
 
@@ -102,6 +104,7 @@ def _insert_collect(table, keys, tids, value, policy, name):
         ScoreArg(name=name, value=value, policy=policy),
         _ir(keys.numel(), table, keys.device),
         collect_evicted=True,
+        num_valid=full_count(keys),
     )
     m = int(num_evicted)
     return indices, m, evicted_keys[:m], evicted_tids[:m]
@@ -133,6 +136,7 @@ def test_collect_evicted_lrulfu_cubin_matches_oracle(current_device):
                 name="frequency", value=ones[s : s + per], policy=ScorePolicy.LRU_LFU
             ),
             _ir(per, table, device),
+            num_valid=full_count(keys[s : s + per]),
         )
         idx_parts.append(indices)
         torch.cuda.synchronize()
@@ -288,6 +292,7 @@ def test_collect_evicted_determinism_mode_raises(current_device, monkeypatch):
             ScoreArg(name="score1", value=scores, policy=ScorePolicy.ASSIGN),
             _ir(n, table, device),
             collect_evicted=True,
+            num_valid=full_count(keys),
         )
 
 
@@ -332,6 +337,7 @@ def _storage_insert(storage, keys, dim, device):
         torch.zeros(n, dtype=torch.int64, device=device),
         torch.randn(n, dim, dtype=torch.float32, device=device),
         scores=torch.ones(n, dtype=torch.uint64, device=device),
+        num_valid=full_count(keys),
     )
     torch.cuda.synchronize()
 
@@ -420,7 +426,8 @@ def test_storage_retain_end_to_end(current_device):
 
     name = storage._state.score_policy.name
     _, founds, _ = storage.key_index_map.lookup(
-        evk, torch.zeros_like(evk), ScoreArg(name=name, policy=ScorePolicy.CONST)
+        evk, torch.zeros_like(evk), ScoreArg(name=name, policy=ScorePolicy.CONST),
+        num_valid=full_count(evk),
     )
     assert not bool(founds.any()), "evicted keys must no longer be in the table"
 

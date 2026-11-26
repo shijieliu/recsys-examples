@@ -46,6 +46,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA d
 
 dynamicemb_extensions = pytest.importorskip("dynamicemb_extensions")
 
+from dynamicemb.device_count import full_count
 from dynamicemb.utils import torch_to_dyn_emb  # noqa: E402
 
 # 2**20 rows of 4096 elements is exactly 2**32 elements; go past it.
@@ -78,6 +79,7 @@ def _update(path, grads, values, emb_dim, all_dims_vec4):
             all_dims_vec4,
             LR,
             torch_to_dyn_emb(values.dtype).value,
+            num_valid=full_count(grads),
         )
     else:
         dynamicemb_extensions.sgd_update_for_padded_buffer(
@@ -89,6 +91,7 @@ def _update(path, grads, values, emb_dim, all_dims_vec4):
             values.size(1),
             all_dims_vec4,
             LR,
+            num_valid=full_count(grads),
         )
 
 

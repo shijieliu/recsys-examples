@@ -26,6 +26,9 @@ from dynamicemb_extensions import (
     InsertResult,
     ScorePolicy,
     bucketize_keys,
+    lookup_in_cache,
+    table_insert_collect_evicted,
+    table_lookup,
     table_partition,
 )
 
@@ -341,7 +344,9 @@ def test_table_basic(
     score_copy_0 = score_arg.value.clone()
     insert_results = torch.empty(batch_size, dtype=table.result_type, device=device)
 
-    indices = table.insert(keys, table_ids, score_arg, insert_results)
+    indices = table.insert(
+        keys, table_ids, score_arg, insert_results
+    )
 
     assert (
         (insert_results == InsertResult.INSERT.value)
@@ -360,7 +365,7 @@ def test_table_basic(
 
     scores_reinsert = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
     indices_reinsert = table.insert(
-        keys, table_ids, score_arg_reinsert, insert_results, score_out=scores_reinsert
+        keys, table_ids, score_arg_reinsert, insert_results, score_out=scores_reinsert,
     )
 
     assert (
@@ -374,7 +379,9 @@ def test_table_basic(
         value=get_scores(score_policy, keys),
         policy=ScorePolicy.CONST,
     )
-    score_out, founds, indices_lookup = table.lookup(keys, table_ids, score_arg_lookup)
+    score_out, founds, indices_lookup = table.lookup(
+        keys, table_ids, score_arg_lookup
+    )
 
     assert founds[valid_mask].all()
     if (~valid_mask).any():
@@ -407,7 +414,7 @@ def test_table_basic(
     if num_tables > 1 and valid_mask.any():
         wrong_table_ids = (table_ids + 1) % num_tables
         _, wrong_founds, wrong_indices = table.lookup(
-            keys, wrong_table_ids, score_arg_lookup
+            keys, wrong_table_ids, score_arg_lookup,
         )
         both_valid = valid_mask & wrong_founds
         if both_valid.any():
@@ -445,7 +452,9 @@ def test_table_basic(
             keys.numel(), dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
 
-        indices = table.insert(keys, tid, score_arg, insert_results)
+        indices = table.insert(
+            keys, tid, score_arg, insert_results
+        )
 
         num_inserted = (insert_results == InsertResult.INSERT.value).sum()
         num_reclaimed = (insert_results == InsertResult.RECLAIM.value).sum()
@@ -494,7 +503,9 @@ def test_table_basic(
             batch_size, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
 
-        indices = table.insert(keys, tid, score_arg, insert_results)
+        indices = table.insert(
+            keys, tid, score_arg, insert_results
+        )
 
         assert (
             (insert_results == InsertResult.EVICT.value)
@@ -508,7 +519,9 @@ def test_table_basic(
         insert_results2 = torch.empty(
             batch_size, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
-        indices_reinsert = table.insert(keys, tid, score_arg, insert_results2)
+        indices_reinsert = table.insert(
+            keys, tid, score_arg, insert_results2
+        )
 
         assert (
             (insert_results2 == InsertResult.RECLAIM.value)
@@ -601,11 +614,11 @@ def test_table_evict(
             evicted_scores,
             evicted_table_ids,
         ) = table.insert_and_evict(
-            keys, table_ids, score_arg, insert_results, score_out=insert_scores_out
+            keys, table_ids, score_arg, insert_results, score_out=insert_scores_out,
         )
 
         score_out, founds, indices_lookup = table.lookup(
-            keys, table_ids, score_arg_lookup
+            keys, table_ids, score_arg_lookup,
         )
 
         num_existed = founds.sum()
@@ -629,7 +642,7 @@ def test_table_evict(
             == num_inserted + num_inserted_by_eviction + num_insert_failed + num_illegal
         )
         assert num_existed == num_inserted + num_inserted_by_eviction
-        assert num_evicted == num_inserted_by_eviction + num_insert_failed
+        assert int(num_evicted) == num_inserted_by_eviction + num_insert_failed
 
         assert torch.equal(indices[founds], indices_lookup[founds])
 
@@ -752,7 +765,12 @@ def test_overflow_with_counter(key_type, table_config):
         )
         batch_results = torch.empty(batch_n, dtype=table.result_type, device=device)
 
-        indices = table.insert(batch_keys, batch_tids, batch_scores, batch_results)
+        indices = table.insert(
+            batch_keys,
+            batch_tids,
+            batch_scores,
+            batch_results,
+        )
 
         success_mask = (
             (batch_results == InsertResult.INSERT.value)
@@ -868,7 +886,10 @@ def test_overflow_with_counter(key_type, table_config):
         successful_indices = round_indices[success_mask]
         successful_tids = round_tids[success_mask]
         if successful_indices.numel() > 0:
-            table.increment_counter(successful_indices, successful_tids)
+            table.increment_counter(
+                successful_indices,
+                successful_tids,
+            )
 
         all_ovf_indices.append(round_indices)
         all_ovf_keys.append(round_keys)
@@ -974,8 +995,9 @@ def test_overflow_with_counter(key_type, table_config):
             ovf_success_indices_list.append(r_idx[r_success])
             ovf_success_tids_list.append(r_tids[r_success])
     if ovf_success_indices_list:
+        held_slots = torch.cat(ovf_success_indices_list)
         table.decrement_counter(
-            torch.cat(ovf_success_indices_list),
+            held_slots,
             torch.cat(ovf_success_tids_list),
         )
 
@@ -1002,9 +1024,9 @@ def test_overflow_with_counter(key_type, table_config):
     )
 
     has_evict = (evict_results == InsertResult.EVICT.value).any().item()
-    print(f"Phase 6: evictions={num_evicted}, " f"has_evict_result={has_evict}")
+    print(f"Phase 6: evictions={int(num_evicted)}, " f"has_evict_result={has_evict}")
     assert (
-        num_evicted > 0 or has_evict
+        int(num_evicted) > 0 or has_evict
     ), "With counters at 0 and higher scores, some eviction should occur"
 
     print("Phase 6 passed: counter release and eviction verified")
@@ -1080,7 +1102,7 @@ def test_table_without_ref_counter(key_type, score_name, score_policy):
             batch, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
         (_, num_evicted, *_rest) = table.insert_and_evict(
-            keys, table_ids, score_arg, insert_results
+            keys, table_ids, score_arg, insert_results,
         )
         evicted = (insert_results == InsertResult.EVICT.value).sum()
         failed = (insert_results == InsertResult.BUSY.value).sum()
@@ -1096,3 +1118,544 @@ def test_table_without_ref_counter(key_type, score_name, score_policy):
     table.reset()
     assert table.size() == 0
     assert table._ref_counter is None
+
+
+# Table ops with a device count: ``num_valid``, a one-element int64 device tensor, says
+# how many leading entries of the per-key arrays are live; the rest is garbage that no
+# kernel reads or writes. The reference for n is the same call on the exact slice [:n].
+
+CAP = 64
+COUNTS = [0, 1, CAP // 2, CAP - 1, CAP]
+BIG = 1 << 22  # more entries than a capped grid has threads: the kernels must stride
+ASSIGN, CONST, LRU_LFU = ScorePolicy.ASSIGN, ScorePolicy.CONST, ScorePolicy.LRU_LFU
+INSERT, EVICT = InsertResult.INSERT.value, InsertResult.EVICT.value
+UNSET, UNSET_SCORE = 255, -(1 << 62)  # what the caller's output buffers start with
+
+COUNT = pytest.mark.parametrize("n", COUNTS)
+FEW = pytest.mark.parametrize("n", [0, CAP // 2, CAP])  # none, some, all
+BIG_COUNTS = pytest.mark.parametrize("n", [1, BIG // 2 + 1, BIG])
+ROWS = pytest.mark.parametrize("use_rows", [False, True], ids=["slots", "rows"])
+
+
+def _nv(n):
+    """The count as a view into a longer tensor, as ``table_offsets[T:T + 1]`` is."""
+    return torch.tensor([-7, n, -7], dtype=torch.int64, device="cuda")[1:2]
+
+
+def _unset(m, dtype=torch.uint8, value=UNSET):
+    return torch.full((m,), value, dtype=dtype, device="cuda")
+
+
+def _table(policy=ASSIGN, caps=(1024,), **kw):
+    return get_scored_table(
+        capacity=list(caps),
+        bucket_capacity=128,
+        key_type=torch.int64,
+        score_specs=[ScoreSpec(name="score", policy=policy)],
+        **kw,
+    )
+
+
+def _arg(value, policy=ASSIGN):
+    return ScoreArg(name="score", value=value, policy=policy)
+
+
+def _found(table, keys, ids):
+    return table.lookup(keys, ids, _arg(None, CONST))[1]
+
+
+def _junk_keys(m):
+    """Random keys (taken, they would be inserted), the reserved ones among them."""
+    k = torch.randint(1 << 40, 1 << 60, (m,), dtype=torch.int64, device="cuda")
+    k[::4], k[1::8], k[3::8] = -1, -2, -3  # empty, reclaimed, locked
+    return k
+
+
+def _junk_ids(m, num_tables=1):
+    """Table ids, every other one far out of range (a read of it would fault)."""
+    t = torch.randint(0, num_tables, (m,), dtype=torch.int64, device="cuda")
+    wild = torch.randint(1 << 30, 1 << 40, (m,), dtype=torch.int64, device="cuda")
+    wild[1::4] *= -1
+    t[1::2] = wild[1::2]
+    return t
+
+
+def _junk_scores(m):
+    k = torch.randint(1 << 40, 1 << 60, (m,), dtype=torch.int64, device="cuda")
+    return k.to(torch.uint64)
+
+
+def _dirty(x, n, junk):
+    """``x`` with the entries from ``n`` on replaced by ``junk(count)``."""
+    y = x.clone()
+    y[n:] = junk(x.numel() - n)
+    return y
+
+
+def _dirty_batch(keys, scores, n, policy=ASSIGN):
+    """(keys, table_ids, score) of a batch whose entries from ``n`` on are garbage."""
+    return (
+        _dirty(keys, n, _junk_keys),
+        _dirty(torch.zeros_like(keys), n, _junk_ids),
+        _arg(_dirty(scores, n, _junk_scores), policy),
+    )
+
+
+def _resident(policy, use_rows=False):
+    """Twin tables of one 128-slot bucket holding keys 1..100, scored by themselves."""
+    tables = [_table(policy, (128,), use_rows=use_rows) for _ in range(2)]
+    old = torch.arange(1, 101, device="cuda")
+    for t in tables:
+        t.insert(
+            old,
+            torch.zeros_like(old),
+            _arg(old.to(torch.uint64), policy),
+        )
+    return tables
+
+
+def _newcomers():
+    """CAP keys that outscore every resident: each one past the 28 free slots evicts
+    the lowest-scored resident, so the victims are exactly the lowest keys."""
+    new = torch.arange(1000, 1000 + CAP, device="cuda")
+    return new, torch.full((CAP,), 10**6, dtype=torch.uint64, device="cuda")
+
+
+def _check_lookup(size, n, use_rows):
+    table = _table(caps=(max(1024, 2 * size),), use_rows=use_rows)
+    keys = torch.arange(1, size + 1, device="cuda")
+    ids = torch.zeros_like(keys)
+    scores = (keys * 10).to(torch.uint64)
+    present = keys[::2].contiguous()  # the table holds every other key
+    pids = ids[: present.numel()]
+    table.insert(present, pids, _arg(scores[::2].contiguous()))
+
+    def present_keys(m):  # the tail asks for keys the table has, ...
+        return present[torch.randint(0, present.numel(), (m,), device="cuda")]
+
+    args = (_dirty(keys, n, present_keys), _dirty(ids, n, _junk_ids))
+    junk = _arg(_dirty(scores, n, _junk_scores))  # ... with scores to replace theirs
+    got = table.lookup(*args, junk, return_slots=True, num_valid=_nv(n))
+    want = table.lookup(
+        keys[:n],
+        ids[:n],
+        _arg(scores[:n]),
+        return_slots=True,
+    )
+    for g, w in zip(got, want):
+        assert g.numel() == size and torch.equal(g[:n], w)
+    # An ASSIGN lookup rewrites the score of a key it finds; the tail's did not.
+    score_out, founds, _ = table.lookup(
+        present, pids, _arg(None, CONST)
+    )
+    assert founds.all() and torch.equal(score_out, present * 10)
+
+
+@COUNT
+@ROWS
+def test_lookup(n, use_rows):
+    _check_lookup(CAP, n, use_rows)
+
+
+@BIG_COUNTS
+def test_lookup_big_batch(n):
+    _check_lookup(BIG, n, False)
+
+
+def _check_insert(size, n, use_rows, policy):
+    caps = (max(1024, 2 * size),)
+    a, b = (_table(policy, caps, use_rows=use_rows) for _ in range(2))
+    keys = torch.arange(1, size + 1, device="cuda")
+    ids = torch.zeros_like(keys)
+    scores = (keys * 3).to(torch.uint64)
+    results, score_out = _unset(size), _unset(size, torch.int64, UNSET_SCORE)
+    rows, slots = a.insert(
+        *_dirty_batch(keys, scores, n, policy),
+        results,
+        score_out,
+        return_slots=True,
+        num_valid=_nv(n),
+    )
+    results_b, score_b = _unset(n), _unset(n, torch.int64, UNSET_SCORE)
+    b.insert(
+        keys[:n],
+        ids[:n],
+        _arg(scores[:n], policy),
+        results_b,
+        score_b,
+    )
+    # The outputs match the exact-slice run, and are untouched past n.
+    assert rows.numel() == slots.numel() == size
+    assert torch.equal(results[:n], results_b) and (results[:n] == INSERT).all()
+    assert torch.equal(score_out[:n], score_b)
+    assert torch.equal(score_out[:n], scores[:n].to(torch.int64))
+    assert (results[n:] == UNSET).all() and (score_out[n:] == UNSET_SCORE).all()
+    # So is the table: the tail inserted nothing.
+    assert torch.equal(a.bucket_sizes, b.bucket_sizes)
+    assert int(a.bucket_sizes.sum()) == n
+    found = _found(a, keys, ids)
+    assert torch.equal(found, _found(b, keys, ids))
+    assert found[:n].all() and not found[n:].any()
+    # The indices reported are where the keys are found.
+    assert torch.equal(
+        rows[:n],
+        a.lookup(keys[:n], ids[:n], _arg(None, CONST))[
+            2
+        ],
+    )
+    assert torch.equal(
+        slots[:n], a.slots_of(keys[:n], ids[:n])
+    )
+    if use_rows:  # the rows are dense: the tail took none
+        assert torch.equal(torch.sort(rows[:n]).values, torch.arange(n, device="cuda"))
+        assert a.num_rows(0) == n
+
+
+@pytest.mark.parametrize(
+    "n, use_rows, policy",
+    [(n, rows, ASSIGN) for n in COUNTS for rows in (False, True)]
+    + [(CAP // 2, False, LRU_LFU)],
+    ids=str,
+)
+def test_insert(n, use_rows, policy):
+    _check_insert(CAP, n, use_rows, policy)
+
+
+@BIG_COUNTS
+def test_insert_big_batch(n):
+    _check_insert(BIG, n, False, ASSIGN)
+
+
+@pytest.mark.parametrize(
+    "host_n,device_n,live",
+    [(None, None, 8), (3, None, 3), (0, 9, 0), (3, 7, 3), (7, 2, 2)],
+)
+@pytest.mark.parametrize("policy", [ASSIGN, LRU_LFU], ids=["assign", "lru_lfu"])
+def test_native_table_prefix_bounds(host_n, device_n, live, policy):
+    table = _table(policy)
+    keys = torch.arange(1, 9, device="cuda")
+    table_ids = torch.zeros_like(keys)
+    results = _unset(keys.numel())
+    num_valid = None if device_n is None else _nv(device_n)
+    storage = (table.table_storage_, table.table_bucket_offsets_, table.bucket_capacity_)
+    slots, evicted_count, evicted_keys, evicted_ids = table_insert_collect_evicted(
+        *storage,
+        table.bucket_sizes,
+        keys,
+        table_ids,
+        keys.to(torch.uint64),
+        policy,
+        None,
+        results,
+        num_scores=table.num_scores_,
+        num_valid=num_valid,
+        host_num_valid=host_n,
+    )
+    assert slots.shape == evicted_keys.shape == evicted_ids.shape == keys.shape
+    assert int(evicted_count) == 0
+    assert (results[:live] == INSERT).all() and (results[live:] == UNSET).all()
+    _, found, _ = table_lookup(
+        *storage, keys, table_ids, None, CONST, num_scores=table.num_scores_
+    )
+    assert torch.equal(found, torch.arange(len(keys), device="cuda") < live)
+
+
+@pytest.mark.parametrize(
+    "host_n,device_n,policy,n",
+    [
+        (None, None, ASSIGN, 8),
+        (None, None, CONST, 8),
+        (5, None, ASSIGN, 5),
+        (9, 6, ASSIGN, 6),
+        (6, 9, ASSIGN, 6),
+        (0, 8, ASSIGN, 0),
+        (8, 0, ASSIGN, 0),
+    ],
+)
+def test_lookup_in_cache_matches_lookup_and_pin(host_n, device_n, policy, n):
+    table = _table(caps=(256, 128, 128), enable_overflow=True)
+    # Fill and pin the last table's single bucket so that key 900 lands in
+    # overflow. Key 1 is resident in both the first and the last tables.
+    resident = torch.arange(1, 129, device="cuda")
+    last_table = torch.full_like(resident, 2)
+    scores = _arg(resident.to(torch.uint64))
+    slots = table.insert(resident, last_table, scores)
+    table.increment_counter(slots, last_table)
+    table.insert(resident[:1], torch.zeros_like(resident[:1]), _arg(None, CONST))
+    overflow_key = torch.tensor([900], device="cuda")
+    overflow_slots, *_ = table.insert_and_evict_with_counter_and_overflow(
+        overflow_key, last_table[:1], _arg(overflow_key.to(torch.uint64))
+    )
+    assert overflow_slots.item() >= 128
+
+    # An empty middle segment skips table 1. Two extra resident keys in the
+    # physical tail would acquire extra pins if the final offset were ignored.
+    keys = torch.tensor([1, 9999, -1, 2, 900, 9999, -2, 1, 3, 4], device="cuda")
+    offsets = torch.tensor([0, 3, 3, 8], device="cuda")
+    ids = torch.tensor([0, 0, 0, 2, 2, 2, 2, 2], device="cuda")
+    score_input = None
+    if policy == ASSIGN:
+        score_input = torch.arange(1000, 1000 + len(keys), device="cuda").to(torch.uint64)
+    reference_score = _arg(None if score_input is None else score_input[:n], policy)
+
+    # Use the same physical hash tables on both paths so that their slot
+    # numbers, score updates and complete counter buffers can be compared.
+    state = (table.table_storage_, table.overflow_table_storage_, table._ref_counter)
+    before = [tensor.clone() for tensor in state]
+    _, hits, expected_slots = table.lookup_with_overflow(
+        keys[:n], ids[:n], reference_score
+    )
+    table.increment_counter(expected_slots, ids[:n])
+    expected_state = [tensor.clone() for tensor in state]
+    for tensor, saved in zip(state, before):
+        tensor.copy_(saved)
+
+    misses, slots, table_ids = lookup_in_cache(
+        keys,
+        offsets,
+        table.table_storage_,
+        table.table_bucket_offsets_,
+        table.bucket_capacity_,
+        table._ref_counter,
+        table.overflow_table_storage_,
+        table.overflow_bucket_capacity_,
+        table.overflow_output_offsets_,
+        score_input,
+        policy,
+        num_scores=table.num_scores_,
+        table_global_capacities=table.table_global_capacities_,
+        num_valid=None if device_n is None else _nv(device_n),
+        host_num_valid=host_n,
+    )
+    assert misses.shape == slots.shape == table_ids.shape == keys.shape
+    torch.testing.assert_close(misses[:n], ~hits)
+    torch.testing.assert_close(slots[:n], expected_slots)
+    torch.testing.assert_close(table_ids[:n], ids[:n])
+    for tensor, expected in zip(state, expected_state):
+        torch.testing.assert_close(tensor, expected)
+
+
+@pytest.mark.parametrize("count, live", [(-3, 0), (CAP + 9, CAP)])
+def test_count_is_clamped(count, live):
+    """The count is clamped to [0, capacity]. The arrays are the first CAP entries of
+    longer ones, so that a loop to the raw count would read live entries past the
+    capacity, insert them and write their results."""
+    table = _table()
+    keys = torch.arange(1, CAP + 17, device="cuda")
+    ids = torch.zeros_like(keys)
+    results = _unset(CAP + 16)
+    score = _arg(keys.to(torch.uint64)[:CAP])
+    table.insert(keys[:CAP], ids[:CAP], score, results[:CAP], num_valid=_nv(count))
+    assert int(table.bucket_sizes.sum()) == live
+    assert (results[:live] == INSERT).all() and (results[live:] == UNSET).all()
+
+
+@COUNT
+@pytest.mark.parametrize(
+    "use_rows, policy",
+    [(False, ASSIGN), (True, ASSIGN), (False, LRU_LFU)],
+    ids=str,
+)
+def test_insert_and_evict(n, use_rows, policy):
+    a, b = _resident(policy, use_rows)
+    new, high = _newcomers()
+    m, results = max(0, 100 + n - 128), _unset(CAP)
+    indices, num_evicted, *evicted = a.insert_and_evict(
+        *_dirty_batch(new, high, n, policy), results, num_valid=_nv(n)
+    )
+    ev_keys, ev_idx, _, ev_ids = evicted
+    # The counted form: the count stays on the device and nothing is sliced.
+    assert isinstance(num_evicted, torch.Tensor) and int(num_evicted) == m
+    assert all(x.numel() == CAP for x in (indices, *evicted))
+    assert sorted(ev_keys[:m].tolist()) == list(range(1, m + 1))
+    assert (ev_ids[:m] == 0).all() and (results[n:] == UNSET).all()
+    head = results[:n]
+    assert int((head == EVICT).sum()) == m and int((head == INSERT).sum()) == n - m
+    # A newcomer takes the slot (the row, with use_rows) of the resident it evicted.
+    assert sorted(indices[:n][head == EVICT].tolist()) == sorted(ev_idx[:m].tolist())
+    # The exact-slice run on the twin agrees, table included, at its own capacity n.
+    idx_b, m_b, *ev_b = b.insert_and_evict(
+        new[:n], torch.zeros_like(new[:n]), _arg(high[:n], policy),
+    )
+    assert m_b.is_cuda and m_b.dtype == torch.int64 and idx_b.numel() == n
+    assert all(x.numel() == n for x in ev_b)
+    assert int(m_b) == m
+    assert sorted(ev_b[0][:m].tolist()) == sorted(ev_keys[:m].tolist())
+    keys = torch.cat([torch.arange(1, 101, device="cuda"), new])
+    ids = torch.zeros_like(keys)
+    assert torch.equal(_found(a, keys, ids), _found(b, keys, ids))
+    assert torch.equal(a.bucket_sizes, b.bucket_sizes)
+    if use_rows:
+        assert a.num_rows(0) == b.num_rows(0) == min(100 + n, 128)
+
+
+@FEW
+@pytest.mark.parametrize("policy", [ASSIGN, LRU_LFU], ids=str)
+def test_insert_collect_evicted(n, policy):
+    a, _ = _resident(policy)
+    new, high = _newcomers()
+    m, results = max(0, 100 + n - 128), _unset(CAP)
+    _, num_evicted, ev_keys, ev_ids = a.insert(
+        *_dirty_batch(new, high, n, policy),
+        results,
+        collect_evicted=True,
+        num_valid=_nv(n),
+    )
+    assert int(num_evicted) == m and ev_keys.numel() == ev_ids.numel() == CAP
+    assert sorted(ev_keys[:m].tolist()) == list(range(1, m + 1))
+    assert (ev_ids[:m] == 0).all() and (results[n:] == UNSET).all()
+    assert (results[:n] != UNSET).all()
+
+
+@pytest.mark.parametrize(
+    "capacity,count,live",
+    [(0, 0, 0), (0, 4, 0), (8, -2, 0), (8, 0, 0), (8, 5, 5), (8, 20, 8)],
+)
+def test_cache_placement_report_live_prefix(capacity, count, live):
+    table = _table(caps=(128,), enable_overflow=True)
+    keys = torch.arange(1, capacity + 1, device="cuda")
+    ids = torch.zeros_like(keys)
+    (
+        slots,
+        evicted,
+        *victims,
+        refused,
+    ) = table.insert_and_evict_with_counter_and_overflow(
+        keys,
+        ids,
+        _arg(keys.to(torch.uint64)),
+        report_refused=True,
+        num_valid=_nv(count),
+    )
+    assert slots.numel() == live
+    assert evicted.is_cuda and int(evicted) == refused == 0
+    assert all(v.numel() == 0 for v in victims)
+    assert int(table.bucket_sizes.sum()) == live
+
+
+@FEW
+def test_overflow(n):
+    a, b = (_table(caps=(128,), enable_overflow=True) for _ in range(2))
+    old = torch.arange(1, 129, device="cuda")
+    zeros = torch.zeros_like(old)
+    for t in (a, b):  # fill the bucket, pin every slot: newcomers go to the overflow
+        slots = t.insert(old, zeros, _arg(old.to(torch.uint64)))
+        t.increment_counter(slots, zeros)
+    new, high = _newcomers()
+    results = _unset(CAP)
+    keys, ids, junk = _dirty_batch(new, high, n)
+    indices, num_evicted, *evicted = a.insert_and_evict_with_counter_and_overflow(
+        keys, ids, junk, results, num_valid=_nv(n)
+    )
+    assert int(num_evicted) == 0 and all(x.numel() == CAP for x in (indices, *evicted))
+    assert (results[:n] == INSERT).all() and (results[n:] == UNSET).all()
+    # The exact-slice run answers at its own capacity n.
+    idx_b, m_b, *ev_b = b.insert_and_evict_with_counter_and_overflow(
+        new[:n], zeros[:n], _arg(high[:n]),
+    )
+    assert m_b.is_cuda and int(m_b) == 0 and idx_b.numel() == n
+    assert all(x.numel() == n for x in ev_b)
+    assert torch.equal(a.overflow_bucket_sizes, b.overflow_bucket_sizes)
+    assert int(a.overflow_bucket_sizes.sum()) == n
+    look = _arg(None, CONST)
+    _, found, where = a.lookup_with_overflow(keys, ids, look, num_valid=_nv(n))
+    assert where.numel() == CAP and found[:n].all()
+    assert (where[:n] >= 128).all()
+    assert (
+        int(
+            a.lookup_with_overflow(new, zeros[:CAP], look)[
+                1
+            ].sum()
+        )
+        == n
+    )
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["main", "overflow"])
+@pytest.mark.parametrize("op", ["increment_counter", "decrement_counter"])
+@FEW
+def test_counter(n, op, overflow):
+    a, b = (_table(caps=(512, 512), enable_overflow=overflow) for _ in range(2))
+    flat = torch.randperm(1024, device="cuda")[:CAP]  # one counter each: no atomics
+    ids = (flat >= 512).to(torch.int64)
+    slots = flat - 512 * ids
+    if op == "decrement_counter":  # something to take back
+        for t in (a, b):
+            t.increment_counter(slots, ids)
+
+    def junk_slots(m):
+        return torch.randint(-8, 2048, (m,), dtype=torch.int64, device="cuda")
+
+    dirty_ids = _dirty(ids, n, lambda m: _junk_ids(m, 2))
+    getattr(a, op)(_dirty(slots, n, junk_slots), dirty_ids, num_valid=_nv(n))
+    getattr(b, op)(slots[:n], ids[:n], num_valid=_nv(n))
+    assert torch.equal(a._ref_counter, b._ref_counter)
+    live = CAP - n if op == "decrement_counter" else n
+    assert int(a._ref_counter.abs().sum()) == live
+
+
+@COUNT
+def test_erase(n):
+    a, b = (_table() for _ in range(2))
+    keys = torch.arange(1, CAP + 1, device="cuda")
+    ids = torch.zeros_like(keys)
+    for t in (a, b):
+        t.insert(keys, ids, _arg(keys.to(torch.uint64)))
+
+    def kept(m):  # the tail names keys that are in the table and have to stay
+        return keys[n:][torch.randint(0, max(CAP - n, 1), (m,), device="cuda")]
+
+    erase_keys, erase_ids = _dirty(keys, n, kept), _dirty(ids, n, _junk_ids)
+    present = a.erase(erase_keys, erase_ids, return_indices=True, num_valid=_nv(n))
+    b.erase(keys[:n], ids[:n])
+    assert present.numel() == CAP and (present[:n] >= 0).all()
+    again = a.erase(erase_keys, erase_ids, return_indices=True, num_valid=_nv(n))
+    assert (again[:n] < 0).all()
+    found = _found(a, keys, ids)
+    assert torch.equal(found, _found(b, keys, ids)) and int(found.sum()) == CAP - n
+    assert torch.equal(a.bucket_sizes, b.bucket_sizes)
+    assert int(a.bucket_sizes.sum()) == CAP - n
+
+
+@FEW
+@ROWS
+def test_determinism_mode(n, use_rows, monkeypatch):
+    """The host reads the live count and runs the exact slices
+    through the host-driven code and hands back the counted shapes: capacity-length
+    arrays, ``num_evicted`` a device tensor."""
+    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    a, b = _resident(ASSIGN, use_rows)
+    new, high = _newcomers()
+    m = max(0, 100 + n - 128)
+    indices, num_evicted, *evicted = a.insert_and_evict(
+        *_dirty_batch(new, high, n), num_valid=_nv(n)
+    )
+    assert num_evicted.shape == (1,) and num_evicted.dtype == torch.int64
+    assert int(num_evicted) == m and all(x.numel() == CAP for x in (indices, *evicted))
+    assert sorted(evicted[0][:m].tolist()) == list(range(1, m + 1))
+    # With exact-size input, all output buffers have capacity n.
+    idx_b, m_b, *ev_b = b.insert_and_evict(
+        new[:n], torch.zeros_like(new[:n]), _arg(high[:n]),
+    )
+    assert m_b.is_cuda and m_b.dtype == torch.int64 and idx_b.numel() == n
+    assert all(x.numel() == n for x in ev_b)
+    assert int(m_b) == m and sorted(ev_b[0][:m].tolist()) == list(range(1, m + 1))
+    if use_rows:  # dense rows, none taken for an eviction, a victim's is a newcomer's
+        for t, rows, victims in [
+            (a, indices[:n], evicted[1][:m]),
+            (b, idx_b, ev_b[1][:m]),
+        ]:
+            assert t.num_rows(0) == min(100 + n, 128)
+            assert len(set(rows.tolist())) == n
+            assert set(victims.tolist()) <= set(rows.tolist())
+    c = _table()
+    keys = torch.arange(1, CAP + 1, device="cuda")
+    batch = _dirty_batch(keys, keys.to(torch.uint64), n)
+    rows, slots = c.insert(*batch, return_slots=True, num_valid=_nv(n))
+    assert rows.numel() == slots.numel() == CAP and int(c.bucket_sizes.sum()) == n
+    assert torch.equal(
+        slots[:n],
+        c.slots_of(
+            keys[:n], torch.zeros_like(keys[:n])
+        ),
+    )
