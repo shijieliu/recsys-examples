@@ -42,7 +42,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.constants import default_pg_nccl_timeout
 from torchrec.distributed import comm_ops
-from torchrec.distributed.embedding_sharding import BaseEmbeddingDist
+from torchrec.distributed.embedding_sharding import (
+    BaseEmbeddingDist,
+    EmbeddingShardingContext,
+)
 from torchrec.distributed.sharding.rw_sequence_sharding import RwSequenceEmbeddingDist
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import Awaitable
@@ -318,6 +321,25 @@ class DynamicEmbSequenceShardingContext(SequenceShardingContext):
             self.hier_result.record_stream(stream)
 
 
+class PooledHierShardingContext(EmbeddingShardingContext):
+    """Requester bag layout and communication plans for one EBC call."""
+
+    def __init__(self, features, reverse, weights):
+        super().__init__(batch_size_per_feature_pre_a2a=features.stride_per_key())
+        self.offsets = features.offsets().contiguous()
+        self.reverse = reverse
+        self.weights = weights.contiguous() if weights is not None else None
+        self.hier_result = None
+
+    def record_stream(self, stream):
+        self.offsets.record_stream(stream)
+        self.reverse.record_stream(stream)
+        if self.weights is not None:
+            self.weights.record_stream(stream)
+        if self.hier_result is not None:
+            self.hier_result.record_stream(stream)
+
+
 class HierDist:
     """The hierarchical dist of one row-wise sequence sharding: its operator,
     built at the first ``input_dist()`` (:meth:`setup`), and what its calls
@@ -392,9 +414,7 @@ class HierDist:
         # The owner's KJT of each call on this path, as its second wait
         # returned it: the rows its lookup writes, and the row of each key
         # there (owns(), lookup()).
-        self._rows: "weakref.WeakKeyDictionary[KeyedJaggedTensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]" = (
-            weakref.WeakKeyDictionary()
-        )
+        self._rows: "weakref.WeakKeyDictionary[KeyedJaggedTensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]" = weakref.WeakKeyDictionary()
         # While a lookup runs (lookup()): the call's rows and row map, and how
         # many of them the lookup groups took so far (lookup_buffer()).
         self._lookup_rows: Optional[torch.Tensor] = None
@@ -413,7 +433,7 @@ class HierDist:
         self,
         dist_types: Sequence[int],
         weighted: bool,
-        index_dedup: bool,
+        index_dedup: Optional[bool],
     ) -> bool:
         """Whether this sharding takes the hierarchical dist, the same on
         every rank. The first call reads the node from NCCL (its LSA team on
@@ -468,7 +488,12 @@ class HierDist:
         refusal = (
             "the sharding's tables clip gradients, and it would add up a GPU's "
             "gradients of a key before the clip, where TorchRec's dists clip "
-            "each occurrence's: give the sharder use_index_dedup=True"
+            "each occurrence's"
+            + (
+                ": give the sharder use_index_dedup=True"
+                if index_dedup is not None
+                else "; use TorchRec's dists for clipped embedding bags"
+            )
             if self._clipping and not index_dedup
             else hier_output_dist_invalid(rank=self._rank, **arguments)
         )
@@ -513,7 +538,7 @@ class HierDist:
             )
             return False
         self.takes_hier_dist = True
-        if not index_dedup:
+        if index_dedup is False:
             # The training calls deduplicate the keys the sharder did not
             # (ShardedDynamicEmbeddingCollection.input_dist): say so once.
             warnings.warn(
@@ -804,6 +829,44 @@ class RwSequenceHierEmbeddingDist(
         return _OutputAwaitable(_OutputFunction.apply(local_embs, call, self._hier.op))
 
 
+class _PooledOutputFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, lookup_out, sharding_ctx, op):
+        sharding_ctx.record_stream(torch.cuda.current_stream())
+        call = sharding_ctx.hier_result
+        offsets, weights = sharding_ctx.offsets, sharding_ctx.weights
+        out = op.output_dist_fwd_pooled(
+            call.fwd_plan, lookup_out, offsets, sharding_ctx.reverse, weights
+        )
+        ctx.save_for_backward(offsets, weights, *call.bwd_plan)
+        ctx.counts, ctx.op = call.counts, op
+        ctx.lookup_shape = lookup_out.shape
+        sharding_ctx.hier_result = None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        offsets, weights, *plan = ctx.saved_tensors
+        rows = ctx.op.output_dist_bwd_pooled(
+            plan, ctx.counts, grad, comm_ops.GRADIENT_DIVISION, offsets, weights
+        )
+        return rows.view(ctx.lookup_shape), None, None
+
+
+class RwPooledHierEmbeddingDist(BaseEmbeddingDist):
+    def __init__(self, hier, torchrec_dist):
+        super().__init__()
+        self._hier = hier
+        self._torchrec = torchrec_dist
+
+    def forward(self, local_embs, sharding_ctx):
+        if isinstance(sharding_ctx, PooledHierShardingContext):
+            return _OutputAwaitable(
+                _PooledOutputFunction.apply(local_embs, sharding_ctx, self._hier.op)
+            )
+        return self._torchrec(local_embs, sharding_ctx)
+
+
 def quiesce(model: torch.nn.Module) -> None:
     """Lets every rank free the windows of ``model``'s hierarchical dists at
     once when the model is dropped. Each operator syncs its device and meets
@@ -816,7 +879,10 @@ def quiesce(model: torch.nn.Module) -> None:
     for module in model.modules():
         for output_dist in getattr(module, "_output_dists", None) or []:
             if (
-                isinstance(output_dist, RwSequenceHierEmbeddingDist)
+                isinstance(
+                    output_dist,
+                    (RwSequenceHierEmbeddingDist, RwPooledHierEmbeddingDist),
+                )
                 and output_dist._hier.op is not None
             ):
                 output_dist._hier.op.quiesce()

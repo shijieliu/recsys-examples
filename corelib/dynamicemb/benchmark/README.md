@@ -865,6 +865,56 @@ holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
 These runs are of commit `45101458`; this batch was not timed again on the
 commits after it.
 
+#### Hierarchical pooling on EOS and GB300
+
+`--pooling none` runs a row-wise EmbeddingCollection. `--pooling sum` and
+`--pooling mean` run a row-wise EmbeddingBagCollection with the same keys
+and table configuration. The benchmark injects gradients of the public
+output shape and includes the optimizer update in step time.
+
+| Hardware and ranks | Local batch | Max bag length | Unpooled (ms) | SUM (ms) | MEAN (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| EOS, 8 H100s on one host | 8,192 | 4 | 1.427 | 1.413 | 1.523 |
+| EOS, 8 H100s on one host | 128 | 1,024 | 1.782 | 1.817 | 1.831 |
+| EOS, 16 H100s across two hosts | 8,192 | 4 | 1.984 | 2.095 | 2.157 |
+| EOS, 16 H100s across two hosts | 128 | 1,024 | 3.125 | 3.253 | 3.224 |
+| GB300, 16 GPUs in one NVLink rack | 8,192 | 4 | 1.782 | 1.797 | 1.912 |
+| GB300, 16 GPUs in one NVLink rack | 128 | 1,024 | 1.800 | 1.769 | 1.890 |
+
+Each cell is the median of three runs on EOS or five runs on GB300. Each
+run used CUDA events over 20 training steps after 20 warmup steps, averaged
+over ranks. All runs used FP32 table and output rows, eight tables of four
+million keys, D=128, one feature per table, and SGD. Bag lengths were drawn
+uniformly from 1 to the maximum and keys from a power law with exponent
+1.05, with seed 1234. Both pooled modes ran the hierarchical forward and
+backward. EOS used GIN between hosts. The four GB300 trays formed a single
+NCCL LSA team.
+
+In separate W=16 `--kernel_times` runs, the median forward and backward
+GPU times in milliseconds were as follows. The timings include hierarchical
+communication, requester bag reduction and backward gradient mapping.
+The EBC mean normalization is included in the step timings above.
+
+| Hardware | Max bag length | Unpooled fwd / bwd | SUM fwd / bwd | MEAN fwd / bwd |
+| --- | ---: | ---: | ---: | ---: |
+| EOS | 4 | 0.411 / 0.452 | 0.414 / 0.451 | 0.427 / 0.449 |
+| EOS | 1,024 | 0.848 / 0.952 | 0.947 / 0.941 | 0.947 / 0.942 |
+| GB300 | 4 | 0.353 / 0.305 | 0.295 / 0.308 | 0.304 / 0.331 |
+| GB300 | 1,024 | 0.537 / 0.283 | 0.525 / 0.260 | 0.504 / 0.330 |
+
+Use the launcher above with one process per GPU. For the short SUM case,
+pass these arguments to `benchmark_distributed_embedding_collection.py`.
+Change `--pooling` for the other modes and set `--local_batch_size 128
+--max_seq_len 1024` for long bags. Add `--check` for a separate four-step
+comparison against TorchRec's distribution.
+
+```bash
+--output_dist hierarchical --pooling sum --num_tables 8 --features_per_table 1 \
+--num_embeddings 4000000 --embedding_dim 128 --local_batch_size 8192 --max_seq_len 4 \
+--key_dist pow-law --alpha 1.05 --seq_len_dist uniform --use_index_dedup \
+--warmup 20 --num_iterations 20 --profile_iterations 0 --seed 1234
+```
+
 #### Options
 
 | option | default | meaning |
@@ -883,12 +933,13 @@ commits after it.
 | `--key_range` | `--num_embeddings` | uniform keys are drawn from [0, key_range), pow-law ones from [1, key_range) |
 | `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks) or `hash_roundrobin` (hashed key mod ranks) |
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
-| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
+| `--pooling` | `none` | `none` for sequence embeddings, `sum` or `mean` for an EmbeddingBagCollection |
+| `--use_index_dedup` | off | For the sequence sharder, TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
 | `--num_iterations`, `--warmup` | 20, 20 | the timed iterations, and the untimed ones right before them (after the first call): the two run back to back, with no sync of the benchmark's between them, and a CUDA event before the first timed iteration and one after the last time them. At least 1 each |
 | `--seed` | 1234 | seed of the batches and of the output gradients (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
-| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, the same output gradients (+1 or -1 per element, as in the timed run), and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
+| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, the same output gradients (+1 or -1 per element, as in the timed run), and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. For sequence embeddings, outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. Pooled comparisons allow for differences in the order of reduction. The low-precision pooled check uses 0/−1 output gradients to limit cancellation. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |

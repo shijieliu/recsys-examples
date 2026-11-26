@@ -248,6 +248,14 @@ class HierOutputDist {
   at::Tensor output_dist_bwd(const std::vector<c10::optional<at::Tensor>> &bwd_plan,
                              const std::vector<int64_t> &counts, const at::Tensor &grad,
                              bool divide);
+  at::Tensor output_dist_fwd_pooled(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
+                                    const at::Tensor &lookup_out, const at::Tensor &offsets,
+                                    const at::Tensor &reverse_indices,
+                                    const c10::optional<at::Tensor> &weights);
+  at::Tensor output_dist_bwd_pooled(const std::vector<c10::optional<at::Tensor>> &bwd_plan,
+                                    const std::vector<int64_t> &counts, const at::Tensor &grad,
+                                    bool divide, const at::Tensor &offsets,
+                                    const c10::optional<at::Tensor> &weights);
   // Collective, after the op's last call, on every rank: syncs this rank's
   // device and meets the other ranks over the op's communicator. No peer
   // then reads this rank's window or sends it a credit any more, so the

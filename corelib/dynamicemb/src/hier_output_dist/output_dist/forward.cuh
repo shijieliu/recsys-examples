@@ -275,7 +275,7 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
 // (count_pulls: index dedup's heavy rows across nodes) at this rank; and the
 // task into the timeline. The warp copy keeps kVectors vectors in flight per
 // lane.
-template <int kVectors>
+template <int kVectors, bool kUnique>
 __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &args,
                                           const OutTables &tables, const Pull &pull,
                                           bool count_pulls, int lane) {
@@ -285,8 +285,13 @@ __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &arg
   const bool remote = pull.remote;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  warp_copy_fanout<kVectors>(pull.src, pull.dedup_row, num_rows, vec, lane, plan.fanout, args.out,
-                             row_bytes, remote);
+  if constexpr (kUnique) {
+    // The bag reduction reads this requester-local row for every occurrence.
+    warp_copy_rows<kVectors>(pull.src, args.out + pull.dedup_row * row_bytes, num_rows, vec, lane);
+  } else {
+    warp_copy_fanout<kVectors>(pull.src, pull.dedup_row, num_rows, vec, lane, plan.fanout, args.out,
+                               row_bytes, remote);
+  }
   if (remote && plan.wraps(peer)) {
     // The task's rows are out of proxy_rows (the warp's loads, before the
     // release).
@@ -731,7 +736,7 @@ __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev
 // word before it (arrive0), and the call (args). It is built once for each
 // GIN backend (kGin, gin_context); NCCL_GIN_TYPE_NONE is the kernel for one
 // node (kMulti false).
-template <ncclGinType_t kGin>
+template <ncclGinType_t kGin, bool kUnique = false>
 __global__ void __launch_bounds__(kThreads, 1)
     fwd_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq, int64_t arrive0,
                FwdArgs args) {
@@ -753,7 +758,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
   } else {
     const OutTables tables(window, sizes, args.plan);
-    const int64_t heavy_subs = fanout.count[1];
+    const int64_t heavy_subs = kUnique ? 0 : fanout.count[1];
     // the rows pulled from each proxy are counted (pulled_from_proxy): index
     // dedup's heavy rows of other nodes at a proxy whose stream wraps the ring
     // copy on from their first original row (fwd::heavy_sub_warp)
@@ -791,12 +796,12 @@ __global__ void __launch_bounds__(kThreads, 1)
       return true;
     };
     for (int64_t task = tasks.next_warp(ready); task >= 0; task = tasks.next_warp(ready)) {
-      if (task >= local + remote) {  // the late pass of the heavy rows' sub-tasks
+      if (!kUnique && task >= local + remote) {  // the late pass of the heavy rows' sub-tasks
         fwd::heavy_sub_warp<kMulti, true>(sizes, seq, args, tables, task - local - remote, lane);
         continue;
       }
-      int64_t index = 0;
-      if (task < local && Interleave{num_row_tasks, heavy_subs}.is_sub(task, index)) {
+      int64_t index = task;
+      if (!kUnique && task < local && Interleave{num_row_tasks, heavy_subs}.is_sub(task, index)) {
         fwd::heavy_sub_warp<kMulti, false>(sizes, seq, args, tables, index, lane);
         continue;
       }
@@ -806,8 +811,8 @@ __global__ void __launch_bounds__(kThreads, 1)
       } else {
         if (!fwd::remote_pull_warp(sizes, seq, args, tables, task - local, lane, pull)) continue;
       }
-      fwd::pull_warp<kMulti ? fwd::kPullVectorsMulti : fwd::kPullVectors>(sizes, args, tables, pull,
-                                                                          count_pulls, lane);
+      fwd::pull_warp<kMulti ? fwd::kPullVectorsMulti : fwd::kPullVectors, kUnique>(
+          sizes, args, tables, pull, count_pulls, lane);
     }
   }
   if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on

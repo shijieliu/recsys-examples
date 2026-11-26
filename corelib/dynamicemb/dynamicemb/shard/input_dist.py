@@ -16,8 +16,12 @@
 from typing import List, Optional, Tuple
 
 import torch
-from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
-from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
+from dynamicemb_extensions import (
+    block_bucketize_sparse_features,
+    compute_dedup_lengths_cuda,
+    get_table_range,
+    segmented_unique_cuda,
+)
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
@@ -36,10 +40,44 @@ from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
+
 from ..scored_kjt import ScoredKeyedJaggedTensor
-from .hier_output_dist import DynamicEmbSequenceShardingContext, HierDist
+from .hier_output_dist import (
+    DynamicEmbSequenceShardingContext,
+    HierDist,
+    PooledHierShardingContext,
+)
 
 torch.fx.wrap("len")
+
+
+def deduplicate_features(features, table_offsets, needs_counters, device_sized):
+    """Deduplicate within each table, retaining the original-to-unique row map."""
+    values = features.values().contiguous()
+    offsets = features.offsets().long()
+    total_bags = offsets.numel() - 1
+    if values.numel() == 0:
+        empty = offsets.new_empty(0)
+        return values, empty, empty, features.lengths().long(), offsets
+    table_range = get_table_range(offsets, table_offsets)
+    count, keys, reverse, ends, counts = segmented_unique_cuda(
+        values.long() if values.dtype == torch.int32 else values,
+        table_range,
+        table_offsets.numel() - 1,
+        offsets.new_empty(0) if needs_counters else None,
+    )
+    lengths, dedup_offsets = compute_dedup_lengths_cuda(
+        ends,
+        table_offsets,
+        table_offsets.numel() - 1,
+        total_bags // len(features.keys()),
+        total_bags,
+    )
+    if not device_sized:
+        n = count.item()
+        keys, counts = keys[:n], counts[:n]
+    return keys.to(values.dtype), reverse, counts, lengths, dedup_offsets
 
 
 def dist_type_codes(
@@ -363,7 +401,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             dist_type_per_feature=self._dist_type_tensor,
         )
 
-    def hier_setup(self, weighted: bool, index_dedup: bool) -> bool:
+    def hier_setup(self, weighted: bool, index_dedup: Optional[bool]) -> bool:
         """Whether the sharding takes its hierarchical dist; the first call
         builds it, collectively (``HierDist.setup``), with this input
         dist's rule of each feature. ``weighted``: the keys carry weights
@@ -433,6 +471,35 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         )
 
 
+class RwPooledHierInputDist(RwSparseFeaturesDist):
+    """Keep the bags on the requester and send table-unique keys to the owners."""
+
+    def __init__(self, *args, table_offsets, frequency_counters, is_weighted, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("_table_offsets", table_offsets, persistent=False)
+        self._frequency_counters = frequency_counters
+        self._is_weighted = is_weighted
+
+    def forward(self, features):
+        enabled = self.hier_setup(self._frequency_counters, None)
+        if not enabled or not self.training or features.variable_stride_per_key():
+            return super().forward(features)
+        keys, reverse, counts, lengths, offsets = deduplicate_features(
+            features, self._table_offsets, self._frequency_counters, True
+        )
+        unique = KeyedJaggedTensor(
+            keys=features.keys(),
+            values=keys,
+            lengths=lengths,
+            offsets=offsets,
+            weights=counts.float() if self._frequency_counters else None,
+            stride=features.stride(),
+        )
+        weights = features.weights_or_none() if self._is_weighted else None
+        context = PooledHierShardingContext(features, reverse, weights)
+        return self.hier_forward(unique, features, reverse, context)
+
+
 class HierStartAwaitable(Awaitable[Awaitable[KeyedJaggedTensor]]):
     """The first wait of a call on the hierarchical dist: its input dist is
     queued already, so the wait returns the second at once."""
@@ -440,6 +507,10 @@ class HierStartAwaitable(Awaitable[Awaitable[KeyedJaggedTensor]]):
     def __init__(self, second: "HierKJTAwaitable") -> None:
         super().__init__()
         self._second = second
+
+    @property
+    def sharding_context(self):
+        return self._second._sharding_ctx
 
     def _wait_impl(self) -> "HierKJTAwaitable":
         return self._second

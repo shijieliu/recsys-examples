@@ -46,10 +46,15 @@ __device__ __forceinline__ int4 scaled(float *vals, float scale) {
 // Vector `col` of the gradient rows of original rows exp_idx[begin .. end),
 // begin < end, summed in fp32 in that order into acc, Depth rows' loads in
 // flight.
-template <typename RowT, int Depth = 4>
+template <typename RowT, int Depth = 4, bool kWeighted = false>
 __device__ __forceinline__ void sum_vec(const char *grad, const int32_t *exp_idx, int64_t begin,
-                                        int64_t end, int row_bytes, int col, float *acc) {
+                                        int64_t end, int row_bytes, int col, float *acc,
+                                        const float *weights = nullptr) {
   Vec16<RowT>::get(acc, __ldcg((const int4 *)(grad + (int64_t)exp_idx[begin] * row_bytes) + col));
+  if constexpr (kWeighted) {
+#pragma unroll
+    for (int i = 0; i < Vec16<RowT>::kValues; ++i) acc[i] *= weights[begin];
+  }
   for (int64_t entry = begin + 1; entry < end; entry += Depth) {
     int4 vecs[Depth];
 #pragma unroll
@@ -59,8 +64,18 @@ __device__ __forceinline__ void sum_vec(const char *grad, const int32_t *exp_idx
               ? __ldcg((const int4 *)(grad + (int64_t)exp_idx[entry + step] * row_bytes) + col)
               : make_int4(0, 0, 0, 0);
 #pragma unroll
-    for (int step = 0; step < Depth; ++step)
-      if (entry + step < end) Vec16<RowT>::add(acc, vecs[step]);
+    for (int step = 0; step < Depth; ++step) {
+      if (entry + step >= end) break;
+      if constexpr (kWeighted) {
+        float vals[Vec16<RowT>::kValues];
+        Vec16<RowT>::get(vals, vecs[step]);
+        const float weight = weights[entry + step];
+#pragma unroll
+        for (int i = 0; i < Vec16<RowT>::kValues; ++i) acc[i] += vals[i] * weight;
+      } else {
+        Vec16<RowT>::add(acc, vecs[step]);
+      }
+    }
   }
 }
 
@@ -91,9 +106,9 @@ __device__ __forceinline__ void load_fp32(const float *row, int col, float *vals
 // vector) pairs as in warp_copy_rows, 4 vectors in flight per lane. A row
 // whose dst is nullptr is skipped, and one whose src alone is nullptr gets
 // zeros.
-template <typename RowT>
+template <typename RowT, bool kWeighted = false>
 __device__ __forceinline__ void scaled_copy_rows(const char *src, char *dst, int num_rows, int vec,
-                                                 int lane, float scale) {
+                                                 int lane, float scale, float weight = 1.0f) {
   const int total = num_rows * vec;
   for (int base = 0; base < total; base += 32 * 4) {
     int4 vecs[4];
@@ -111,9 +126,15 @@ __device__ __forceinline__ void scaled_copy_rows(const char *src, char *dst, int
       const int idx = base + step * 32 + lane;
       const int row = idx / vec;
       char *dst_row = from_lane(dst, row & 31);
+      float row_weight;
+      if constexpr (kWeighted) row_weight = __shfl_sync(kFull, weight, row & 31);
       if (idx < total && dst_row != nullptr) {
         float vals[Vec16<RowT>::kValues];
         Vec16<RowT>::get(vals, vecs[step]);
+        if constexpr (kWeighted) {
+#pragma unroll
+          for (int i = 0; i < Vec16<RowT>::kValues; ++i) vals[i] *= row_weight;
+        }
         *((int4 *)dst_row + (idx - row * vec)) = scaled<RowT>(vals, scale);
       }
     }
@@ -199,7 +220,11 @@ __global__ void __launch_bounds__(kThreads) bwd_heavy_partial_kernel(Sizes sizes
     float *part = args.partial + sub * dim;
     for (int col = lane; col < vec; col += lanes) {
       float acc[kValues];
-      sum_vec<RowT, 8>(args.grad, fanout.exp_idx, begin, end, sizes.row_bytes, col, acc);
+      if (args.weights != nullptr)
+        sum_vec<RowT, 8, true>(args.grad, fanout.exp_idx, begin, end, sizes.row_bytes, col, acc,
+                               args.weights);
+      else
+        sum_vec<RowT, 8>(args.grad, fanout.exp_idx, begin, end, sizes.row_bytes, col, acc);
       store_fp32<kValues>(part, col, acc);
     }
   }
@@ -326,7 +351,13 @@ __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
     cnt = fanout.exp_off[dedup_row + 1] - first_entry;
     if (cnt == 1) src = args.grad + (int64_t)fanout.exp_idx[first_entry] * row_bytes;
   }
-  scaled_copy_rows<RowT>(src, cnt <= 1 ? dst : nullptr, num_rows, vec, lane, args.scale);
+  if (args.weights != nullptr) {
+    const float weight = cnt == 1 ? args.weights[first_entry] : 1.0f;
+    scaled_copy_rows<RowT, true>(src, cnt <= 1 ? dst : nullptr, num_rows, vec, lane, args.scale,
+                                 weight);
+  } else {
+    scaled_copy_rows<RowT>(src, cnt <= 1 ? dst : nullptr, num_rows, vec, lane, args.scale);
+  }
   for (unsigned many = __ballot_sync(kFull, cnt > 1); many; many &= many - 1) {
     const int src_lane = __ffs(many) - 1;
     const int64_t lane_begin = __shfl_sync(kFull, first_entry, src_lane);
@@ -336,8 +367,12 @@ __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
     if (lane_count <= kHeavy) {
       for (int col = lane; col < vec; col += 32) {
         float acc[Vec16<RowT>::kValues];
-        sum_vec<RowT>(args.grad, fanout.exp_idx, lane_begin, lane_begin + lane_count, row_bytes,
-                      col, acc);
+        if (args.weights != nullptr)
+          sum_vec<RowT, 4, true>(args.grad, fanout.exp_idx, lane_begin, lane_begin + lane_count,
+                                 row_bytes, col, acc, args.weights);
+        else
+          sum_vec<RowT>(args.grad, fanout.exp_idx, lane_begin, lane_begin + lane_count, row_bytes,
+                        col, acc);
         *((int4 *)lane_dst + col) = scaled<RowT>(acc, args.scale);
       }
       continue;

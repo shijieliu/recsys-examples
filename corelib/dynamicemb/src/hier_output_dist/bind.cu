@@ -106,6 +106,14 @@ void bind_hier_output_dist(py::module &py_module) {
       .def("output_dist_bwd", &HierOutputDist::output_dist_bwd, py::arg("bwd_plan"),
            py::arg("counts"), py::arg("grad"), py::arg("divide"),
            "The output dist's backward kernel: the gradient of the lookup output")
+      .def("output_dist_fwd_pooled", &HierOutputDist::output_dist_fwd_pooled,
+           py::arg("fwd_plan"), py::arg("lookup_out"), py::arg("offsets"), py::arg("reverse_indices"),
+           py::arg("weights") = py::none(),
+           "Pull requester-unique rows and sum them into [batch, features * dim]")
+      .def("output_dist_bwd_pooled", &HierOutputDist::output_dist_bwd_pooled,
+           py::arg("bwd_plan"), py::arg("counts"), py::arg("grad"), py::arg("divide"),
+           py::arg("offsets"), py::arg("weights") = py::none(),
+           "Return the lookup gradients of pooled bags")
       .def("quiesce", &HierOutputDist::quiesce, py::call_guard<py::gil_scoped_release>(),
            "Collective, after the last call: the teardown then frees the window at once")
       .def("memory", &HierOutputDist::memory)

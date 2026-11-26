@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-GPU benchmark for a row-wise sharded DynamicEmb EmbeddingCollection.
+"""Multi-GPU benchmark for row-wise DynamicEmb embedding and embedding bag collections.
 
 Every table lives entirely in HBM (no caching, no host memory), and only
 the embedding is timed. Each rank draws two batches whose sequence lengths
@@ -76,13 +76,22 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder, quiesce
-from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
-from dynamicemb.shard.hier_output_dist import RwSequenceHierEmbeddingDist
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    DynamicEmbeddingCollectionSharder,
+    ShardedDynamicEmbeddingBagCollection,
+    ShardedDynamicEmbeddingCollection,
+    quiesce,
+)
+from dynamicemb.shard.hier_output_dist import (
+    RwPooledHierEmbeddingDist,
+    RwSequenceHierEmbeddingDist,
+)
 from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.autograd import DeviceType
 from torch.autograd.profiler import record_function
 from torchrec.distributed.embedding import EmbeddingCollectionAwaitable
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionAwaitable
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
     KJTListAwaitable,
@@ -96,7 +105,7 @@ from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
-from torchrec.modules.embedding_configs import DataType
+from torchrec.modules.embedding_configs import DataType, PoolingType
 from torchrec.sparse.jagged_tensor import JaggedTensor
 from torchrec.streamable import Pipelineable
 
@@ -142,6 +151,7 @@ class BenchConfig:
     optimizer: str = "sgd"
     learning_rate: float = 0.01
     use_index_dedup: bool = False
+    pooling: str = "none"
     output_dist: str = "torchrec"
     capacity: str = "measure"  # an int, or measure: from the batches
     capacity_factor: float = 1.25
@@ -169,6 +179,7 @@ class BenchConfig:
             f"T{self.num_tables}_D{self.embedding_dim}_B{self.local_batch_size}"
             f"_L{self.max_seq_len}{self.seq_len_dist[0]}_{self.key_dist}"
             f"_{self.emb_dtype}_dedup{int(self.use_index_dedup)}_{self.output_dist}"
+            + (f"_{self.pooling}" if self.pooling != "none" else "")
             + (f"_F{self.features_per_table}" if self.features_per_table > 1 else "")
             + (f"_{self.pipeline}" if self.pipeline != "none" else "")
         )
@@ -230,32 +241,47 @@ def with_output_grads(
     rank: int,
     device: torch.device,
     batches: List[torchrec.KeyedJaggedTensor],
+    nonpositive: bool = False,
 ) -> List["Batch"]:
-    """``batches`` with the gradients their embeddings get in the backward
-    (:func:`inject_grads`), drawn here, once. They come from one buffer of
-    this rank's: as many rows as the largest batch has keys,
-    ``embedding_dim`` columns, in the lookup's output dtype, each element +1
-    or -1 (exact in every dtype, which ``--check`` needs). Its generator is
-    its own, seeded by ``cfg.seed`` and ``rank``, so every run of a
-    configuration gets the same, whatever its dists. A batch's gradients are
-    the buffer's first rows, one per key, in the KJT's order: the order of the
-    EC's output (:func:`install_flat_output`).
+    """Precompute each batch's output gradient from a rank-local seeded buffer.
+
+    EC takes one row per key in KJT order. EBC takes one row per sample with
+    the features concatenated, in KeyedTensor order. Timing uses independent
+    -1/+1 entries. The low-precision pooling check uses independent 0/-1
+    entries to keep bags well-conditioned across SGD steps.
     """
-    # keys per batch, from the lengths: a KJT keeps the totals it is asked
+    # EC uses one gradient per key, EBC one per bag.
+    # Keys per batch, from the lengths: a KJT keeps the totals it is asked
     # for, and a call on it must find its own
-    counts = [int(kjt.lengths().sum()) for kjt in batches]
+    pooled = cfg.pooling != "none"
+    counts = (
+        [cfg.local_batch_size] * len(batches)
+        if pooled
+        else [int(kjt.lengths().sum()) for kjt in batches]
+    )
+    width = cfg.embedding_dim * (
+        cfg.num_tables * cfg.features_per_table if pooled else 1
+    )
     # seeded apart from the batches (generate_batches)
     generator = torch.Generator(device=device)
     generator.manual_seed(cfg.seed * 7919 + rank + (1 << 32))
     grad = torch.randint(
         0,
         2,
-        (max(counts), cfg.embedding_dim),
+        (max(counts), width),
         generator=generator,
         device=device,
-        dtype=_OUTPUT_DTYPES[cfg.output_dtype].as_dtype(),
+        # TorchRec divides the MEAN output by its fp32 divisor.
+        dtype=torch.float32
+        if cfg.pooling == "mean"
+        else _OUTPUT_DTYPES[cfg.output_dtype].as_dtype(),
     )
-    grad.mul_(2).sub_(1)
+    if nonpositive:
+        # Low-precision pool checks keep SGD updates nonnegative so near-zero
+        # cancelled bags do not dominate the relative error against TorchRec.
+        grad.neg_()
+    else:
+        grad.mul_(2).sub_(1)
     return [Batch(kjt, grad[:count]) for kjt, count in zip(batches, counts)]
 
 
@@ -301,19 +327,19 @@ class Batch(Pipelineable):
 
 
 class EmbeddingModel(torch.nn.Module):
-    """The EC, with no loss: ``forward(batch)`` returns a zero in its place,
-    whose backward gives the embeddings the batch's gradients
-    (:func:`inject_grads`), and the embeddings (one JaggedTensor over all
-    features: :func:`install_flat_output`), as TorchRec's train pipelines
-    expect."""
+    """Wrap an EC or EBC for the plain loop and TorchRec's train pipelines.
 
-    def __init__(self, ec: torchrec.EmbeddingCollection) -> None:
+    The dummy loss injects a precomputed gradient into the collection output.
+    """
+
+    def __init__(self, ec: torch.nn.Module, pooled: bool) -> None:
         super().__init__()
         self.ec = ec
+        self.pooled = pooled
 
     def forward(self, batch: Batch):
         out = self.ec(batch.features)
-        return inject_grads(out, batch.grad), out
+        return inject_grads(out, batch.grad, self.pooled), out
 
 
 def build_model(
@@ -325,8 +351,11 @@ def build_model(
     init_mode: DynamicEmbInitializerMode = DynamicEmbInitializerMode.NORMAL,
 ) -> DistributedModelParallel:
     """The EC of ``cfg`` on ``output_dist``, in an :class:`EmbeddingModel`."""
+    pooled = cfg.pooling != "none"
+    table_config = torchrec.EmbeddingBagConfig if pooled else torchrec.EmbeddingConfig
+    pool_options = {"pooling": PoolingType(cfg.pooling.upper())} if pooled else {}
     tables = [
-        torchrec.EmbeddingConfig(
+        table_config(
             name=table_name(i),
             embedding_dim=cfg.embedding_dim,
             num_embeddings=cfg.num_embeddings,
@@ -335,10 +364,14 @@ def build_model(
                 for j in range(cfg.features_per_table)
             ],
             data_type=_TABLE_DTYPES[cfg.emb_dtype],
+            **pool_options,
         )
         for i in range(cfg.num_tables)
     ]
-    ec = torchrec.EmbeddingCollection(tables=tables, device=torch.device("meta"))
+    collection = (
+        torchrec.EmbeddingBagCollection if pooled else torchrec.EmbeddingCollection
+    )
+    ec = collection(tables=tables, device=torch.device("meta"))
 
     opt = _OPTIMIZERS[cfg.optimizer]
     constraints = {}
@@ -377,11 +410,13 @@ def build_model(
         "learning_rate": cfg.learning_rate,
         "output_dtype": _OUTPUT_DTYPES[cfg.output_dtype],
     }
-    sharder = DynamicEmbeddingCollectionSharder(
-        fused_params=fused_params,
-        use_index_dedup=cfg.use_index_dedup,
-    )
-    model = EmbeddingModel(ec)
+    if pooled:
+        sharder = DynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
+    else:
+        sharder = DynamicEmbeddingCollectionSharder(
+            fused_params=fused_params, use_index_dedup=cfg.use_index_dedup
+        )
+    model = EmbeddingModel(ec, pooled)
     plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
     return DistributedModelParallel(
         module=model, device=device, sharders=[sharder], plan=plan
@@ -434,7 +469,9 @@ def _hier_dists(model) -> List:
         output_dist._hier
         for module in model.modules()
         for output_dist in getattr(module, "_output_dists", []) or []
-        if isinstance(output_dist, RwSequenceHierEmbeddingDist)
+        if isinstance(
+            output_dist, (RwSequenceHierEmbeddingDist, RwPooledHierEmbeddingDist)
+        )
     ]
 
 
@@ -459,13 +496,16 @@ class _GradInjection(torch.autograd.Function):
         return None, ctx.out_grad
 
 
-def inject_grads(out: Dict[str, JaggedTensor], grad: torch.Tensor) -> torch.Tensor:
-    """In place of a loss over the looked-up embeddings ``out``, the EC's one
-    JaggedTensor over all features (:func:`install_flat_output`): a zero
-    whose backward gives its rows ``grad``, a row per key in the KJT's order.
-    It launches no kernel but that zero, and its host work does not grow
-    with the features. Opaque to the train pipelines' fx tracing."""
-    (values,) = [jagged.values() for jagged in out.values()]
+def inject_grads(out, grad: torch.Tensor, pooled: bool) -> torch.Tensor:
+    """Return a dummy loss that gives all output values the precomputed gradient.
+
+    Both the flat EC output and the EBC KeyedTensor expose one values
+    tensor. This function is opaque to train pipeline FX tracing.
+    """
+    if pooled:
+        values = out.values()  # batch x (features * dim) KeyedTensor
+    else:
+        (values,) = [jagged.values() for jagged in out.values()]
     # autograd would cast a gradient of another dtype (a kernel)
     assert values.shape == grad.shape and values.dtype == grad.dtype, (
         f"the output gradients are {tuple(grad.shape)} {grad.dtype}, the"
@@ -783,7 +823,14 @@ def _time_output_dist_launches() -> None:
 
     if not hasattr(ext, "HierOutputDist"):
         return
-    for method, direction in (("output_dist_fwd", 0), ("output_dist_bwd", 1)):
+    for method, direction in (
+        ("output_dist_fwd", 0),
+        ("output_dist_bwd", 1),
+        ("output_dist_fwd_pooled", 0),
+        ("output_dist_bwd_pooled", 1),
+    ):
+        if not hasattr(ext.HierOutputDist, method):
+            continue
         orig = getattr(ext.HierOutputDist, method)
 
         def launch(self, *args, _orig=orig, _direction=direction, **kwargs):
@@ -795,7 +842,7 @@ def _time_output_dist_launches() -> None:
         setattr(ext.HierOutputDist, method, launch)
 
 
-def install_stage_markers() -> None:
+def install_stage_markers(pooled: bool) -> None:
     """Wrap the sharded module's pieces in record_function ranges (while
     profiling), so the profiler can tell which stage launched each kernel,
     and in the per-call instrumentation of the timed iterations (_CALLS).
@@ -823,7 +870,12 @@ def install_stage_markers() -> None:
                 calls.step(3)
         return self.compute_and_output_dist(ctx, dist_input)
 
-    ShardedDynamicEmbeddingCollection.forward = forward
+    sharded = (
+        ShardedDynamicEmbeddingBagCollection
+        if pooled
+        else ShardedDynamicEmbeddingCollection
+    )
+    sharded.forward = forward
 
     # Under a train pipeline input_dist() and its waits run from the
     # pipeline, outside the module's forward.
@@ -834,9 +886,7 @@ def install_stage_markers() -> None:
 
         return wrapped
 
-    ShardedDynamicEmbeddingCollection.input_dist = in_stage(
-        ShardedDynamicEmbeddingCollection.input_dist
-    )
+    sharded.input_dist = in_stage(sharded.input_dist)
     for awaitable in (
         KJTListSplitsAwaitable,
         FusedKJTListSplitsAwaitable,
@@ -844,9 +894,7 @@ def install_stage_markers() -> None:
     ):
         awaitable._wait_impl = in_stage(awaitable._wait_impl)
 
-    orig_compute_and_output_dist = (
-        ShardedDynamicEmbeddingCollection.compute_and_output_dist
-    )
+    orig_compute_and_output_dist = sharded.compute_and_output_dist
 
     def compute_and_output_dist(self, ctx, input):
         for lookup in self._lookups:
@@ -855,15 +903,18 @@ def install_stage_markers() -> None:
             _wrap_once(output_dist, "output_dist")
         return orig_compute_and_output_dist(self, ctx, input)
 
-    ShardedDynamicEmbeddingCollection.compute_and_output_dist = compute_and_output_dist
+    sharded.compute_and_output_dist = compute_and_output_dist
 
-    orig_wait = EmbeddingCollectionAwaitable._wait_impl
+    awaitable = (
+        EmbeddingBagCollectionAwaitable if pooled else EmbeddingCollectionAwaitable
+    )
+    orig_wait = awaitable._wait_impl
 
     def _wait_impl(self):
         with _range(_STAGE_PREFIX + "output_dist_wait"):
             return orig_wait(self)
 
-    EmbeddingCollectionAwaitable._wait_impl = _wait_impl
+    awaitable._wait_impl = _wait_impl
 
 
 def _wrap_once(module: torch.nn.Module, stage: str) -> None:
@@ -886,8 +937,8 @@ def _wrap_once(module: torch.nn.Module, stage: str) -> None:
 # losses).
 _BACKWARD_STAGES = [
     (re.compile(r"DynamicEmbeddingFunction"), "lookup"),
-    (re.compile(r"All2All_Seq"), "output_dist"),
-    (re.compile(r"_OutputFunction"), "output_dist"),
+    (re.compile(r"All2All_Seq|ReduceScatter"), "output_dist"),
+    (re.compile(r"_(?:Pooled)?OutputFunction"), "output_dist"),
     (re.compile(r"IndexSelectBackward|GatherBackward"), "output_dist"),
 ]
 _FORWARD_STAGE_RE = re.compile(re.escape(_STAGE_PREFIX) + r"(\w+)")
@@ -1068,13 +1119,16 @@ class HierTraffic:
     there. A call costs the host one append: its tables are read afterwards.
     """
 
-    def __init__(self, rank: int, node_size: int):
+    def __init__(self, rank: int, node_size: int, pooled: bool):
         self.local_rank = rank % node_size
         self.node = rank // node_size
         self.local_size = node_size
         self.hier = None
         self.reset()
-        orig = RwSequenceHierEmbeddingDist.forward
+        output_dist = (
+            RwPooledHierEmbeddingDist if pooled else RwSequenceHierEmbeddingDist
+        )
+        orig = output_dist.forward
         traffic = self
 
         def forward(self_, local_embs, sharding_ctx=None):
@@ -1095,7 +1149,7 @@ class HierTraffic:
                 )
             return orig(self_, local_embs, sharding_ctx)
 
-        RwSequenceHierEmbeddingDist.forward = forward
+        output_dist.forward = forward
 
     def reset(self):
         self.enabled = False
@@ -1650,10 +1704,12 @@ def device_used() -> int:
 
 # Kernels of the hierarchical output dist, by name: the forward's, the
 # backward's, and the two that sum the heavy rows before the backward's.
-_OUTPUT_DIST_FWD_RE = re.compile(r"\bhier_output_dist::fwd_kernel\b")
+_OUTPUT_DIST_FWD_RE = re.compile(
+    r"\bhier_output_dist::(?:fwd_kernel|pooled::sum_(?:long_)?bags)\b"
+)
 _OUTPUT_DIST_BWD_RE = re.compile(r"\bhier_output_dist::bwd_kernel\b")
-_OUTPUT_DIST_HEAVY_RE = re.compile(
-    r"\bhier_output_dist::bwd_heavy_(?:partial|sum)_kernel\b"
+_OUTPUT_DIST_BWD_PREP_RE = re.compile(
+    r"\bhier_output_dist::(?:bwd_heavy_(?:partial|sum)_kernel|pooled::bag_indices)\b"
 )
 
 
@@ -1662,8 +1718,8 @@ def output_dist_kernel_times(prof) -> List[List[float]]:
     the GPU ms of the hierarchical output dist's forward kernel and of its
     backward kernels, each with its wait at the entry for the other ranks, in
     call order (each backward with the forward kernel before it). The
-    backward's time adds the heavy rows' kernels (when they run) to the
-    backward kernel. Empty for TorchRec's output dist."""
+    times include requester-local bag reductions and gradient-index mapping
+    for EBC and the heavy-row kernels when they run. Empty for TorchRec's dist."""
     kernels = sorted(
         (event.time_range.start, event.time_range.end, event.name)
         for event in prof.events()
@@ -1671,19 +1727,19 @@ def output_dist_kernel_times(prof) -> List[List[float]]:
         and (
             _OUTPUT_DIST_FWD_RE.search(event.name)
             or _OUTPUT_DIST_BWD_RE.search(event.name)
-            or _OUTPUT_DIST_HEAVY_RE.search(event.name)
+            or _OUTPUT_DIST_BWD_PREP_RE.search(event.name)
         )
     )
-    calls, fwd, heavy = [], 0.0, 0.0
+    calls, fwd, bwd_prep = [], 0.0, 0.0
     for begin, end, name in kernels:
         ms = (end - begin) / 1e3
-        if _OUTPUT_DIST_HEAVY_RE.search(name):
-            heavy += ms
+        if _OUTPUT_DIST_BWD_PREP_RE.search(name):
+            bwd_prep += ms
         elif _OUTPUT_DIST_BWD_RE.search(name):
-            calls.append([fwd, heavy + ms])
-            heavy = 0.0
+            calls.append([fwd, bwd_prep + ms])
+            fwd, bwd_prep = 0.0, 0.0
         else:
-            fwd = ms
+            fwd += ms
     return calls
 
 
@@ -1789,7 +1845,9 @@ def check_against_torchrec(
     with fp32 rows the forward outputs must match bit for bit after every
     step. bf16 rows round the node sums of hot keys, and with any other
     world_size the sums of 1/world_size depend on their order, so both get a
-    tolerance.
+    tolerance. Pooled outputs can differ from the first step because TorchRec
+    rounds partial bags on the owners. The low-precision pooling fixture
+    draws 0/-1 output gradients to avoid cancellation in the updated rows.
 
     Keys come from at most an eighth of the table, so nothing is evicted: which
     rows a full table evicts is not deterministic, and two models evicting
@@ -1814,7 +1872,12 @@ def check_against_torchrec(
     debug = DynamicEmbInitializerMode.DEBUG
     output_dist = cfg.output_dist if cfg.output_dist != "torchrec" else "hierarchical"
     batches = generate_batches(cfg, rank, device, steps)
-    inputs = with_output_grads(cfg, rank, device, batches)
+    low_precision_pool = cfg.pooling != "none" and (
+        cfg.emb_dtype != "fp32" or cfg.output_dtype != "fp32"
+    )
+    inputs = with_output_grads(
+        cfg, rank, device, batches, nonpositive=low_precision_pool
+    )
     cfg = resolve_capacity(replace(cfg, output_dist=output_dist), batches, node_size)
     torchrec_model = build_model(cfg, device, world_size, local_size, "torchrec", debug)
     hier_model = build_model(cfg, device, world_size, local_size, output_dist, debug)
@@ -1826,6 +1889,14 @@ def check_against_torchrec(
         and cfg.output_dtype == "fp32"
         and (world_size & (world_size - 1)) == 0  # a power of two
     )
+    # In EBC the reference rounds each owner's partial bag to output_dtype
+    # before NCCL combines the partials. The hierarchical sum rounds once.
+    rtol = 1e-4 if exact else 1e-2
+    if cfg.pooling != "none":
+        rtol = max(
+            rtol, 2 * torch.finfo(_OUTPUT_DTYPES[cfg.output_dtype].as_dtype()).eps
+        )
+    atol = 1e-4 if exact else 1e-2
     ok = True
     _OUTPUT_DIST_COUNTS.clear()
     for step, batch in enumerate(inputs):
@@ -1836,22 +1907,27 @@ def check_against_torchrec(
         else:
             out_hier = pipeline.progress(fed)  # this batch's forward and backward
         for name in out_torchrec.keys():
-            expected, got = out_torchrec[name].values(), out_hier[name].values()
-            same = (
-                torch.equal(expected, got)
-                if step == 0 or exact
-                else torch.allclose(expected.float(), got.float(), rtol=1e-2, atol=1e-2)
+            expected, got = out_torchrec[name], out_hier[name]
+            if cfg.pooling == "none":
+                expected, got = expected.values(), got.values()
+            matches = (
+                expected == got
+                if cfg.pooling == "none" and (step == 0 or exact)
+                else torch.isclose(expected.float(), got.float(), rtol=rtol, atol=atol)
             )
-            if not same:
+            if not matches.all():
                 ok = False
-                bad = (expected != got).any(dim=1).nonzero().flatten()
+                bad = (~matches).any(dim=1).nonzero().flatten()
                 row = int(bad[0]) if bad.numel() else 0
-                diff = (expected.float() - got.float()).abs().max().item()
+                errors = (expected.float() - got.float()).abs()
+                diff = errors.max().item()
+                rel = (errors / expected.float().abs().clamp_min(atol)).max().item()
                 print(
                     f"[rank {rank}] step {step} {name}: {bad.numel()} of"
                     f" {expected.shape[0]} rows differ, max abs diff {diff:.3e}; row {row}:"
                     f" torchrec {expected[row, :4].tolist()}"
-                    f" hierarchical {got[row, :4].tolist()}",
+                    f" hierarchical {got[row, :4].tolist()}, max relative error "
+                    f"{rel:.3g}",
                     flush=True,
                 )
         loss_torchrec.backward()
@@ -1891,10 +1967,12 @@ def run(cfg: BenchConfig) -> Dict:
     # rows over NVLink and IB, the capacities, the trace), read collectively
     # before the timed iterations
     node_size = hier_node_size(local_size)
-    install_flat_output()
-    install_stage_markers()
+    pooled = cfg.pooling != "none"
+    if not pooled:
+        install_flat_output()
+    install_stage_markers(pooled)
     torchrec_traffic = TorchRecTraffic(rank, node_size)
-    hier_traffic = HierTraffic(rank, node_size)
+    hier_traffic = HierTraffic(rank, node_size, pooled)
     row_bytes = cfg.embedding_dim * _OUTPUT_DTYPES[cfg.output_dtype].as_dtype().itemsize
 
     if cfg.check:
@@ -1968,7 +2046,9 @@ def run(cfg: BenchConfig) -> Dict:
         torchrec_traffic.enabled = hier_traffic.enabled = False
         if hier_traffic.calls:
             return hier_traffic.per_iteration(len(hier_traffic.calls))
-        return torchrec_traffic.per_iteration(iterations)
+        # TorchRec EBC uses reduce-scatter, whose physical traffic depends on
+        # the NCCL algorithm. Sequence all-to-all split counts do not apply.
+        return {} if pooled else torchrec_traffic.per_iteration(iterations)
 
     torch.cuda.synchronize()
     mem0, reserved0 = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
@@ -2654,6 +2734,12 @@ def parse_args(argv: List[str]) -> BenchConfig:
         type=int,
         default=defaults.num_embeddings,
         help="rows per table, all ranks together",
+    )
+    parser.add_argument(
+        "--pooling",
+        choices=["none", "sum", "mean"],
+        default=defaults.pooling,
+        help="none benchmarks EmbeddingCollection, sum and mean benchmark EmbeddingBagCollection",
     )
     parser.add_argument("--embedding_dim", type=int, default=defaults.embedding_dim)
     parser.add_argument(

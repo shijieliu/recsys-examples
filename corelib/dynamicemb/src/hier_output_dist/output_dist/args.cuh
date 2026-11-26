@@ -44,6 +44,7 @@ struct FwdArgs {
 struct BwdArgs {
   BwdPlanView plan;
   const char *grad;           // [num_out, row] the gradient of the requester's output
+  const float *weights;       // optional bag weights in fanout.exp_idx order
   float *partial;             // [heavy_subs, dim] fp32 sums of the heavy rows' sub-tasks; a
                               // heavy row's first one ends as the row's sum (bwd_heavy_sum_kernel)
   int64_t *ready;             // across nodes, the proxy's [max_chunks]: keys of each chunk of

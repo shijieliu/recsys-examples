@@ -21,6 +21,7 @@ from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingContext,
     EmbeddingShardingInfo,
+    KJTListSplitsAwaitable,
 )
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, ShardingType
 from torchrec.distributed.embeddingbag import (
@@ -38,6 +39,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
 from ..scored_kjt import without_scores
+from .input_dist import HierStartAwaitable, RwPooledHierInputDist
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwPooledDynamicEmbeddingSharding
 from .twrw_sharding import TwRwPooledDynamicEmbeddingSharding
@@ -53,8 +55,22 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
         # Whether this collection's tables take a score per key; the same on every
         # rank. See :func:`collect_per_key_score`.
         self._per_key_score = per_key_score
+        self._direct_hier_input = False
+        self.register_buffer("_sum_feature_mask", None, persistent=False)
 
     def input_dist(self, ctx, features):
+        # TorchRec prepares the KJT under no_grad, including permutations
+        # that would discard this flag before the requester sees the weights.
+        if (
+            self._is_weighted
+            and torch.is_grad_enabled()
+            and isinstance(features, KeyedJaggedTensor)
+        ):
+            weights = features.weights_or_none()
+            if weights is not None and weights.requires_grad:
+                raise ValueError(
+                    "Pooling weights with requires_grad=True are unsupported"
+                )
         if self._per_key_score:
             if self.training:
                 require_scores(features)
@@ -63,7 +79,80 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
                 # any; one given is dropped here, on every rank alike, so the
                 # ranks agree on whether the distribution sends scores.
                 features = without_scores(features)
-        return super().input_dist(ctx, features)
+        # TorchRec's KJT.split reads the per-feature totals on the host even
+        # when the only split is the entire KJT. The hierarchical second wait
+        # already supplies those totals. After TorchRec initializes its feature
+        # order, pass that single split directly to its distributor.
+        if (
+            self.training
+            and self._direct_hier_input
+            and self._input_dists[0].hier.takes_hier_dist
+            and isinstance(features, KeyedJaggedTensor)
+            and not features.variable_stride_per_key()
+        ):
+            distributor = self._input_dists[0]
+            distributor.training = True
+            with torch.no_grad():
+                if self._has_features_permute:
+                    features = features.permute(
+                        self._features_order, self._features_order_tensor
+                    )
+                if self._has_mean_pooling_callback:
+                    lengths = features.lengths()
+                    weights = features.weights_or_none()
+                    if weights is not None:
+                        lengths = torch.ops.fbgemm.segment_sum_csr(
+                            1, features.offsets().int(), weights
+                        )
+                    # TorchRec adds epsilon to every divisor, including SUM
+                    # features of a mixed collection.
+                    divisor = lengths.reshape(-1, features.stride()).T
+                    if self._sum_feature_mask is not None:
+                        divisor = divisor.masked_fill(self._sum_feature_mask, 1)
+                    divisor = divisor + 1e-6
+                    width = self._embedding_dims[0]
+                    ctx.divisor = (
+                        divisor.unsqueeze(-1)
+                        .expand(-1, -1, width)
+                        .reshape(features.stride(), -1)
+                    )
+                request = distributor(features)
+            ctx.sharding_contexts.append(request.sharding_context)
+            return KJTListSplitsAwaitable([request], ctx)
+        # TorchRec keeps these lazy distributors in a plain list. A later
+        # eval()/train() must select the path for this batch as well.
+        for distributor in self._input_dists:
+            if isinstance(distributor, RwPooledHierInputDist):
+                distributor.training = self.training
+        pending = super().input_dist(ctx, features)
+        # EBC creates each context after calling that sharding's input dist.
+        # Use the context its hierarchical second wait will populate.
+        for i, request in enumerate(pending.awaitables):
+            if isinstance(request, HierStartAwaitable):
+                ctx.sharding_contexts[i] = request.sharding_context
+        return pending
+
+    def _create_input_dist(self, *args, **kwargs):
+        super()._create_input_dist(*args, **kwargs)
+        # Lazy modules start in training mode even when created by an eval call.
+        for input_dist in self._input_dists:
+            input_dist.training = self.training
+        self._direct_hier_input = len(self._input_dists) == 1 and isinstance(
+            self._input_dists[0], RwPooledHierInputDist
+        )
+        if self._direct_hier_input:
+            # Leave TorchRec in charge of remapping shared input features
+            # across tables in its mixed-pooling divisor.
+            features = self._embedding_shardings[0].feature_names()
+            if self._has_mean_pooling_callback and len(set(features)) != len(features):
+                self._direct_hier_input = False
+                return
+            if self._has_mean_pooling_callback:
+                sums = self._pooling_type_to_rs_features.get("SUM", ())
+                if sums:
+                    self._sum_feature_mask = torch.tensor(
+                        [f in sums for f in features], device=self._device
+                    )
 
     def reset_parameters(self) -> None:
         # TorchRec registers an empty weight for shards a rank does not hold but

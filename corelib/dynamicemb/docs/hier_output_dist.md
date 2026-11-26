@@ -234,7 +234,7 @@ DynamicEmbTableOptions(
 DynamicEmbeddingCollectionSharder(...)  # use_index_dedup=True with gradient clipping
 ```
 
-It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) of
+It serves `ROW_WISE` sequence and pooled shardings of
 `"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`). With a
 `"continuous"` table, `"hierarchical"` raises `ValueError` at the first
 `input_dist()` and `"auto"` takes TorchRec's dists (section 6). A call on
@@ -244,8 +244,7 @@ sharder's `use_index_dedup` (section 7.4). Tables that clip gradients need
 `"continuous"` table (section 6). The op carries no score per key:
 with tables that take one (`score_strategy` `PRECISE_CUSTOMIZED`),
 `"hierarchical"` raises `ValueError` when the model is sharded and `"auto"`
-takes TorchRec's dists. Pooled
-shardings (`EmbeddingBagCollection`) ignore `output_dist`. All DynamicEmb
+takes TorchRec's dists. All DynamicEmb
 tables of one sharding must agree on `output_dist`, `output_dist_capacity`
 and `node_dedup`, whatever their `output_dist`; otherwise building the
 sharding raises `ValueError`. Tables without DynamicEmb options (plain
@@ -257,6 +256,23 @@ stays allocated. It runs in a plain training loop and under TorchRec's train
 pipelines; the loop orders its steps on its streams (sections 4.2 and 16).
 Section 5.2 shows how to choose the capacities. Call `quiesce(model)` on
 every rank before you drop a model (section 4.6).
+
+#### Pooled collections
+
+Set the same `output_dist` and capacity on row-wise DynamicEmb tables in an
+`EmbeddingBagCollection` sharded with `DynamicEmbeddingBagCollectionSharder`.
+Set `EmbeddingBagConfig.pooling` on each table. SUM and MEAN can share a
+sharding, and weighted bags take the collection's per-sample FP32 weights.
+A supported training call fetches one row per requester-unique key into GPU
+memory. It sums the rows of each bag in FP32, writes zero for an empty bag,
+and returns the usual batch-major `KeyedTensor`. The backward maps each
+occurrence to its bag gradient and applies its weight while reducing by key.
+TorchRec's mean normalization uses the original bag lengths or weight sums.
+
+The window has a single row width. A sharding with mixed embedding dimensions
+uses TorchRec's pooled dists, as do eval calls and variable-stride batches.
+As in sequence training, all ranks must select the same path. Gradient
+clipping on a pooled sharding requires TorchRec's dists.
 
 ### 4.2 Requirements
 
@@ -3156,7 +3172,7 @@ TorchRec tables in the sharding (the default `--dynamicemb_num=2` of
 `test_sequence_embedding_fw.py`, and the incremental-dump cases that mix them
 with DynamicEmb tables); rows of 516 bytes (`--embedding_dim 129`); and a
 score per key (`per_key_score/`, and six models of
-`test_erase_distributed.py`). Pooled collections ignore `output_dist`.
+`test_erase_distributed.py`). Pooled coverage is in `test/unit_tests/test_hier_pooling.py`.
 
 The node's part of a call has hooks of its own in `testing.cu`:
 
@@ -3302,7 +3318,7 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
 
 ## 19. Limitations
 
-* **Scope**: row-wise sequence shardings of DynamicEmb tables, within the
+* **Scope**: row-wise sequence and pooled shardings of DynamicEmb tables, within the
   limits of section 4.2.
 * **The node is NCCL's LSA team** (sections 2 and 4.2), read once per group
   of ranks at the first `input_dist()`, with a short-lived NCCL

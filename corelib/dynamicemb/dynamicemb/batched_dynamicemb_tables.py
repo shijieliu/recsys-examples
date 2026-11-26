@@ -1323,6 +1323,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
         scores: Optional[Tensor] = None,
+        unpooled: bool = False,
     ) -> List[Tensor]:
         self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
@@ -1345,7 +1346,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Built per call because batch_size comes from the input; see
         # dynamicemb/lookup_layout.py for what the fields mean.
         layout = EmbeddingLayout(
-            pooling_mode=self.pooling_mode,
+            pooling_mode=DynamicEmbPoolingMode.NONE if unpooled else self.pooling_mode,
             batch_size=batch_size,
             feature_num=self.feature_num,
             num_keys=indices.numel(),

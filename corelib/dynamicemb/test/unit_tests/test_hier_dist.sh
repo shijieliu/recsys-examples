@@ -15,4 +15,7 @@ for nproc in 2 4 6 8; do
   echo "=== ${nproc} GPU(s) ==="
   torchrun --nnodes 1 --nproc_per_node "${nproc}" \
     ./test/unit_tests/test_hier_dist.py || exit 1
+  if [ "$nproc" -eq 2 ]; then
+    torchrun --nnodes 1 --nproc_per_node "$nproc" ./test/unit_tests/test_hier_pooling.py
+  fi
 done
