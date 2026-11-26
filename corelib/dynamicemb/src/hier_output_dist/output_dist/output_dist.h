@@ -78,12 +78,19 @@ class OutChannel {
   // lookup_rows of its node's owners and (across nodes) the proxy_rows of
   // its node's proxies, into a new tensor of plan.num_out() rows. lookup_out
   // must be the rows of lookup_rows the lookup wrote (zero copy).
-  at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);
+  at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out, bool unique = false);
+  // Pull one row per requester-unique key, then sum it into its original bags.
+  at::Tensor forward_pooled(const FwdPlan &plan, const at::Tensor &lookup_out,
+                            const at::Tensor &offsets, const at::Tensor &reverse_indices,
+                            const c10::optional<at::Tensor> &weights);
+  void backward_pooled(BwdPlan plan, bool divide, at::Tensor grad, const at::Tensor &offsets,
+                       const c10::optional<at::Tensor> &weights);
   // bwd_kernel on the current stream, after bwd_heavy_partial_kernel and
   // bwd_heavy_sum_kernel when the call has heavy rows: the gradient of this rank's rows back into
   // the lookup_rows of their owners (across nodes through the proxies, which sum each node-unique
   // key's), times 1 / world_size if `divide`. There each owner's lookup backward reads it.
-  void backward(const BwdPlan &plan, at::Tensor grad, bool divide);
+  void backward(const BwdPlan &plan, at::Tensor grad, bool divide,
+                const at::Tensor &weights = {});
 
   const Trace &trace() const { return trace_; }
 

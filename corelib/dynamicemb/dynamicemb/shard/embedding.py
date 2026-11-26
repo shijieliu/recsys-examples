@@ -17,11 +17,6 @@ from itertools import accumulate
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from dynamicemb_extensions import (
-    compute_dedup_lengths_cuda,
-    get_table_range,
-    segmented_unique_cuda,
-)
 from torch.autograd.profiler import record_function
 from torchrec.distributed.embedding import (
     EmbeddingCollectionContext,
@@ -57,6 +52,7 @@ from ..dynamicemb_config import (
 )
 from ..scored_kjt import ScoredKeyedJaggedTensor, without_scores
 from .hier_output_dist import DynamicEmbSequenceShardingContext
+from .input_dist import deduplicate_features
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 
@@ -240,9 +236,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         # key once per call (TorchRec's dists give it no
                         # counters), also on the hierarchical dist, whose
                         # calls deduplicate the keys whatever the flag.
-                        config.fused_params[
-                            "admission_counts_occurrences"
-                        ] = self._use_index_dedup
+                        config.fused_params["admission_counts_occurrences"] = (
+                            self._use_index_dedup
+                        )
             self._lookups.append(sharding.create_lookup())
 
     def _create_input_dist(
@@ -366,97 +362,15 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     ctx.frequency_counters.append(None)
                     features_by_shards.append(input_feature)
                     continue
-                hash_size_offset = self.get_buffer(f"_hash_size_offset_tensor_{i}")
                 d_table_offset = self.get_buffer(
                     f"_nonfuse_table_feature_offsets_device_{i}"
                 )
-                input_feature._values = input_feature._values.contiguous()
-
-                table_num = d_table_offset.numel() - 1
-                total_B = input_feature.offsets().numel() - 1
-                features = hash_size_offset.numel() - 1
-                local_batchsize = total_B // features
-
-                indices = input_feature.values()
-                offsets = input_feature.offsets().to(torch.int64)
-                num_elements = indices.numel()
                 needs_counters = self._needs_counters(i)
-
-                # Handle empty input
-                if num_elements == 0:
-                    dedup_features = KeyedJaggedTensor(
-                        keys=input_feature.keys(),
-                        lengths=input_feature.lengths().to(torch.int64),
-                        offsets=offsets,
-                        values=indices,
+                (unique_keys, reverse_idx, freq_counters, new_lengths, new_offsets) = (
+                    deduplicate_features(
+                        input_feature, d_table_offset, needs_counters, on_hier[i]
                     )
-                    if isinstance(input_feature, ScoredKeyedJaggedTensor):
-                        dedup_features = ScoredKeyedJaggedTensor.from_kjt(
-                            dedup_features, input_feature.scores()
-                        )
-                    ctx.input_features.append(input_feature)
-                    ctx.reverse_indices.append(
-                        torch.empty(0, dtype=torch.int64, device=self._device)
-                    )
-                    # No keys, so no counts. A sharding that needs counters still
-                    # gets an entry, empty, so input_dist sends empty weights as
-                    # the ranks with keys send theirs.
-                    ctx.frequency_counters.append(
-                        torch.empty(0, dtype=torch.uint64, device=self._device)
-                        if needs_counters
-                        else None
-                    )
-                    features_by_shards.append(dedup_features)
-                    continue
-
-                # Compute table boundary offsets from jagged offsets (O(T), fully on GPU)
-                segmented_range = get_table_range(offsets, d_table_offset)
-
-                # Prepare input_frequencies tensor to control frequency counting
-                input_frequencies = None
-                if needs_counters:
-                    input_frequencies = torch.empty(
-                        0, dtype=torch.int64, device=self._device
-                    )
-
-                # segmented_unique_cuda takes 64-bit keys. The lookup widens
-                # int32 indices to int64, so the dedup does the same.
-                indices_64bit = (
-                    indices.to(torch.int64) if indices.dtype == torch.int32 else indices
                 )
-
-                # Call segmented_unique_cuda
-                (
-                    num_uniques,
-                    unique_keys,
-                    reverse_idx,
-                    table_offsets,
-                    freq_counters,
-                ) = segmented_unique_cuda(
-                    indices_64bit,
-                    segmented_range,
-                    table_num,
-                    input_frequencies,
-                )
-
-                # Compute new lengths and offsets using GPU kernel
-                # new_lengths_size = total_B (total number of feature/batch buckets)
-                new_lengths, new_offsets = compute_dedup_lengths_cuda(
-                    table_offsets,
-                    d_table_offset,
-                    table_num,
-                    local_batchsize,
-                    total_B,
-                )
-
-                unique_keys = unique_keys.to(indices.dtype)
-                if not on_hier[i]:
-                    # Get unique values for the KJT
-                    # .item() implicitly syncs GPU to CPU
-                    total_unique = num_uniques.item()
-                    unique_keys = unique_keys[:total_unique]
-                    freq_counters = freq_counters[:total_unique]
-
                 dedup_features = KeyedJaggedTensor(
                     keys=input_feature.keys(),
                     lengths=new_lengths,

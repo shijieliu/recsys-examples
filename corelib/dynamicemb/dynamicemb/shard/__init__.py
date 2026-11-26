@@ -41,6 +41,7 @@ from .embedding import (
 )
 from .embeddingbag import (
     DynamicEmbeddingBagCollectionSharder,
+    LocalDynamicEmbeddingBagCollectionSharder,
     ShardedDynamicEmbeddingBagCollection,
 )
 from .hier_output_dist import node_size, quiesce
@@ -50,6 +51,7 @@ __all__ = [
     "DynamicEmbeddingCollectionSharder",
     "ShardedDynamicEmbeddingBagCollection",
     "DynamicEmbeddingBagCollectionSharder",
+    "LocalDynamicEmbeddingBagCollectionSharder",
     "node_size",
     "quiesce",
 ]

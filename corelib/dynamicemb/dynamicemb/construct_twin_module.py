@@ -34,6 +34,7 @@ from dynamicemb.planner import (
 from dynamicemb.shard import (
     DynamicEmbeddingBagCollectionSharder,
     DynamicEmbeddingCollectionSharder,
+    LocalDynamicEmbeddingBagCollectionSharder,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torch import nn
@@ -320,7 +321,12 @@ class ConstructTwinModule:
         )
 
         if isinstance(collection, EmbeddingBagCollection):
-            sharder = DynamicEmbeddingBagCollectionSharder(
+            bag_sharder = (
+                LocalDynamicEmbeddingBagCollectionSharder
+                if self._use_index_dedup
+                else DynamicEmbeddingBagCollectionSharder
+            )
+            sharder = bag_sharder(
                 qcomm_codecs_registry=qcomm_codecs_registry,
                 fused_params=fused_params,
             )

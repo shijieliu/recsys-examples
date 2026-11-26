@@ -73,7 +73,7 @@ bucketize by the same rule -- the supported `dist_type` values are:
 
 `roundrobin` sends a key to rank `key % world_size`, and `hash_roundrobin` to rank `murmur3_fmix64(key) % world_size`, where `world_size` is the number of ranks the table is split over. Both read the key as an unsigned 64-bit number. An int32 key is widened to int64 with its sign first, so it goes to the rank of the int64 key with the same value. That is the key the table stores and a checkpoint holds, and checkpoint load and `replay_increment` place each key by it.
 
-The hierarchical dist (`output_dist="hierarchical"`, see [Hierarchical sequence dist](#hierarchical-sequence-dist)) takes `roundrobin` and `hash_roundrobin` only.
+The hierarchical dist (`output_dist="hierarchical"`, see [Hierarchical dist](#hierarchical-dist)) takes `roundrobin` and `hash_roundrobin` only.
 
     ```python
     #How to import
@@ -232,6 +232,35 @@ With `use_index_dedup=True`, each rank deduplicates its indices per table before
 With `use_index_dedup=True` and an LFU score strategy or an admission strategy, each rank sends its deduplicated keys together with how often each one occurs (as the KJT weights), so that a table counts every occurrence.
 
 A training call on the hierarchical dist (`output_dist="hierarchical"` or `"auto"`) deduplicates the sharding's keys in the same way whatever `use_index_dedup` is, and its tables count the keys as on TorchRec's dists under the same flag: without it the keys carry the counts for LFU tables alone, and an admission strategy of a table that does not evict by LFU counts each key once per call. Tables that clip gradients need `use_index_dedup=True` there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), sections 6 and 7.4).
+
+## Choosing a sharder for pooled embeddings
+
+For row-wise `EmbeddingBagCollection` training, the sharder selects which
+rows cross the network. `EmbeddingBagConfig.pooling` selects SUM or MEAN
+independently on each table.
+
+| Sharder | Table option | Rows communicated |
+| --- | --- | --- |
+| `DynamicEmbeddingBagCollectionSharder` | Default | The owners pool their contributions and TorchRec reduce-scatters the pooled rows. A configured `output_dist_capacity` produces a warning. |
+| `LocalDynamicEmbeddingBagCollectionSharder` | `output_dist="torchrec"` (default) | The requester deduplicates keys per table. TorchRec exchanges unique rows and the requester pools its original bags. |
+| `LocalDynamicEmbeddingBagCollectionSharder` | `output_dist="hierarchical"` and `output_dist_capacity` | The requester deduplicates keys per table. The hierarchical dist fetches unique rows and pools the original bags. |
+
+```python
+from dynamicemb.shard import (
+    DynamicEmbeddingBagCollectionSharder,
+    DynamicEmbeddingCollectionSharder,
+    LocalDynamicEmbeddingBagCollectionSharder,
+)
+
+if pooled and use_index_dedup:
+    sharder = LocalDynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
+elif pooled:
+    sharder = DynamicEmbeddingBagCollectionSharder(fused_params=fused_params)
+else:
+    sharder = DynamicEmbeddingCollectionSharder(
+        fused_params=fused_params, use_index_dedup=use_index_dedup
+    )
+```
 
 ## DynamicEmbCheckMode
 
@@ -531,10 +560,10 @@ Rules:
   `(NO_EVICTION, PRECISE_CUSTOMIZED)`. Not with `admit_strategy`. It is its own
   strategy, so it cannot be combined with LFU.
 - **Sharding.** Row-wise only (EC and EBC), on TorchRec's dists: the
-  [hierarchical sequence dist](#hierarchical-sequence-dist) carries no score, so
-  in an `EmbeddingCollection` `output_dist="hierarchical"` raises `ValueError`
+  [hierarchical dist](#hierarchical-dist) carries no score, so
+  `output_dist="hierarchical"` raises `ValueError`
   when the model is sharded (a one-rank sharding warns instead) and `"auto"`
-  takes TorchRec's dists; an `EmbeddingBagCollection` ignores `output_dist`. No
+  takes TorchRec's dists. No
   variable batch size per key
   (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
   supported yet. Neither is an `external_storage` that is the only
@@ -1824,9 +1853,17 @@ The switching between training and evaluation modes should be consistent with `n
 
 Due to limited resources, the dynamic embedding table does not pre allocate memory for all keys. If a key appears for the first time during training, it will be initialized immediately during the training process. Please see `initializer_args` and `eval_initializer_args` in `DynamicEmbTableOptions` for more information.
 
-## Hierarchical sequence dist
+<a id="hierarchical-sequence-dist"></a>
 
-`output_dist="hierarchical"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
+## Hierarchical dist
+
+For a row-wise `EmbeddingCollection`, set
+`DynamicEmbTableOptions(output_dist="hierarchical", output_dist_capacity=...)`
+to use the hierarchical dist. A row-wise `EmbeddingBagCollection` uses those
+same table options with `LocalDynamicEmbeddingBagCollectionSharder`.
+See [Choosing a sharder for pooled embeddings](#choosing-a-sharder-for-pooled-embeddings).
+Evaluation, mixed embedding dimensions, and variable-stride batches use
+TorchRec's pooled distribution.
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
 - Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`. With a `continuous` table, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).

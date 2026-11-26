@@ -767,7 +767,7 @@ class DynamicEmbTableOptions:
     grouped onto shared storage."""
 
     output_dist: str = "torchrec"
-    """How a row-wise sequence (EmbeddingCollection) sharding moves keys to
+    """How a row-wise EmbeddingCollection or EmbeddingBagCollection moves keys to
     the ranks that own them and looked-up rows back. ``"torchrec"`` is
     TorchRec's input and output dists. ``"hierarchical"`` is the hierarchical
     dist: keys and rows move over NVLink inside a node and over the rails
@@ -786,7 +786,12 @@ class DynamicEmbTableOptions:
     the sharding is ``"continuous"``, takes a score per key or clips
     gradients without the sharder's index dedup, and TorchRec's dists (with
     a warning) elsewhere.
-    Pooled shardings ignore it.
+    For pooled collections, LocalDynamicEmbeddingBagCollectionSharder chooses
+    the row exchange from this option and pools on the requester.
+    DynamicEmbeddingBagCollectionSharder communicates owner-pooled rows and
+    warns if a capacity is configured.
+    Row-wise local pooling supports SUM and MEAN with one embedding dimension per
+    sharding. Variable-stride batches use TorchRec's pooled dists.
     Every DynamicEmb table of a sharding sets ``output_dist``,
     ``output_dist_capacity`` and ``node_dedup`` alike. See
     docs/hier_output_dist.md, section 4."""

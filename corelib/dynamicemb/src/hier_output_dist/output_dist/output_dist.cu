@@ -32,6 +32,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/output_dist/backward.cuh"
 #include "hier_output_dist/output_dist/forward.cuh"
 #include "hier_output_dist/output_dist/output_dist.h"
+#include "hier_output_dist/output_dist/pooling.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -40,16 +41,17 @@ namespace {
 
 // The kernels of GIN backend `gin` (gin_context; NCCL_GIN_TYPE_NONE: one
 // node).
+template <bool kUnique>
 const void *forward_kernel(ncclGinType_t gin) {
   switch (gin) {
     case NCCL_GIN_TYPE_PROXY:
-      return (const void *)fwd_kernel<NCCL_GIN_TYPE_PROXY>;
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_PROXY, kUnique>;
     case NCCL_GIN_TYPE_GDAKI:
-      return (const void *)fwd_kernel<NCCL_GIN_TYPE_GDAKI>;
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_GDAKI, kUnique>;
     case NCCL_GIN_TYPE_GPI:
-      return (const void *)fwd_kernel<NCCL_GIN_TYPE_GPI>;
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_GPI, kUnique>;
     default:
-      return (const void *)fwd_kernel<NCCL_GIN_TYPE_NONE>;
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_NONE, kUnique>;
   }
 }
 
@@ -81,6 +83,47 @@ const void *heavy_partial_kernel(at::ScalarType dtype) {
   return dtype == at::kFloat      ? (const void *)bwd_heavy_partial_kernel<float>
          : dtype == at::kBFloat16 ? (const void *)bwd_heavy_partial_kernel<__nv_bfloat16>
                                   : (const void *)bwd_heavy_partial_kernel<__half>;
+}
+
+// Pooled offsets describe the original KJT, before index dedup. The input
+// dist already consumes that KJT, so these checks need no device-host sync.
+int pooled_batch(const at::Tensor &offsets, const c10::optional<at::Tensor> &weights,
+                 int device, int features, int64_t occurrences) {
+  const int64_t bags = offsets.numel() - 1;
+  TORCH_CHECK(offsets.is_cuda() && offsets.get_device() == device && offsets.is_contiguous() &&
+                  offsets.dim() == 1 && (offsets.scalar_type() == at::kLong ||
+                                        offsets.scalar_type() == at::kInt) &&
+                  bags >= 0 && bags <= INT32_MAX && bags % features == 0,
+              "hier_output_dist: expected contiguous CUDA offsets for each feature and sample");
+  if (weights)
+    TORCH_CHECK(weights->device() == offsets.device() && weights->is_contiguous() &&
+                    weights->scalar_type() == at::kFloat && weights->dim() == 1 &&
+                    weights->numel() == occurrences,
+                "hier_output_dist: expected one contiguous fp32 CUDA weight per occurrence");
+  return (int)(bags / features);
+}
+
+template <typename Launch>
+void with_offsets(const at::Tensor &offsets, Launch launch) {
+  if (offsets.scalar_type() == at::kLong)
+    launch(offsets.data_ptr<int64_t>());
+  else
+    launch(offsets.data_ptr<int32_t>());
+}
+
+// Pass the row type as a tag to instantiate a kernel on that type.
+template <typename Launch>
+void with_row_type(at::ScalarType dtype, Launch launch) {
+  if (dtype == at::kFloat)
+    launch(float{});
+  else if (dtype == at::kHalf)
+    launch(__half{});
+  else
+    launch(__nv_bfloat16{});
+}
+
+int pooled_grid(int64_t items, int sms) {
+  return (int)std::min<int64_t>((items + pooled::kBlock - 1) / pooled::kBlock, 16 * sms);
 }
 
 }  // namespace
@@ -151,25 +194,90 @@ void OutChannel::launch(const void *kernel, OutKernel which, int ctas, Args &arg
   arrive_ += ctas;
 }
 
-at::Tensor OutChannel::forward(const FwdPlan &plan, const at::Tensor &lookup_out) {
+at::Tensor OutChannel::forward(const FwdPlan &plan, const at::Tensor &lookup_out, bool unique) {
   c10::cuda::CUDAGuard guard(device_);
   TORCH_CHECK(
       lookup_out.numel() == 0 || (lookup_out.is_cuda() && lookup_out.data_ptr() == lookup_rows_),
       "hier_output_dist: the lookup output must be the rows lookup_rows() returned");
-  at::Tensor out = output(plan.num_out());
+  at::Tensor out = output(unique ? plan.inv.numel() : plan.num_out());
   at::Tensor pulled_from_proxy;  // the kernel zeroes it
-  if (multi_node_)
+  if (multi_node_ && !unique)
     pulled_from_proxy = at::empty({sizes_.topo.local_size}, out.options().dtype(at::kLong));
   FwdArgs args{};
   args.plan = plan.view(sizes_);
   args.out = (char *)out.data_ptr();
   args.pulled_from_proxy =
       pulled_from_proxy.defined() ? pulled_from_proxy.data_ptr<int64_t>() : nullptr;
-  launch(forward_kernel(gin_), OutKernel::kForward, out_ctas(OutKernel::kForward), args);
+  launch(unique ? forward_kernel<true>(gin_) : forward_kernel<false>(gin_), OutKernel::kForward, out_ctas(OutKernel::kForward), args);
   return out;
 }
 
-void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
+at::Tensor OutChannel::forward_pooled(const FwdPlan &plan, const at::Tensor &lookup_out,
+                                      const at::Tensor &offsets, const at::Tensor &reverse_indices,
+                                      const c10::optional<at::Tensor> &weights) {
+  c10::cuda::CUDAGuard guard(device_);
+  const int features = sizes_.num_features, vecs = sizes_.row_vecs();
+  const int batch = pooled_batch(offsets, weights, device_, features, plan.num_out());
+  TORCH_CHECK(reverse_indices.device() == offsets.device() && reverse_indices.is_contiguous() &&
+                  reverse_indices.dim() == 1 && reverse_indices.scalar_type() == at::kLong &&
+                  reverse_indices.numel() == plan.num_out(),
+              "hier_output_dist: expected the input dist's CUDA reverse indices");
+  const at::Tensor rows = forward(plan, lookup_out, true);
+  at::Tensor out = at::empty({batch, features * dim_}, rows.options());
+  const int64_t bags = (int64_t)batch * features;
+  if (bags > 0) {
+    const bool long_bags = plan.num_out() >= 32 * bags;
+    const int grid = long_bags ? (int)std::min<int64_t>(bags * ((vecs + 31) / 32), 16 * sms_)
+                               : pooled_grid(bags * vecs, sms_);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
+    with_offsets(offsets, [&](const auto *off) {
+      with_row_type(dtype_, [&](auto tag) {
+        const int4 *src = (const int4 *)rows.data_ptr();
+        const int64_t *reverse = reverse_indices.data_ptr<int64_t>();
+        const float *weight = weights ? weights->data_ptr<float>() : nullptr;
+        int4 *dst = (int4 *)out.data_ptr();
+        if (long_bags)
+          pooled::sum_long_bags<decltype(tag)><<<grid, pooled::kBlock, 0, stream>>>(
+              src, reverse, off, weight, batch, features, vecs, dst);
+        else
+          pooled::sum_bags<decltype(tag)><<<grid, pooled::kBlock, 0, stream>>>(
+              src, reverse, off, weight, batch, features, vecs, dst);
+      });
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return out;
+}
+
+void OutChannel::backward_pooled(BwdPlan plan, bool divide, at::Tensor grad,
+                                 const at::Tensor &offsets, const c10::optional<at::Tensor> &weights) {
+  c10::cuda::CUDAGuard guard(device_);
+  const int features = sizes_.num_features;
+  const int64_t occurrences = plan.fanout.exp_idx.numel();
+  const int batch = pooled_batch(offsets, weights, device_, features, occurrences);
+  TORCH_CHECK(grad.device() == offsets.device() && grad.scalar_type() == dtype_ &&
+                  grad.dim() == 2 && grad.size(0) == batch && grad.size(1) == features * dim_,
+              "hier_output_dist: pooled gradient must match the pooled output's device, dtype and shape");
+  grad = grad.contiguous().view({(int64_t)batch * features, dim_});
+  at::Tensor sorted_weights;
+  if (occurrences) {
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
+    at::Tensor indices = at::empty_like(plan.fanout.exp_idx);
+    if (weights) sorted_weights = at::empty_like(*weights);
+    with_offsets(offsets, [&](const auto *off) {
+      pooled::bag_indices<<<pooled_grid(occurrences, sms_), pooled::kBlock, 0, stream>>>(
+          plan.fanout.exp_idx.data_ptr<int32_t>(), occurrences, off, batch, features,
+          indices.data_ptr<int32_t>(), weights ? weights->data_ptr<float>() : nullptr,
+          sorted_weights.defined() ? sorted_weights.data_ptr<float>() : nullptr);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    plan.fanout.exp_idx = indices;
+  }
+  backward(plan, grad, divide, sorted_weights);
+}
+
+void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide,
+                          const at::Tensor &weights) {
   c10::cuda::CUDAGuard guard(device_);
   grad = grad.contiguous();
   if (grad.numel() > 0 && (uintptr_t)grad.data_ptr() % 16 != 0) grad = grad.clone();
@@ -184,6 +292,7 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   BwdArgs args{};
   args.plan = plan.view(sizes_);
   args.grad = (const char *)grad.data_ptr();
+  args.weights = weights.defined() ? weights.data_ptr<float>() : nullptr;
   args.partial = partial.data_ptr<float>();
   args.ready = ready.defined() ? ready.data_ptr<int64_t>() : nullptr;
   args.reducers = reducers(ctas);

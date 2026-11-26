@@ -673,15 +673,16 @@ for DIST in torchrec hierarchical; do
 done      # $LAUNCH: the torchrun or srun prefix above
 ```
 
-Both dists also run without `--use_index_dedup`. TorchRec's dists then send
-every key, and the hierarchical dist's calls deduplicate their keys
-themselves.
+For sequence embeddings, both dists also run without `--use_index_dedup`.
+TorchRec's dists then send every key, and the hierarchical dist deduplicates
+its own keys. For pooled embeddings, the flag selects the representation
+communicated between GPUs. See [Pooled communication sweep](#pooled-communication-sweep).
 
 More runs on the same configuration:
 
-* `--check`: first compare the hierarchical dist with TorchRec's (section
-  *Options*); the exit status is 1 if they differ, or if any call ran on
-  TorchRec's dists.
+* `--check` compares four training steps with a TorchRec reference. For
+  pooled embeddings it also verifies which collective ran on every rank.
+  A mismatch exits with status 1. See *Options* for the sequence check.
 * `--pipeline sparse_dist` or `--pipeline prefetch`: TorchRec's
   `TrainPipelineSparseDist` or `PrefetchTrainPipelineSparseDist`.
 * `--trace --trace_out run.npz` (`hierarchical`, on a build with
@@ -865,6 +866,161 @@ holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
 These runs are of commit `45101458`; this batch was not timed again on the
 commits after it.
 
+#### Pooled communication sweep
+
+For row-wise pooled training, choose the sharder with `--use_index_dedup`
+and the transport for deduplicated rows with `--output_dist`. Each timing
+below includes the forward pass, backward pass, and SGD update.
+
+| Mode | Benchmark flags | Data communicated |
+| --- | --- | --- |
+| Owner pooling | `--output_dist torchrec` | Each owner pools its rows. TorchRec reduce-scatters the partial bags. |
+| Dedup + TorchRec | `--use_index_dedup --output_dist torchrec` | Requesters deduplicate keys per table. TorchRec all-to-all returns the unique rows for local pooling. |
+| Dedup + hierarchical | `--use_index_dedup --output_dist hierarchical` | The hierarchical dist fetches unique rows and reduces the original bags on the requester. |
+
+To reproduce a cell, select a flag set above and the table's `--pooling sum`
+or `--pooling mean`. Set `--features_per_table` to Features divided by 8,
+`--local_batch_size` to Samples/GPU, and `--max_seq_len` to Max bag length.
+The following shared options reproduce the ten workloads in the [benchmark
+sweep](#results).
+
+```bash
+--num_tables 8 --num_embeddings 4000000 --embedding_dim 128 \
+--emb_dtype fp32 --output_dtype fp32 --optimizer sgd --pipeline none \
+--key_dist pow-law --alpha 1.05 --seq_len_dist uniform --seed 1234 \
+--warmup 20 --num_iterations 20 --profile_iterations 0
+```
+
+Each cell gives **owner pooling / dedup + TorchRec / dedup + hierarchical**
+in milliseconds per training step (lower is faster). Each value is the median
+of three runs, using the rank-averaged CUDA event time over 20 steps following
+20 warmup steps. Every timed rank verified which output distribution it used.
+EOS ran on one, two, or four 8-GPU H100 hosts. GB300 ran on one, two, or four
+4-GPU trays in one NVLink rack per run. The first two GB300 rounds used the same
+rack. The third used two other racks across its jobs.
+
+Across the 30 shape and GPU-count combinations for each pooling operation,
+the median TorchRec all-to-all time divided by hierarchical time was
+**2.74× for SUM and 2.78× for MEAN on H100**, and **2.76× and 2.79× on
+GB300**. Hierarchical pooling was fastest in all 60 GB300 comparisons and
+51 of 60 on H100. On H100, owner pooling was fastest with 16 or 32 GPUs
+and maximum bag lengths of 4,096 or 8,192, and for MEAN with 32 GPUs and
+a maximum of 2,048.
+
+Some configurations varied across runs. For example, hierarchical SUM at
+2,048 features on 16 GB300s took 5.21, 2.06, and 7.20 ms. The table
+reports the 5.21 ms median.
+
+**H100 · SUM**
+
+| Features | Samples/GPU | Max bag length | 8 GPUs | 16 GPUs | 32 GPUs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 8,192 | 4 | 3.62 / 3.33 / 1.41 | 6.26 / 16.10 / 2.07 | 10.54 / 26.60 / 2.39 |
+| 8 | 16,384 | 4 | 5.42 / 4.08 / 1.54 | 10.19 / 6.95 / 2.64 | 18.78 / 9.13 / 3.09 |
+| 8 | 32,768 | 4 | 9.12 / 5.93 / 2.06 | 18.34 / 10.10 / 3.55 | 35.52 / 14.42 / 4.46 |
+| 1,024 | 128 | 4 | 6.46 / 5.17 / 1.66 | 12.01 / 8.93 / 2.78 | 22.18 / 12.38 / 3.29 |
+| 2,048 | 128 | 4 | 11.15 / 8.04 / 2.27 | 21.90 / 13.55 / 3.82 | 42.35 / 21.41 / 4.74 |
+| 4,096 | 128 | 4 | 20.54 / 13.65 / 3.46 | 42.03 / 23.83 / 5.82 | 83.46 / 39.28 / 7.38 |
+| 8 | 128 | 1,024 | 2.91 / 4.26 / 1.81 | 5.16 / 6.41 / 3.19 | 8.46 / 8.41 / 3.91 |
+| 8 | 128 | 2,048 | 3.61 / 6.09 / 2.58 | 7.58 / 10.39 / 4.56 | 5.94 / 12.45 / 5.82 |
+| 8 | 128 | 4,096 | 5.15 / 9.46 / 4.04 | 6.41 / 15.28 / 7.05 | 7.47 / 19.70 / 9.18 |
+| 8 | 128 | 8,192 | 8.89 / 15.72 / 6.73 | 10.33 / 25.00 / 11.23 | 12.45 / 32.22 / 14.75 |
+
+**H100 · MEAN**
+
+| Features | Samples/GPU | Max bag length | 8 GPUs | 16 GPUs | 32 GPUs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 8,192 | 4 | 3.71 / 3.47 / 1.52 | 6.25 / 19.48 / 2.15 | 11.00 / 24.24 / 2.49 |
+| 8 | 16,384 | 4 | 5.68 / 4.36 / 1.74 | 10.47 / 8.52 / 2.83 | 19.15 / 9.70 / 3.28 |
+| 8 | 32,768 | 4 | 9.66 / 6.46 / 2.43 | 18.89 / 10.91 / 3.92 | 36.42 / 14.90 / 4.83 |
+| 1,024 | 128 | 4 | 6.71 / 5.41 / 1.85 | 12.33 / 9.51 / 2.96 | 22.53 / 12.55 / 3.41 |
+| 2,048 | 128 | 4 | 11.65 / 8.55 / 2.63 | 22.44 / 14.15 / 4.17 | 43.19 / 21.91 / 5.10 |
+| 4,096 | 128 | 4 | 21.54 / 14.68 / 4.16 | 43.07 / 24.81 / 6.52 | 84.25 / 40.46 / 8.07 |
+| 8 | 128 | 1,024 | 2.97 / 4.26 / 1.84 | 6.92 / 6.61 / 3.21 | 8.31 / 10.90 / 3.92 |
+| 8 | 128 | 2,048 | 3.65 / 6.08 / 2.60 | 8.26 / 10.04 / 4.58 | 5.65 / 11.94 / 5.84 |
+| 8 | 128 | 4,096 | 5.21 / 9.47 / 4.06 | 6.35 / 14.92 / 7.07 | 7.39 / 19.27 / 9.23 |
+| 8 | 128 | 8,192 | 8.90 / 15.72 / 6.74 | 10.36 / 24.96 / 11.25 | 12.53 / 31.89 / 14.77 |
+
+**GB300 · SUM**
+
+| Features | Samples/GPU | Max bag length | 4 GPUs | 8 GPUs | 16 GPUs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 8,192 | 4 | 3.12 / 3.86 / 1.73 | 3.41 / 3.98 / 1.75 | 4.45 / 4.17 / 1.79 |
+| 8 | 16,384 | 4 | 3.33 / 4.09 / 1.69 | 4.28 / 4.18 / 1.71 | 6.42 / 4.73 / 1.74 |
+| 8 | 32,768 | 4 | 4.21 / 5.14 / 1.83 | 6.34 / 5.60 / 1.87 | 10.66 / 6.71 / 1.93 |
+| 1,024 | 128 | 4 | 3.88 / 4.66 / 1.77 | 5.25 / 5.19 / 1.79 | 8.26 / 6.69 / 1.81 |
+| 2,048 | 128 | 4 | 5.34 / 6.26 / 1.96 | 8.38 / 7.60 / 2.02 | 14.59 / 10.45 / 5.21 |
+| 4,096 | 128 | 4 | 8.48 / 9.68 / 2.66 | 14.44 / 12.46 / 2.74 | 26.75 / 21.82 / 2.82 |
+| 8 | 128 | 1,024 | 3.30 / 4.32 / 1.70 | 3.37 / 4.37 / 1.72 | 3.60 / 4.66 / 1.77 |
+| 8 | 128 | 2,048 | 3.90 / 5.76 / 2.11 | 3.88 / 5.80 / 2.18 | 4.19 / 5.99 / 2.24 |
+| 8 | 128 | 4,096 | 4.99 / 8.34 / 2.89 | 4.99 / 8.39 / 3.01 | 5.23 / 8.47 / 3.10 |
+| 8 | 128 | 8,192 | 7.46 / 13.11 / 4.39 | 7.21 / 13.14 / 4.57 | 7.51 / 13.52 / 4.69 |
+
+**GB300 · MEAN**
+
+| Features | Samples/GPU | Max bag length | 4 GPUs | 8 GPUs | 16 GPUs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 8,192 | 4 | 3.20 / 4.13 / 1.86 | 3.52 / 4.15 / 1.88 | 4.51 / 4.38 / 1.89 |
+| 8 | 16,384 | 4 | 3.49 / 4.21 / 1.82 | 4.48 / 4.43 / 1.84 | 6.62 / 4.94 / 1.83 |
+| 8 | 32,768 | 4 | 4.49 / 5.38 / 2.02 | 6.58 / 5.90 / 2.06 | 10.95 / 6.96 / 2.10 |
+| 1,024 | 128 | 4 | 4.05 / 4.76 / 1.91 | 5.45 / 5.43 / 1.93 | 8.46 / 6.89 / 1.99 |
+| 2,048 | 128 | 4 | 5.64 / 6.52 / 2.16 | 8.63 / 7.89 / 2.19 | 14.72 / 10.78 / 2.44 |
+| 4,096 | 128 | 4 | 9.05 / 10.25 / 3.02 | 15.06 / 13.03 / 3.09 | 27.25 / 18.98 / 3.17 |
+| 8 | 128 | 1,024 | 3.48 / 4.34 / 1.79 | 3.57 / 4.40 / 1.84 | 3.78 / 4.57 / 1.86 |
+| 8 | 128 | 2,048 | 3.99 / 5.74 / 2.10 | 4.08 / 5.88 / 2.18 | 4.24 / 6.36 / 2.25 |
+| 8 | 128 | 4,096 | 5.08 / 8.39 / 2.89 | 5.06 / 8.41 / 3.03 | 5.39 / 8.52 / 3.12 |
+| 8 | 128 | 8,192 | 7.48 / 13.16 / 4.40 | 7.29 / 13.17 / 4.60 | 7.66 / 13.49 / 4.72 |
+
+#### Hierarchical pooled versus unpooled embeddings
+
+`--pooling none` runs a row-wise EmbeddingCollection. `--pooling sum` and
+`--pooling mean` run a row-wise EmbeddingBagCollection with the same keys
+and table configuration. The benchmark injects gradients of the public
+output shape and includes the optimizer update in step time.
+
+| Hardware and ranks | Local batch | Max bag length | Unpooled (ms) | SUM (ms) | MEAN (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| EOS, 8 H100s on one host | 8,192 | 4 | 1.427 | 1.413 | 1.523 |
+| EOS, 8 H100s on one host | 128 | 1,024 | 1.782 | 1.817 | 1.831 |
+| EOS, 16 H100s across two hosts | 8,192 | 4 | 1.984 | 2.095 | 2.157 |
+| EOS, 16 H100s across two hosts | 128 | 1,024 | 3.125 | 3.253 | 3.224 |
+| GB300, 16 GPUs in one NVLink rack | 8,192 | 4 | 1.782 | 1.797 | 1.912 |
+| GB300, 16 GPUs in one NVLink rack | 128 | 1,024 | 1.800 | 1.769 | 1.890 |
+
+Each cell is the median of three runs on EOS or five runs on GB300. Each
+run used CUDA events over 20 training steps after 20 warmup steps, averaged
+over ranks. All runs used FP32 table and output rows, eight tables of four
+million keys, D=128, one feature per table, and SGD. Bag lengths were drawn
+uniformly from 1 to the maximum and keys from a power law with exponent
+1.05, with seed 1234. Both pooled modes ran the hierarchical forward and
+backward. EOS used GIN between hosts. The four GB300 trays formed a single
+NCCL LSA team.
+
+In separate W=16 `--kernel_times` runs, the median forward and backward
+GPU times in milliseconds were as follows. The timings include hierarchical
+communication, requester bag reduction and backward gradient mapping.
+The EBC mean normalization is included in the step timings above.
+
+| Hardware | Max bag length | Unpooled fwd / bwd | SUM fwd / bwd | MEAN fwd / bwd |
+| --- | ---: | ---: | ---: | ---: |
+| EOS | 4 | 0.411 / 0.452 | 0.414 / 0.451 | 0.427 / 0.449 |
+| EOS | 1,024 | 0.848 / 0.952 | 0.947 / 0.941 | 0.947 / 0.942 |
+| GB300 | 4 | 0.353 / 0.305 | 0.295 / 0.308 | 0.304 / 0.331 |
+| GB300 | 1,024 | 0.537 / 0.283 | 0.525 / 0.260 | 0.504 / 0.330 |
+
+Use the launcher above with one process per GPU. For the short SUM case,
+pass these arguments to `benchmark_distributed_embedding_collection.py`.
+Change `--pooling` for the other modes and set `--local_batch_size 128
+--max_seq_len 1024` for long bags. Add `--check` for a separate four-step
+comparison against TorchRec's distribution.
+
+```bash
+--output_dist hierarchical --pooling sum --num_tables 8 --features_per_table 1 \
+--num_embeddings 4000000 --embedding_dim 128 --local_batch_size 8192 --max_seq_len 4 \
+--key_dist pow-law --alpha 1.05 --seq_len_dist uniform --use_index_dedup \
+--warmup 20 --num_iterations 20 --profile_iterations 0 --seed 1234
+```
+
 #### Options
 
 | option | default | meaning |
@@ -883,12 +1039,13 @@ commits after it.
 | `--key_range` | `--num_embeddings` | uniform keys are drawn from [0, key_range), pow-law ones from [1, key_range) |
 | `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks) or `hash_roundrobin` (hashed key mod ranks) |
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
-| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
+| `--pooling` | `none` | `none` for sequence embeddings, `sum` or `mean` for an EmbeddingBagCollection |
+| `--use_index_dedup` | off | For pooled embeddings, off selects owner pooling and pooled reduce-scatter. On selects requester-side deduplication and pooling with the row transport selected by `--output_dist`. For sequences, the flag enables TorchRec's index dedup. Hierarchical sequence calls always deduplicate keys. |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
 | `--num_iterations`, `--warmup` | 20, 20 | the timed iterations, and the untimed ones right before them (after the first call): the two run back to back, with no sync of the benchmark's between them, and a CUDA event before the first timed iteration and one after the last time them. At least 1 each |
 | `--seed` | 1234 | seed of the batches and of the output gradients (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
-| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, the same output gradients (+1 or -1 per element, as in the timed run), and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
+| `--check` | off | Compare four SGD training steps against TorchRec using DEBUG initialization, the same batches and gradients, learning rate 1, and a key range of one eighth of the table. Pooled runs compare the selected mode with the regular owner-pooled sharder and verify the expected collective on every rank. Comparisons allow for reduction order and output precision. The low-precision pooled check uses 0/−1 gradients. Sequence runs compare the hierarchical dist (or the requested `auto` dist) with TorchRec under the same dedup flag and check both hierarchical kernel directions. FP32 sequence outputs must match bit for bit on power-of-two world sizes. Other sequence configurations require an exact first step and allow 1e-2 on later steps. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |

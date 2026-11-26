@@ -389,6 +389,25 @@ at::Tensor HierOutputDist::output_dist_bwd(const std::vector<c10::optional<at::T
   return window_->lookup_rows(plan.num_recv, grad.size(1), grad.scalar_type());
 }
 
+at::Tensor HierOutputDist::output_dist_fwd_pooled(
+    const std::vector<c10::optional<at::Tensor>> &fwd_plan, const at::Tensor &lookup_out,
+    const at::Tensor &offsets, const at::Tensor &reverse_indices,
+    const c10::optional<at::Tensor> &weights) {
+  quiesced_ = false;
+  return out_->forward_pooled(FwdPlan::of(fwd_plan), lookup_out, offsets, reverse_indices, weights);
+}
+
+at::Tensor HierOutputDist::output_dist_bwd_pooled(
+    const std::vector<c10::optional<at::Tensor>> &bwd_plan, const std::vector<int64_t> &counts,
+    const at::Tensor &grad, bool divide, const at::Tensor &offsets,
+    const c10::optional<at::Tensor> &weights) {
+  quiesced_ = false;
+  const BwdPlan plan = BwdPlan::of(bwd_plan, counts);
+  out_->backward_pooled(plan, divide, grad, offsets, weights);
+  c10::cuda::CUDAGuard guard(device_);
+  return window_->lookup_rows(plan.num_recv, config_.dim, config_.dtype);
+}
+
 void HierOutputDist::quiesce() {
   c10::cuda::CUDAGuard guard(device_);
   HIER_CUDA_CHECK(cudaDeviceSynchronize());

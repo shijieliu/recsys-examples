@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from typing import Dict, List, Optional
 
 import torch
@@ -21,6 +22,7 @@ from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingContext,
     EmbeddingShardingInfo,
+    KJTListSplitsAwaitable,
 )
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, ShardingType
 from torchrec.distributed.embeddingbag import (
@@ -38,12 +40,16 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
 from ..scored_kjt import without_scores
+from .hier_output_dist import PooledSequenceShardingContext
+from .input_dist import HierStartAwaitable, RwPooledHierInputDist
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwPooledDynamicEmbeddingSharding
 from .twrw_sharding import TwRwPooledDynamicEmbeddingSharding
 
 
 class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
+    local_pooling = False
+
     supported_compute_kernels: List[str] = [
         kernel.value for kernel in EmbeddingComputeKernel
     ] + [DynamicEmbKernel]
@@ -55,6 +61,18 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
         self._per_key_score = per_key_score
 
     def input_dist(self, ctx, features):
+        # TorchRec prepares the KJT under no_grad, including permutations
+        # that would discard this flag before the requester sees the weights.
+        if (
+            self._is_weighted
+            and torch.is_grad_enabled()
+            and isinstance(features, KeyedJaggedTensor)
+        ):
+            weights = features.weights_or_none()
+            if weights is not None and weights.requires_grad:
+                raise ValueError(
+                    "Pooling weights with requires_grad=True are unsupported"
+                )
         if self._per_key_score:
             if self.training:
                 require_scores(features)
@@ -63,6 +81,9 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
                 # any; one given is dropped here, on every rank alike, so the
                 # ranks agree on whether the distribution sends scores.
                 features = without_scores(features)
+        return self._distribute_bags(ctx, features)
+
+    def _distribute_bags(self, ctx, features):
         return super().input_dist(ctx, features)
 
     def reset_parameters(self) -> None:
@@ -113,6 +134,7 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
 
         if sharding_type == ShardingType.ROW_WISE.value:
             return RwPooledDynamicEmbeddingSharding(
+                local_pooling=cls.local_pooling,
                 sharding_infos=sharding_infos,
                 env=env,
                 device=device,
@@ -141,6 +163,8 @@ class DynamicEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
     The usage is completely consistent with TorchREC's EmbeddingBagCollectionSharder.
     """
 
+    collection_type = ShardedDynamicEmbeddingBagCollection
+
     def shard(
         self,
         module: EmbeddingBagCollection,
@@ -150,7 +174,20 @@ class DynamicEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
         module_fqn: Optional[str] = None,
     ) -> ShardedEmbeddingBagCollection:
         per_key_score = collect_per_key_score(params)
-        return ShardedDynamicEmbeddingBagCollection(
+        if not self.collection_type.local_pooling and any(
+            getattr(
+                getattr(param, "dynamicemb_options", None), "output_dist_capacity", None
+            )
+            is not None
+            for param in params.values()
+        ):
+            warnings.warn(
+                "DynamicEmbeddingBagCollectionSharder communicates pooled embeddings and "
+                "ignores output_dist_capacity. Use LocalDynamicEmbeddingBagCollectionSharder "
+                "to communicate unique rows and pool on the requester.",
+                stacklevel=2,
+            )
+        return self.collection_type(
             module=module,
             table_name_to_parameter_sharding=params,
             env=env,
@@ -160,3 +197,122 @@ class DynamicEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
             module_fqn=module_fqn,
             per_key_score=per_key_score,
         )
+
+
+class ShardedLocalDynamicEmbeddingBagCollection(ShardedDynamicEmbeddingBagCollection):
+    """Deduplicate and pool on the requester for eligible row-wise training calls."""
+
+    local_pooling = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._direct_hier_input = False
+        self.register_buffer("_sum_feature_mask", None, persistent=False)
+
+    def _distribute_bags(self, ctx, features):
+        # TorchRec's KJT.split reads the per-feature totals on the host even
+        # when the only split is the entire KJT. The hierarchical second wait
+        # already supplies those totals. After TorchRec initializes its feature
+        # order, pass that single split directly to its distributor.
+        if (
+            self.training
+            and self._direct_hier_input
+            # Newer TorchRec versions do this bookkeeping in their input_dist.
+            and not getattr(self, "_enabled_feature_score_auto_collection", False)
+            and not getattr(self, "_free_features_storage_early", False)
+            and self._input_dists[0].hier is not None
+            and self._input_dists[0].hier.takes_hier_dist
+            and isinstance(features, KeyedJaggedTensor)
+            and not features.variable_stride_per_key()
+        ):
+            distributor = self._input_dists[0]
+            distributor.training = True
+            with torch.no_grad():
+                if self._has_features_permute:
+                    features = features.permute(
+                        self._features_order, self._features_order_tensor
+                    )
+                if self._has_mean_pooling_callback:
+                    lengths = features.lengths()
+                    weights = features.weights_or_none()
+                    if weights is not None:
+                        lengths = torch.ops.fbgemm.segment_sum_csr(
+                            1, features.offsets().int(), weights
+                        )
+                    # TorchRec adds epsilon to every divisor, including SUM
+                    # features of a mixed collection.
+                    divisor = lengths.reshape(-1, features.stride()).T
+                    if self._sum_feature_mask is not None:
+                        divisor = divisor.masked_fill(self._sum_feature_mask, 1)
+                    divisor = divisor + 1e-6
+                    width = self._embedding_dims[0]
+                    ctx.divisor = (
+                        divisor.unsqueeze(-1)
+                        .expand(-1, -1, width)
+                        .reshape(features.stride(), -1)
+                    )
+                request = distributor(features)
+            ctx.sharding_contexts.append(request.sharding_context)
+            return KJTListSplitsAwaitable([request], ctx)
+        # TorchRec keeps these lazy distributors in a plain list. A later
+        # eval()/train() must select the path for this batch as well.
+        for distributor in self._input_dists:
+            if isinstance(distributor, RwPooledHierInputDist):
+                distributor.training = self.training
+        pending = super()._distribute_bags(ctx, features)
+        # EBC creates each context after calling that sharding's input dist.
+        # Use the context its hierarchical second wait will populate.
+        for i, request in enumerate(pending.awaitables):
+            if isinstance(request, HierStartAwaitable):
+                ctx.sharding_contexts[i] = request.sharding_context
+            elif hasattr(request, "local_pool_context"):
+                ctx.sharding_contexts[i] = request.local_pool_context
+        return pending
+
+    def _create_input_dist(self, *args, **kwargs):
+        super()._create_input_dist(*args, **kwargs)
+        # Lazy modules start in training mode even when created by an eval call.
+        for input_dist in self._input_dists:
+            input_dist.training = self.training
+        self._direct_hier_input = len(self._input_dists) == 1 and isinstance(
+            self._input_dists[0], RwPooledHierInputDist
+        )
+        if self._direct_hier_input:
+            # Leave TorchRec in charge of remapping shared input features
+            # across tables in its mixed-pooling divisor.
+            features = self._embedding_shardings[0].feature_names()
+            if self._has_mean_pooling_callback and len(set(features)) != len(features):
+                self._direct_hier_input = False
+                return
+            if self._has_mean_pooling_callback:
+                sums = self._pooling_type_to_rs_features.get("SUM", ())
+                if sums:
+                    self._sum_feature_mask = torch.tensor(
+                        [f in sums for f in features], device=self._device
+                    )
+
+    @staticmethod
+    def _prepare_sequence_lookup(ctx, inputs):
+        # The TorchRec sequence output dist needs lengths after the KJT
+        # all-to-all, available here on both the training and pipeline APIs.
+        for sharding_ctx, features in zip(ctx.sharding_contexts, inputs):
+            if isinstance(sharding_ctx, PooledSequenceShardingContext):
+                sharding_ctx.prepare_lookup(features)
+
+    def compute(self, ctx, dist_input):
+        self._prepare_sequence_lookup(ctx, dist_input)
+        return super().compute(ctx, dist_input)
+
+    def compute_and_output_dist(self, ctx, input):
+        self._prepare_sequence_lookup(ctx, input)
+        return super().compute_and_output_dist(ctx, input)
+
+
+class LocalDynamicEmbeddingBagCollectionSharder(DynamicEmbeddingBagCollectionSharder):
+    """Shard an EBC with requester-side deduplication and pooling.
+
+    Row-wise training uses TorchRec sequence all-to-all or hierarchical
+    output distribution according to the tables' output_dist setting.
+    """
+
+    collection_type = ShardedLocalDynamicEmbeddingBagCollection
