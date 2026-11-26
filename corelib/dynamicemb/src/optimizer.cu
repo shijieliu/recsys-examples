@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "optimizer.h"
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
+#include <c10/cuda/CUDAGuard.h>
 #include "utils.h"
 #include <cmath>
 #include <functional>
@@ -77,6 +78,101 @@ void launch_update_kernel_for_flat_table(
         table_value_dims, table_emb_dims, opt, num_valid);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// One CTA updates 32 short rows. Metadata is read consecutively and shared by
+// the 16 lanes that cover every 64-float row. Every writer orders its value
+// stores before the block releases the associated cache pins.
+__global__ void sgd_update_and_unpin_cache_kernel(
+    const float *grads, const int64_t *value_rows, const int64_t *slots,
+    const int64_t *tids, const int64_t *ptrs, const int64_t *bucket_offsets,
+    int64_t bucket_capacity, const int64_t *overflow_offsets, int64_t overflow_capacity,
+    int64_t main_capacity, int64_t pin_count, int32_t *pins, int64_t bound, const int64_t *num_valid,
+    float lr) {
+  constexpr int block = 128, tile = 32, width = 64;
+  const int t = threadIdx.x;
+  const auto n = counted_limit(num_valid, bound);
+  const int64_t begin = int64_t(blockIdx.x) * tile;
+  if (begin >= n) return;
+  __shared__ float *dest[tile];
+  int64_t pin = -1;
+  if (t < tile) {
+    const int64_t i = begin + t;
+    dest[t] = nullptr;
+    if (i < n) {
+      const int64_t row = value_rows[i], slot = slots[i], tid = tids[i];
+      if (row >= 0) dest[t] = reinterpret_cast<float *>(ptrs[tid]) + row * width;
+      if (slot >= 0) {
+        const int64_t overflow = overflow_offsets[tid];
+        pin = slot < overflow ? bucket_offsets[tid] * bucket_capacity + slot
+                              : main_capacity + tid * overflow_capacity + slot - overflow;
+      }
+    }
+  }
+  __syncthreads();
+  float4 weight[4];
+  float4 gradient[4];
+  float *outputs[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int vector = j * block + t, row = vector / 16, col = (vector % 16) * 4;
+    outputs[j] = dest[row] ? dest[row] + col : nullptr;
+    if (!outputs[j]) continue;
+    const auto *src = grads + (begin + row) * width + col;
+    if (!(reinterpret_cast<uintptr_t>(src) & 15))
+      gradient[j] = *reinterpret_cast<const float4 *>(src);
+    else
+      memcpy(&gradient[j], src, sizeof(float4));
+    if (!(reinterpret_cast<uintptr_t>(outputs[j]) & 15))
+      weight[j] = *reinterpret_cast<float4 *>(outputs[j]);
+    else
+      memcpy(&weight[j], outputs[j], sizeof(float4));
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    if (!outputs[j]) continue;
+    auto &w = weight[j];
+    const auto g = gradient[j];
+    w.x += g.x * -lr;
+    w.y += g.y * -lr;
+    w.z += g.z * -lr;
+    w.w += g.w * -lr;
+    if (!(reinterpret_cast<uintptr_t>(outputs[j]) & 15))
+      *reinterpret_cast<float4 *>(outputs[j]) = w;
+    else
+      memcpy(outputs[j], &w, sizeof(float4));
+  }
+  __threadfence();
+  __syncthreads();
+  if (pin >= 0 && pin < pin_count) ::atomicAdd(pins + pin, -1);
+}
+
+void sgd_update_and_unpin_cache(
+    at::Tensor grads, at::Tensor rows, at::Tensor slots, at::Tensor tids, at::Tensor ptrs,
+    at::Tensor bucket_offsets, int64_t bucket_capacity, at::Tensor overflow_offsets,
+    int64_t overflow_capacity, at::Tensor pins, at::Tensor num_valid, float lr) {
+  TORCH_CHECK(grads.is_cuda() && grads.is_contiguous() && grads.scalar_type() == at::kFloat &&
+              grads.dim() == 2 && grads.size(1) == 64, "expected contiguous 64-column FP32 CUDA gradients");
+  const auto n = grads.size(0), tables = ptrs.numel();
+  const auto check = [&](const at::Tensor &t, int64_t len, at::ScalarType type) {
+    TORCH_CHECK(t.is_contiguous() && t.device() == grads.device() && t.dim() == 1 &&
+                t.numel() == len && t.scalar_type() == type, "invalid cache SGD metadata");
+  };
+  check(rows,n,at::kLong); check(slots,n,at::kLong); check(tids,n,at::kLong);
+  check(ptrs,tables,at::kLong); check(bucket_offsets,tables+1,at::kLong);
+  check(overflow_offsets,tables,at::kLong); check(pins,pins.numel(),at::kInt);
+  TORCH_CHECK(tables > 0 && bucket_capacity > 0 && overflow_capacity > 0 &&
+              pins.numel() >= tables * overflow_capacity, "invalid cache capacities");
+  const c10::cuda::CUDAGuard guard(grads.device());
+  const auto *count = counted_num_valid_ptr(num_valid, grads.device());
+  if (n) {
+    sgd_update_and_unpin_cache_kernel<<<(n + 31) / 32,128,0,at::cuda::getCurrentCUDAStream()>>>(
+        grads.data_ptr<float>(), rows.data_ptr<int64_t>(), slots.data_ptr<int64_t>(),
+        tids.data_ptr<int64_t>(), ptrs.data_ptr<int64_t>(), bucket_offsets.data_ptr<int64_t>(),
+        bucket_capacity, overflow_offsets.data_ptr<int64_t>(), overflow_capacity,
+        pins.numel() - tables * overflow_capacity, pins.numel(), pins.data_ptr<int32_t>(), n, count, lr);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
@@ -595,6 +691,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
 // PYTHON WRAP
 // Every update reads the live gradient row count on the device.
 void bind_optimizer_kernel_op(py::module &m) {
+  m.def("sgd_update_and_unpin_cache", &dyn_emb::sgd_update_and_unpin_cache);
   m.def("sgd_update_for_flat_table", &dyn_emb::sgd_update_for_flat_table,
         "SGD optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
         py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),

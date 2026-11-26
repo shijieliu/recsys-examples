@@ -44,6 +44,7 @@ from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
     FTRLDynamicEmbeddingOptimizer,
+    SGDDynamicEmbeddingOptimizer,
 )
 from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb.utils import decode_table_values, gradient_dtype
@@ -1437,31 +1438,43 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     # since this one's prefetch (prefetch pipelines, several
                     # forwards before their backwards).
                     refresh_slots_after_rehash(state, ctx)
-                    with torch.cuda.nvtx.range("op:optimizer_update_fused"):
-                        optimizer.fused_update_for_flat_table(
-                            unique_grads.to(
-                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
-                            ),
-                            # Writes into the value buffer -> rows.
-                            ctx.update_value_rows,
-                            state.table_ptrs_dev,
-                            unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
+                    if (
+                        ctx.storage_mode == StorageMode.CACHE
+                        and type(optimizer) is SGDDynamicEmbeddingOptimizer
+                        and state.uniform_value_shape and state.value_dim == state.emb_dim == 64
+                        and state.emb_dtype == unique_grads.dtype == torch.float32
+                    ):
+                        with torch.cuda.nvtx.range("op:sgd_update_and_unpin_cache"):
+                            optimizer.update_and_unpin_cache(
+                                unique_grads, ctx.update_value_rows, ctx.slot_indices,
+                                unique_table_ids, state, num_unique,
+                            )
+                    else:
+                        with torch.cuda.nvtx.range("op:optimizer_update_fused"):
+                            optimizer.fused_update_for_flat_table(
+                                unique_grads.to(
+                                    gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                                ),
+                                # Writes into the value buffer -> rows.
+                                ctx.update_value_rows,
+                                state.table_ptrs_dev,
+                                unique_table_ids,
+                                state.table_value_dims,
+                                state.table_emb_dims,
+                                state.max_emb_dim,
+                                state.all_dims_vec4,
+                                state.emb_dtype,
+                                num_valid=num_unique,
+                            )
+
+                        release_slot_pins(
+                            cache,
+                            storage,
+                            ctx.storage_mode,
+                            ctx.slot_indices,
+                            ctx.unique_table_ids,
                             num_valid=num_unique,
                         )
-
-                    release_slot_pins(
-                        cache,
-                        storage,
-                        ctx.storage_mode,
-                        ctx.slot_indices,
-                        ctx.unique_table_ids,
-                        num_valid=num_unique,
-                    )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
                     # Per-table embedding dims (on the CUDA device) let the

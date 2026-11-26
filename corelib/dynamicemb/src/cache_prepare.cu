@@ -66,11 +66,11 @@ __device__ __forceinline__ void initialize_cache_row(
   }
 }
 
-// Compact address metadata first. Each CTA reads a consecutive tile, then
-// half warps issue the four value loads before the dependent staging writes.
-__device__ void stage_full_rows_256(const StagingRows &rows, uint4 *values) {
-  constexpr int groups = 128 / 16;
-  constexpr int tile_rows = groups * 4;
+// Each block resolves the addresses of one tile, then issues four independent
+// vector reads per lane before writing contiguous staging memory.
+template <int RowVectors>
+__device__ void stage_full_rows(const StagingRows &rows, uint4 *values) {
+  constexpr int tile_rows = 128 * 4 / RowVectors;
   __shared__ const uint4 *sources[tile_rows];
   const int t = threadIdx.x;
   const int64_t n = *rows.num_misses;
@@ -89,23 +89,38 @@ __device__ void stage_full_rows_256(const StagingRows &rows, uint4 *values) {
       uint4 data[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const auto *src = sources[j * groups + t / 16] + t % 16;
+        const auto *src = sources[(j * 128 + t) / RowVectors] + (j * 128 + t) % RowVectors;
         auto &v = data[j];
         asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" :
                      "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src));
       }
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        values[begin * 16 + t + j * 128] = data[j];
-    } else {
+        values[begin * RowVectors + t + j * 128] = data[j];
+    } else if constexpr (RowVectors == 16) {
       CacheTransfer256 transfers[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const int row = j * groups + t / 16;
+        const int row = j * 8 + t / 16;
         transfers[j].src = sources[row];
         transfers[j].dst = sources[row] ? values + (begin + row) * 16 : nullptr;
       }
       copy_cache_transfers_256(transfers, t % 16);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int vector = j * 128 + t;
+        const auto *row = sources[vector / RowVectors];
+        if (!row) continue;
+        // A sliced table can start between vector boundaries. Copy precisely
+        // one vector by bytes there, including in the final partial tile.
+        const auto *src = reinterpret_cast<const char *>(row) + (vector % RowVectors) * 16;
+        auto *dst = values + begin * RowVectors + vector;
+        if (reinterpret_cast<uintptr_t>(src) % alignof(uint4) == 0)
+          *dst = *reinterpret_cast<const uint4 *>(src);
+        else
+          memcpy(dst, src, sizeof(uint4));
+      }
     }
     if (begin + stride < n) __syncthreads();
   }
@@ -118,9 +133,12 @@ void stage_cache_misses_kernel(StagingRows rows, V *values,
                                           int lane_shift) {
   if constexpr (Dense256) {
     if (*rows.num_new == 0) {
-      stage_full_rows_256(rows, reinterpret_cast<uint4 *>(values));
+      stage_full_rows<16>(rows, reinterpret_cast<uint4 *>(values));
       return;
     }
+  } else if (!rows.layout_tags && rows.max_value_dim * sizeof(V) == 1024 && *rows.num_new == 0) {
+    stage_full_rows<64>(rows, reinterpret_cast<uint4 *>(values));
+    return;
   }
   const int lanes = 1 << lane_shift;
   const int lane = threadIdx.x & (lanes - 1);

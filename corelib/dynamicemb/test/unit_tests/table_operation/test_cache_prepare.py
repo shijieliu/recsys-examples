@@ -193,7 +193,10 @@ def test_prepare_releases_hits_on_failure():
 def test_dense_copy_retains_rng_sequence(mode, params):
     # Use the same initialized curandStateXORWOW workers for both preparations.
     # Four warps repeatedly process interleaved backing hits and new rows.
-    state = CurandStateContext().state[: 128 * 48].clone()
+    initialized = CurandStateContext().state
+    props = torch.cuda.get_device_properties(initialized.device)
+    workers = props.multi_processor_count * props.max_threads_per_multi_processor
+    state = initialized.reshape(workers, -1)[:128].flatten().clone()
     uniform_state = state.clone()
     n, dim, width = 149, 64, 128
     cache = get_scored_table([512], bucket_capacity=128, enable_overflow=True)

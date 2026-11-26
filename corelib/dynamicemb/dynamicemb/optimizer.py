@@ -33,6 +33,7 @@ from dynamicemb_extensions import (
     reset_ftrl_states,
     rowwise_adagrad_for_flat_table,
     rowwise_adagrad_for_padded_buffer,
+    sgd_update_and_unpin_cache,
     sgd_update_for_flat_table,
     sgd_update_for_padded_buffer,
 )
@@ -397,6 +398,14 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.learning_rate,
             num_valid=num_valid,
             host_num_valid=host_num_valid,
+        )
+
+    def update_and_unpin_cache(self, grads, rows, slots, table_ids, state, num_valid):
+        table = state.key_index_map
+        sgd_update_and_unpin_cache(
+            grads, rows, slots, table_ids, state.table_ptrs_dev, table.table_bucket_offsets_,
+            table.bucket_capacity_, table.overflow_output_offsets_, table.overflow_bucket_capacity_,
+            table._ref_counter, num_valid, self._opt_args.learning_rate,
         )
 
     def fused_update_for_flat_table(
