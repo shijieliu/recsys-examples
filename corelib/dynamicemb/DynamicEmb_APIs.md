@@ -1177,7 +1177,7 @@ Keep the DynamicEmb tables of a TorchRec 2D sparse parallelism model (`DMPCollec
 
     #API arguments
     class DynamicEmbReplicaSync:
-        def __init__(self, model: DMPCollection) -> None:
+        def __init__(self, model: DMPCollection, *, max_staging_bytes: int = 256 * 1024**2) -> None:
             """
             Parameters
             ----------
@@ -1185,6 +1185,10 @@ Keep the DynamicEmb tables of a TorchRec 2D sparse parallelism model (`DMPCollec
                 The 2D model whose DynamicEmb tables are kept in agreement. Its tables must be sharded row-wise over
                 the default context's sharding group, keep their values in HBM (no cache, no host tier), and keep a
                 timestamp score (TIMESTAMP or (TIMESTAMP, LFU)). Raises ValueError otherwise.
+            max_staging_bytes : int
+                Per-rank payload staging budget in bytes. Each replica group uses the smallest requested
+                value to size the packed NCCL send and receive buffers, with at least one row per slab.
+                Routing metadata and rows awaiting local insertion use additional memory.
             """
 
         def sync(self) -> List[TableSyncStats]:

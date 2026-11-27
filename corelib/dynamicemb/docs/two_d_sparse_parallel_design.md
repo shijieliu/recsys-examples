@@ -49,33 +49,40 @@ replica_sync.mark_synced()
 
 ## 4. The sync
 
-For each table, in chunks of keys that bound the staging buffers:
+Each call to `DynamicEmbReplicaSync.sync()` passes every local DynamicEmb table
+to one Torch operator, `torch.ops.dyn_emb.replica_sync_batch_`. Tables can
+belong to different kernels and have different widths, dtypes, initializers and
+score layouts. The returned statistics follow the original table order.
 
-1. **Touched keys.** `incremental_dump` over the table's timestamp score finds
-   the keys touched since the last sync, whose device time is the threshold.
-2. **Union.** The keys are all-gathered over the replica group and made unique.
-   `torch.unique` sorts them, so every replica merges them in the same order.
-3. **Read.** A const lookup (scores unchanged) finds which keys this replica
-   holds. Their embeddings are read at the precision a checkpoint holds them at,
-   which is lossless (fp16 for an fp8 table). The optimizer state is read at
-   checkpoint width (row-wise Adagrad's fp32 accumulator), along with all score
-   words.
-4. **Exchange.** Each replica sends a held mask per key (one byte) and only the
-   rows it holds. The sync is bound by bandwidth, and a replica that lacks a key
-   sends no row for it.
-5. **Merge.** Sums are taken in fp32. With a `CONSTANT` initializer, a replica
-   without the key counts as a fresh row (the initial value at table precision
-   and a fresh optimizer state), and the sum is divided by R. That is the average
-   a single, unreplicated table would reach, and the rule TorchRec 2D applies to
-   a TBE row only some replicas updated. With a random initializer there is no
-   one fresh row, so only the replicas that hold the key are averaged.
-6. **Write.** Each replica inserts the keys it lacked (expanding first), stores
-   the merged rows, and writes the scores: timestamp = now, LFU = sum // R (at
-   least 1, as for a fresh insert), and any other word sum // R.
-7. **Mark.** The threshold becomes the device time after the sync.
+1. **Discover keys.** Each table scans its timestamp column for keys touched
+   since the last sync. The replicas exchange one vector of table counts and
+   one concatenated key buffer, then build a sorted union for each table.
+   A const lookup maps those keys to local value rows and hash slots. Dense
+   tables can reuse their routes after one batch-wide vote checks the live
+   counts, keys, slots, rows and timestamps.
+2. **Exchange rows.** CUDA kernels pack the embedding, live optimizer state
+   and optional LFU counters for each held row. FP8 values keep their stored
+   encoding and packed Adagrad accumulators keep their fp32 precision. A
+   packed NCCL slab can span several tables. All replica groups use this
+   collective, and NCCL selects the transport for the available topology.
+   A shared mask identifies which replicas contributed sparse rows. The next
+   slab's all-gather can overlap writeback for the preceding slab.
+3. **Merge and place.** The operator averages in fp32. For a constant
+   initializer, an absent replica contributes the initial embedding at table
+   precision and fresh optimizer state. For a random initializer, only the
+   holders contribute. Each replica writes its held rows in place, sets the
+   timestamp from its GPU clock, and stores LFU as the sum divided by the
+   replica count, rounded down with a minimum of one. For locally absent keys
+   the operator returns the averaged rows and scores. Python grows and inserts
+   once per affected storage, after all communication has finished. This lets
+   a rehash change the slot map without invalidating an in-flight merge.
+4. **Advance the threshold.** After writeback, each replica records the device
+   time. The next sync uses it to select touched keys.
 
-A sync costs in proportion to the keys touched since the last one, not to the
-size of the table.
+The smallest `max_staging_bytes` requested by the replicas sets the payload
+staging budget. NCCL processes at least one row per slab. The routing metadata
+and the output rows awaiting local insertion are separate from the payload
+budget.
 
 ## 5. Checkpoints
 
@@ -83,8 +90,11 @@ A DynamicEmb kernel names its checkpoint files by its own shard index and shard
 count, read off the placements TorchRec planned. Under 2D, shard s of every
 replica therefore writes the same file names. `DynamicEmbDump` given a
 `DMPCollection` has the first replica dump, over its sharding group, while the
-others wait at `pg`. `DynamicEmbLoad` needs no change: every replica reads its
-own shard's files. A shard's meta records `sharding_type: table_row_wise`,
+others wait at `pg`. Each replica loads its own shard's files. Checkpoints
+with a compound score store the timestamp column as an age and preserve the
+LFU column. Loading reconstructs the timestamp using the reader GPU's clock.
+For older compound checkpoints that store raw timestamps, the loader clamps
+future timestamps to the local time. A shard's meta records `sharding_type: table_row_wise`,
 because the table is on fewer ranks than the world. That field is informational,
 and a checkpoint written under 2D loads into a row-wise world of the same shard
 count as any other.
@@ -92,7 +102,7 @@ count as any other.
 ## 6. Constraints, checked when `DynamicEmbReplicaSync` is built
 
 - **Values in HBM:** a `DynamicEmbStorage`, with no cache and no host tier. The
-  sync reads and writes rows through the flat-table operations.
+  CUDA kernels read and write rows through the flat value buffer.
 - **A timestamp score:** `TIMESTAMP` or `(TIMESTAMP, LFU)`. It is how the sync
   finds the touched keys.
 - **Row-wise tables of the default context:** a table must be sharded over this
@@ -132,6 +142,9 @@ registered in both the `fwd_bwd` and the `load_dump` groups:
   second sync covers no key. It runs on two GPUs in groups of one for fp32,
   fp16 and fp8 tables, `TIMESTAMP` scores and SGD, and on four GPUs in groups of
   two, both contiguous and strided.
+- **`sync --mixed-tables`:** one native dispatch covers fp32 and fp16 tables
+  with different widths and score layouts. The check exercises growth, a
+  table touched on only one replica, and a subsequent empty sync.
 - **`checkpoint`:** replicas that disagree dump. A fresh model's every replica
   then loads the first replica's rows, so one replica wrote, and wrote alone.
 - **`reject`:** a table without a timestamp score is refused.

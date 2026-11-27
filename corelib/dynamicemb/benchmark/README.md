@@ -987,3 +987,62 @@ once). So NVLink moves about 7 times as much per GPU as one NIC (50 GB/s).
 
 The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).
+
+## Replica sync bandwidth
+
+This benchmark times a complete `DynamicEmbReplicaSync.sync()` on two replicas of
+row-wise shards. All replica pairs run concurrently. Each table gets the same
+keys and independently generated SGD rows. Both replicas hold every measured
+key. Before each call the benchmark writes different values and fresh timestamps
+on each replica. After each call it verifies the touched and held counts and
+reads back every averaged row.
+
+The timer includes key discovery, packing, NCCL collectives, merging and
+writeback. Setup, rank alignment and output checks fall outside the timer.
+Effective bandwidth in bytes/s is
+`tables × rows × dim × element_size / mean(max_rank_seconds)`. This counts
+one useful outgoing embedding payload per GPU per direction. The JSON reports
+the slowest rank's duration for each iteration and a payload-only NCCL
+all-gather baseline. The benchmark exits nonzero if effective bandwidth is
+at or below 80% of the specified **physical one-direction GB/s per GPU**.
+
+### NCCL results on H100 SXM
+
+Both fabrics used the same native batched sync operator. On one node, four
+replica pairs used NVLink (NV18, 450 GB/s per GPU per direction). On two
+nodes, eight replica pairs used InfiniBand (one 400 Gb/s NDR port per GPU,
+50 GB/s per direction). The runs used four warmups and ten measured syncs.
+The default staging budget is 256 MiB per GPU. Increasing the budget
+permits larger messages.
+
+| Fabric | GPUs | Useful bytes/GPU | Staging MiB | Full sync GB/s | Utilization | Payload-only NCCL GB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVLink | 8 | 6 GiB | 256 | 139.70 | 31.04% | 289.82 |
+| NVLink | 8 | 6 GiB | 1536 | 153.61 | 34.13% | 289.87 |
+| NVLink | 8 | 6 GiB | 6500 | 158.15 | 35.14% | 291.77 |
+| InfiniBand | 16 | 4 GiB | 256 | 36.21 | 72.42% | 49.01 |
+| InfiniBand | 16 | 4 GiB | 1536 | 40.45 | 80.90% | 48.97 |
+
+The 1536 MiB InfiniBand run passed the 80% threshold. All three NVLink runs
+missed it. For historical context, the direct peer-copy NVLink implementation
+at `fdbbd09d` measured 362.46 GB/s with the same 6 GiB workload and 6500 MiB
+budget on an eight-H100 node.
+
+Run inside `corelib/dynamicemb` to reproduce the 1536 MiB results.
+
+```bash
+torchrun --standalone --nproc-per-node=8 benchmark/benchmark_replica_sync.py \
+    --fabric nvlink --peak-gbps 450 --tables 2 --rows 393216 --dim 2048 \
+    --staging-mib 1536 --warmup 4 --iterations 10
+srun -N2 --ntasks-per-node=8 env LOCAL_WORLD_SIZE=8 \
+    NCCL_CROSS_NIC=0 NCCL_NET_PLUGIN=none NCCL_MIN_NCHANNELS=8 \
+    NCCL_MAX_NCHANNELS=8 NCCL_BUFFSIZE=8388608 \
+    python benchmark/benchmark_replica_sync.py --fabric ib --peak-gbps 50 \
+    --tables 2 --rows 2097152 --dim 256 --staging-mib 1536 --warmup 4 --iterations 10
+```
+
+For different GPUs or NICs, set `--peak-gbps` to the bandwidth available in
+one direction per GPU and account for shared NICs. Check the physical links
+with `nvidia-smi topo -m`, `nvidia-smi nvlink -s` and `ibstat`, and the peer
+transport with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH,NET,P2P`. The JSON
+lists the hostnames and GPU ranks of each replica pair.

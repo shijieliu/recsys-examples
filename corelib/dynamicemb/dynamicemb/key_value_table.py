@@ -359,6 +359,8 @@ class DynamicEmbTableState:
     # was read from, so whoever walks the slots across calls -- an erase by score,
     # in chunks -- compares this to know when to start over.
     key_map_generation: int = 0
+    # Tensor views need a new row extent when only a value buffer grows.
+    value_buffer_generation: int = 0
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
@@ -1014,6 +1016,7 @@ def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None
             state.tables[i].extend((target - rows, state.table_value_dims_cpu[i]))
             grown = True
     if grown:
+        state.value_buffer_generation += 1
         state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
         state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 
@@ -1997,6 +2000,10 @@ def _dump_table(
     append: bool = False,
 ) -> None:
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    # A multi-word score file historically held raw device clocks. Mark the
+    # age representation explicitly so existing checkpoints still load. A
+    # low-level raw dump (timestamp=0) retains its exact score round-trip.
+    compound_age = timestamp != 0 and state.key_index_map.num_scores_ > 1
     if not append and include_meta:
         meta_data = {}
         meta_data.update(state.optimizer.get_opt_args())
@@ -2018,6 +2025,9 @@ def _dump_table(
             state.optimizer.get_state_dtype(state.emb_dtype)
         )
 
+        if compound_age:
+            meta_data["timestamp_score_as_age"] = True
+
         if current_score is not None:
             meta_data["step_score"] = current_score
 
@@ -2034,7 +2044,11 @@ def _dump_table(
     ):
         fkey.write(keys.cpu().numpy().tobytes())
         fembedding.write(_raw_bytes(embeddings))
-        if state.evict_strategy == EvictStrategy.KLru:
+        if compound_age:
+            scores = _scores_to_age(
+                state.options_list[table_id].score_strategy, scores, timestamp
+            )
+        elif state.evict_strategy == EvictStrategy.KLru:
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
@@ -3264,6 +3278,18 @@ class DynamicEmbStorage(Storage):
             global_capacity=params.global_capacity,
             bucket_capacity=params.bucket_capacity,
         ):
+            if scores is not None and num_scores > 1:
+                strategy = self._state.options_list[table_id].score_strategy
+                if params.meta_data.get("timestamp_score_as_age"):
+                    scores = _age_to_scores(
+                        strategy, scores, timestamp or device_timestamp()
+                    )
+                elif timestamp:
+                    # With no saved clock anchor, preserve all historical
+                    # timestamps up to now. A future timestamp from another
+                    # GPU would keep resurfacing in every incremental scan.
+                    for col in _timestamp_score_columns(strategy):
+                        scores[:, col].clamp_(max=timestamp)
             if (
                 scores is not None
                 and load_perm is not None

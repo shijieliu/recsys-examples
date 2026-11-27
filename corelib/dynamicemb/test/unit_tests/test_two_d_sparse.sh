@@ -29,9 +29,10 @@ for dtype in fp32 fp16 fp8; do
 done
 run 2 1 --mode sync --score-strategy lru
 run 2 1 --mode sync --optimizer sgd
-run 2 1 --mode sync --grow
+run 2 1 --mode sync --grow --mixed-tables
 run 2 1 --mode reject --score-strategy step
 if ${four_gpus}; then
+  run 3 1 --mode sync --optimizer adam --embedding-dtype fp16 --random-initializer --uint64-keys --resync
   run 4 2 --mode sync --embedding-dtype fp16
   run 4 2 --mode sync --embedding-dtype fp16 --strided
   run 4 2 --mode sync --grow
