@@ -93,6 +93,7 @@ from dynamicemb_extensions import (
     fill_rows,
     flagged_compact,
     gather_embedding,
+    lookup_embedding_rows,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
@@ -1481,6 +1482,11 @@ def load_from_flat_by(
         out_rows,
         num_valid=num_valid,
         host_num_valid=host_num_valid,
+        uniform_value_dim=(
+            state.value_dim
+            if state.uniform_value_shape and not state.key_index_map.enable_overflow_
+            else 0
+        ),
     )
 
 
@@ -4737,6 +4743,29 @@ def flush_cache(
 # ---------------------------------------------------------------------------
 
 
+def _cache_value_layout(state: DynamicEmbTableState):
+    return (
+        state.table_ptrs_dev,
+        None if state.uniform_value_shape else state.table_emb_dims,
+        None if state.uniform_value_shape else state.table_value_dims,
+        state.emb_dim,
+        state.value_dim,
+        state.emb_dtype,
+    )
+
+
+def _backing_lookup_map(state: DynamicEmbTableState):
+    table = state.key_index_map
+    return (
+        table.table_storage_, table.table_bucket_offsets_, table.bucket_capacity_,
+        table.rows_, table.num_scores_, table.table_global_capacities_,
+    )
+
+
+def _eval_row_map(state: DynamicEmbTableState):
+    return _backing_lookup_map(state), _cache_value_layout(state)
+
+
 def _eval_lookup_storage(
     storage: Storage,
     keys: torch.Tensor,
@@ -4746,13 +4775,36 @@ def _eval_lookup_storage(
     *,
     host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
-    (num_missing, _, missing_indices, _, _, _, _, embs) = storage.find(
-        keys,
-        table_ids,
-        copy_mode=CopyMode.EMBEDDING,
-        num_valid=num_valid,
-        host_num_valid=host_num_valid,
-    )
+    if (
+        type(storage) is DynamicEmbStorage
+        and not storage.training
+        and storage._state.tables[0].is_device_buffer()
+        and not storage._state.key_index_map.enable_overflow_
+    ):
+        state = storage._state
+        keys = keys.contiguous()
+        table_ids = table_ids.contiguous()
+        embs, missing, _ = lookup_embedding_rows(
+            keys.to(state.key_index_map.key_type),
+            table_ids,
+            _eval_row_map(state),
+            None,
+            None,
+            num_valid,
+            host_num_valid,
+            False,
+        )
+        num_missing, missing_indices, _ = flagged_compact(
+            missing, [], num_valid, host_num_valid=host_num_valid
+        )
+    else:
+        num_missing, _, missing_indices, _, _, _, _, embs = storage.find(
+            keys,
+            table_ids,
+            copy_mode=CopyMode.EMBEDDING,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
+        )
     initializer(
         embs,
         keys,
@@ -4773,6 +4825,39 @@ def _eval_lookup_cached(
     *,
     host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
+    if (
+        isinstance(cache, DynamicEmbCache)
+        and isinstance(storage, DynamicEmbStorage)
+        and not cache._state.training
+        and not storage._state.training
+        and not storage._state.key_index_map.enable_overflow_
+    ):
+        cache._check_placement()
+        table = cache._state.key_index_map
+        overflow = (
+            table.overflow_table_storage_,
+            table.overflow_bucket_capacity_,
+            table.overflow_output_offsets_,
+        )
+        # Both tiers are read-only. Probe backing only on a cache miss and
+        # copy each embedding directly into its final output row.
+        keys = keys.contiguous()
+        table_ids = table_ids.contiguous()
+        embs, missing, hits = lookup_embedding_rows(
+            keys.to(table.key_type), table_ids, _eval_row_map(cache._state),
+            overflow, _eval_row_map(storage._state), num_valid, host_num_valid,
+            cache._record_cache_metrics,
+        )
+        if hits is not None:
+            cache.record_lookup_metrics(hits, num_valid, host_num_valid)
+        # Stable selection preserves input order, including the assignment of
+        # RNG state to each missing embedding in the ordinary initializer.
+        num_missing, positions, _ = flagged_compact(
+            missing, [], num_valid, host_num_valid=host_num_valid
+        )
+        initializer(embs, keys, num_missing, table_ids, positions)
+        return embs
+
     _, founds, cache_indices = cache.lookup(
         keys, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
     )

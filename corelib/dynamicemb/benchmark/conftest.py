@@ -27,12 +27,13 @@ def pytest_addoption(parser):
         "--profile",
         action="store",
         default=None,
-        choices=["torch", "nsys", "ncu-gen", "ncu"],
+        choices=["torch", "nsys", "ncu-gen", "ncu", "lookup-train", "lookup-eval"],
         help=(
             "Profiling mode: 'torch' for torch.profiler, 'nsys' for NVTX only, "
             "'ncu-gen' to print ncu commands without running tests, "
             "'ncu' to run all iterations inside one cudaProfilerStart/Stop "
-            "window (use --num-iterations to limit replay overhead)."
+            "window. 'lookup-train' and 'lookup-eval' capture one DynamicEmb "
+            "forward at the midpoint of the selected phase for hardware counters."
         ),
     )
     parser.addoption(
@@ -58,6 +59,12 @@ def pytest_addoption(parser):
             "mode covers -- useful to keep `--profile ncu` tractable, e.g. "
             "`--profile ncu --num-iterations 3`."
         ),
+    )
+    parser.addoption(
+        "--lookup-iteration",
+        type=int,
+        default=None,
+        help="Batch to capture with lookup-train or lookup-eval (default: midpoint).",
     )
     parser.addoption(
         "--ncu-kernel-regex",
@@ -159,6 +166,11 @@ def correctness_flag(request):
 def num_iterations(request):
     """Session-wide override for BenchmarkConfig.num_iterations (None = keep config default)."""
     return request.config.getoption("--num-iterations")
+
+
+@pytest.fixture(scope="session")
+def lookup_iteration(request):
+    return request.config.getoption("--lookup-iteration")
 
 
 @pytest.fixture(scope="session")

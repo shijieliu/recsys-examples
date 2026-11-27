@@ -181,6 +181,7 @@ class BenchmarkConfig:
     pooling_mode: str = "none"
     max_hotness: int = 10
     num_iterations: int = 100
+    lookup_iteration: Optional[int] = None
     # Profiling-only: which iterations --profile ncu captures (raw spec string,
     # parsed by parse_ncu_iterations).  None = capture iter 0.  Not in cfg.label().
     ncu_iterations: Optional[str] = None
@@ -579,6 +580,20 @@ def _forward_allclose(out_dyn, out_trc, atol, rtol):
     return passed, max_diff, mean_diff
 
 
+def _capture_lookup(model, features):
+    # Start with an idle stream and keep the output alive until every lookup
+    # kernel has finished. Both Nsight tools honor this same capture window.
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStart()
+    try:
+        with torch.cuda.nvtx.range("dynamicemb_lookup"):
+            output = model(features.values(), features.offsets())
+        torch.cuda.synchronize()
+    finally:
+        torch.cuda.cudart().cudaProfilerStop()
+    return output
+
+
 def benchmark_train_eval(
     dynamic_emb,
     torchrec_emb,
@@ -586,6 +601,7 @@ def benchmark_train_eval(
     num_iterations,
     cfg: BenchmarkConfig,
     check_forward: bool = False,
+    lookup_profile: Optional[str] = None,
 ):
     """Measure train / eval latencies for both backends using CUDA Events.
 
@@ -608,6 +624,13 @@ def benchmark_train_eval(
 
     dyn_fwd = dyn_bwd = dyn_total = 0.0
     trc_fwd = trc_bwd = trc_total = 0.0
+    # Sample the same batch in the ordinary timing run and the profiler run.
+    # An eval capture must see the cache state left by the full training loop.
+    lookup_iteration = cfg.lookup_iteration if cfg.lookup_iteration is not None else num_iterations // 2
+    if not 0 <= lookup_iteration < num_iterations:
+        raise ValueError(f"lookup iteration {lookup_iteration} is outside [0, {num_iterations})")
+    train_lookup_ms = []
+    eval_lookup_ms = []
 
     # CUDA events are reusable across record() calls; allocate once.
     dyn_s = torch.cuda.Event(enable_timing=True)
@@ -635,7 +658,10 @@ def benchmark_train_eval(
         # ── dyn ──
         torch.cuda.nvtx.range_push("dyn")
         dyn_s.record()
-        out_dyn = dynamic_emb(sf.values(), sf.offsets())
+        if lookup_profile == "lookup-train" and i == lookup_iteration:
+            out_dyn = _capture_lookup(dynamic_emb, sf)
+        else:
+            out_dyn = dynamic_emb(sf.values(), sf.offsets())
         dyn_m.record()
         out_dyn.backward(grad)
         dyn_e.record()
@@ -654,7 +680,9 @@ def benchmark_train_eval(
 
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
-        dyn_fwd += dyn_s.elapsed_time(dyn_m)
+        forward_ms = dyn_s.elapsed_time(dyn_m)
+        train_lookup_ms.append(forward_ms)
+        dyn_fwd += forward_ms
         dyn_bwd += dyn_m.elapsed_time(dyn_e)
         dyn_total += dyn_s.elapsed_time(dyn_e)
         if has_trc:
@@ -683,10 +711,15 @@ def benchmark_train_eval(
     for i in range(num_iterations):
         sf = sparse_features[i]
         dyn_s.record()
-        out_dyn = dynamic_emb(sf.values(), sf.offsets())
+        if lookup_profile == "lookup-eval" and i == lookup_iteration:
+            out_dyn = _capture_lookup(dynamic_emb, sf)
+        else:
+            out_dyn = dynamic_emb(sf.values(), sf.offsets())
         dyn_e.record()
         torch.cuda.synchronize()
-        dyn_eval += dyn_s.elapsed_time(dyn_e)
+        eval_ms = dyn_s.elapsed_time(dyn_e)
+        eval_lookup_ms.append(eval_ms)
+        dyn_eval += eval_ms
 
         out_trc = None
         if has_trc:
@@ -714,6 +747,7 @@ def benchmark_train_eval(
         raise AssertionError(f"forward mismatch: {failures}")
 
     return {
+        "lookup_steps_ms": {"train": train_lookup_ms, "eval": eval_lookup_ms},
         "dyn_train_ms": dyn_total / num_iterations,
         "dyn_forward_ms": dyn_fwd / num_iterations,
         "dyn_backward_ms": dyn_bwd / num_iterations,
@@ -1629,7 +1663,16 @@ def run_single_benchmark(
         cfg.num_iterations,
         cfg=cfg,
         check_forward=cfg.correctness,
+        lookup_profile=profile_mode,
     )
+    if profile_mode in ("lookup-train", "lookup-eval"):
+        # A replay can serialize kernels and affect CUDA event latency. Only
+        # publish latency from the ordinary, unprofiled benchmark.
+        return {
+            "label": cfg.label(),
+            "profile": profile_mode,
+            "iteration": cfg.lookup_iteration if cfg.lookup_iteration is not None else cfg.num_iterations // 2,
+        }
 
     result = {
         "label": cfg.label(),
@@ -1647,6 +1690,7 @@ def run_single_benchmark(
         "max_hotness": cfg.max_hotness,
         "avg_n_unique": avg_n_unique,
         "avg_n_total": avg_n_total,
+        "lookup_steps_ms": metrics["lookup_steps_ms"],
         "dyn_forward_ms": metrics["dyn_forward_ms"],
         "dyn_backward_ms": metrics["dyn_backward_ms"],
         "dyn_train_ms": metrics["dyn_train_ms"],
@@ -1845,8 +1889,10 @@ def _apply_overrides(
     num_tables: Optional[int] = None,
     sparse_key_range: Optional[int] = None,
     no_torchrec: bool = False,
+    lookup_iteration: Optional[int] = None,
 ) -> BenchmarkConfig:
     """Apply session-wide CLI overrides onto a parametrized config."""
+    cfg.lookup_iteration = lookup_iteration
     if correctness_flag:
         cfg.correctness = True
     if num_iterations is not None:
@@ -1879,6 +1925,7 @@ class TestGpu:
         num_tables,
         sparse_key_range,
         no_torchrec,
+        lookup_iteration,
     ):
         cfg = _apply_overrides(
             cfg,
@@ -1889,6 +1936,7 @@ class TestGpu:
             num_tables,
             sparse_key_range,
             no_torchrec,
+            lookup_iteration,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
@@ -1910,6 +1958,7 @@ class TestCaching:
         num_tables,
         sparse_key_range,
         no_torchrec,
+        lookup_iteration,
     ):
         cfg = _apply_overrides(
             cfg,
@@ -1920,6 +1969,7 @@ class TestCaching:
             num_tables,
             sparse_key_range,
             no_torchrec,
+            lookup_iteration,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
@@ -1941,6 +1991,7 @@ class TestNoCaching:
         num_tables,
         sparse_key_range,
         no_torchrec,
+        lookup_iteration,
     ):
         cfg = _apply_overrides(
             cfg,
@@ -1951,6 +2002,7 @@ class TestNoCaching:
             num_tables,
             sparse_key_range,
             no_torchrec,
+            lookup_iteration,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
@@ -1972,6 +2024,7 @@ class TestNoHbm:
         num_tables,
         sparse_key_range,
         no_torchrec,
+        lookup_iteration,
     ):
         cfg = _apply_overrides(
             cfg,
@@ -1982,6 +2035,7 @@ class TestNoHbm:
             num_tables,
             sparse_key_range,
             no_torchrec,
+            lookup_iteration,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)

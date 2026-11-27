@@ -763,6 +763,32 @@ void reduce_pooled_cache_sgd(at::Tensor inverse, at::Tensor grads, at::Tensor of
 // nullptr). Output row i takes entry entry_of_row[i] of indices and table_ids
 // (entry i when entry_of_row is nullptr), and lies at row out_row[i] of output
 // (row i when out_row is nullptr).
+// Eight lanes transfer a 128-byte segment at a time. Each warp can service
+// four independent rows, interleaving the four segments of their FP32 vectors.
+__global__ void load_uniform_sequence_128(
+    const int64_t *__restrict__ table_ptrs, int64_t table_stride,
+    const int64_t *__restrict__ rows, const int64_t *__restrict__ table_ids,
+    const int64_t *__restrict__ reverse, const int32_t *__restrict__ out_rows,
+    uint4 *__restrict__ output, int64_t output_stride,
+    int64_t capacity, const int64_t *__restrict__ count) {
+  constexpr int lanes = 8;
+  const int lane = threadIdx.x % lanes;
+  const int64_t i = (static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x) / lanes;
+  if (i >= counted_limit(count, capacity)) return;
+  const int64_t entry = reverse[i];
+  const int64_t row = rows[entry];
+  if (row < 0) return;
+  const auto *src = reinterpret_cast<const uint4 *>(table_ptrs[table_ids[entry]]) +
+                    row * table_stride;
+  auto *dst = output + (out_rows ? out_rows[i] : i) * output_stride;
+  uint4 words[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) words[j] = src[j * lanes + lane];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) dst[j * lanes + lane] = words[j];
+}
+
 template <int NumRegions, typename IndexT, typename ValueT>
 __global__ void load_from_flat_table_kernel_vec4(
     int64_t batch, int64_t output_dim, int64_t output_stride,
@@ -987,7 +1013,8 @@ void load_from_flat_table_impl(
     at::Tensor table_emb_dims, int64_t max_emb_dim, bool all_dims_vec4,
     const MaybeTensor &num_valid, std::optional<int64_t> host_num_valid,
     c10::optional<at::Tensor> entry_of_row = c10::nullopt,
-    c10::optional<at::Tensor> out_row = c10::nullopt) {
+    c10::optional<at::Tensor> out_row = c10::nullopt,
+    int64_t uniform_value_dim = 0) {
   const auto *d_num_valid = counted_num_valid_ptr(num_valid, indices.device());
 
   const int64_t capacity = entry_of_row ? entry_of_row->size(0) : indices.size(0);
@@ -1030,6 +1057,24 @@ void load_from_flat_table_impl(
       device_prop.num_sms * (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  if constexpr (NumRegions == 1) {
+    if (entry_of_row_ptr && output_dim == 128 && max_emb_dim == 128 &&
+        uniform_value_dim >= 128 && uniform_value_dim % 4 == 0 &&
+        output.scalar_type() == at::kFloat && indices.scalar_type() == at::kLong &&
+        output.stride(1) == 1 && output_stride % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(output.data_ptr()) % alignof(uint4) == 0) {
+      constexpr int threads = 256;
+      constexpr int rows_per_block = threads / 8;
+      const int blocks = (num_total + rows_per_block - 1) / rows_per_block;
+      load_uniform_sequence_128<<<blocks, threads, 0, stream>>>(
+          table_ptrs.data_ptr<int64_t>(), uniform_value_dim / 4,
+          indices.data_ptr<int64_t>(), table_ids_ptr, entry_of_row_ptr, out_row_ptr,
+          static_cast<uint4 *>(output.data_ptr()), output_stride / 4, num_total, d_num_valid);
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+  }
 
   DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, ValueType, [&] {
     DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
@@ -1089,11 +1134,11 @@ void load_from_flat_table_emb(
     int64_t max_emb_dim, bool all_dims_vec4,
     c10::optional<at::Tensor> entry_of_row, c10::optional<at::Tensor> out_row,
     const MaybeTensor &num_valid,
-    std::optional<int64_t> host_num_valid) {
+    std::optional<int64_t> host_num_valid, int64_t uniform_value_dim) {
   load_from_flat_table_impl<1>(
       table_ptrs, indices, get_pointer<int64_t>(table_ids), 0, output,
       table_value_dims, table_emb_dims, max_emb_dim, all_dims_vec4, num_valid, host_num_valid,
-      entry_of_row, out_row);
+      entry_of_row, out_row, uniform_value_dim);
 }
 
 void load_from_flat_table_value(
@@ -1445,7 +1490,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
         py::arg("all_dims_vec4"), py::arg("entry_of_row") = py::none(),
         py::arg("out_row") = py::none(), py::kw_only(), py::arg("num_valid") = py::none(),
-        py::arg("host_num_valid") = py::none());
+        py::arg("host_num_valid") = py::none(), py::arg("uniform_value_dim") = 0);
 
   m.def("load_from_flat_table_value", &load_from_flat_table_value,
         "Load from flat table: 2-region copy (NumRegions=2, VALUE mode).",

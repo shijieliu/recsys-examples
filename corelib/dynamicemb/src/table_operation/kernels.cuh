@@ -99,19 +99,20 @@ struct CacheLookupRows {
 // A full main bucket is a common negative probe during cache churn. Its
 // 32 lanes inspect consecutive groups of four digests and fetch full keys
 // only for matching tags. Overflow uses its original linear key order.
-template <bool Overflow, bool DistinguishEmpty = false, typename Bucket>
+template <bool Overflow, bool DistinguishEmpty = false, int Lanes = 32, typename Bucket>
 __device__ __forceinline__ int64_t cache_warp_find(
     Bucket bucket, typename Bucket::KeyType key, int64_t hash) {
-  constexpr unsigned full = 0xffffffff;
+  static_assert(Lanes == 8 || Lanes == 32);
+  const unsigned mask = (0xffffffffu >> (32 - Lanes)) << ((threadIdx.x & 31) & ~(Lanes - 1));
   constexpr int per_lane = Overflow ? 1 : Bucket::VectorDim;
-  const int lane = threadIdx.x % 32;
+  const int lane = threadIdx.x % Lanes;
   const int64_t cap = bucket.capacity();
   const int64_t home = hash % cap;
   // The scalar main-table probe starts at the aligned digest-load boundary.
   const int64_t start = Overflow ? home : home - home % Bucket::BufferDim;
   const auto digest = Bucket::digest_to_vector(Bucket::hashcode_to_digest(hash));
   const auto empty_digest = Bucket::digest_to_vector(Bucket::empty_digest());
-  for (int64_t base = 0; base < cap; base += 32 * per_lane) {
+  for (int64_t base = 0; base < cap; base += Lanes * per_lane) {
     const int64_t offset = base + lane * per_lane;
     int64_t pos = start + offset;
     if (pos >= cap) pos -= cap;
@@ -140,11 +141,11 @@ __device__ __forceinline__ int64_t cache_warp_find(
     }
     // In a four-byte digest group insertion tests all matching keys before
     // taking an empty slot. Across groups the first hit or empty wins.
-    const unsigned stop = __ballot_sync(full, match >= 0 || empty);
+    const unsigned stop = (__ballot_sync(mask, match >= 0 || empty) & mask);
     if (stop) {
       // Insertion distinguishes an empty probe chain from a full bucket.
       const int64_t result = match >= 0 ? pos + match : (DistinguishEmpty ? -2 : -1);
-      return __shfl_sync(full, static_cast<long long>(result), __ffs(stop) - 1);
+      return __shfl_sync(mask, static_cast<long long>(result), __ffs(stop) - 1);
     }
   }
   return -1;

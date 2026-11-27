@@ -13,6 +13,11 @@ inline int cache_copy_lane_shift(int64_t row_bytes) {
   return row_bytes <= 256 ? 3 : row_bytes <= 512 ? 4 : 5;
 }
 
+// A tile spans four 128-thread vector instructions, or six for an Adam
+// D128 row: eight 96-vector rows keep both rows and warps whole.
+template <int RowVectors> constexpr int cache_rows_per_tile =
+    RowVectors == 96 ? 8 : 512 / RowVectors;
+
 template <int Stripes>
 __device__ __forceinline__ void copy_cache_stripes(
     const uint4 *src, uint4 *dst, int lane, int lanes) {
@@ -41,6 +46,10 @@ __device__ __forceinline__ void copy_cache_region(
     }
     if (words == 2 * stripe) {
       copy_cache_stripes<2>(in, out, lane, lanes);
+      return;
+    }
+    if (words == 3 * stripe) {
+      copy_cache_stripes<3>(in, out, lane, lanes);
       return;
     }
     if (words == 4 * stripe) {

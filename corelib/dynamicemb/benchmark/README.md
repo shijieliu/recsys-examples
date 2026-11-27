@@ -131,6 +131,41 @@ Correctness is automatically disabled (with a `UserWarning`) when any
 `--profile` mode is set, because profiling captures workloads rather than
 validating them.
 
+### Lookup bandwidth and speed of light
+
+The ordinary benchmark records the CUDA-event latency of each DynamicEmb
+training forward and eval forward in `lookup_steps_ms`. To measure bytes on
+the same workload, capture a single forward with Nsight Compute. Keep the
+number of sampled batches unchanged because it determines the cache footprint.
+For example, run the following commands from `corelib/dynamicemb` on an EOS H100.
+
+```bash
+case_filter="TestCaching and sgd and 0.8"
+launcher=benchmark/benchmark_batched_dynamicemb_tables.sh
+BENCHMARK_RESULTS_FILE=timings.json bash "$launcher" -k "$case_filter"
+
+export BENCHMARK_RESULTS_FILE=capture.json
+ncu --target-processes all --profile-from-start off --nvtx --nvtx-include 'dynamicemb_lookup/' \
+    --replay-mode application --cache-control none --clock-control none \
+    --metrics dram__bytes_read.sum,dram__bytes_write.sum,pcie__read_bytes.sum,pcie__write_bytes.sum \
+    -o lookup bash "$launcher" -k "$case_filter" --profile lookup-eval --lookup-iteration 18
+ncu --import lookup.ncu-rep --page raw --csv --print-units base > lookup.csv
+python benchmark/lookup_bandwidth.py lookup.csv timings.json capture.json \
+    --hbm-gbps 3350 --pcie-gbps 63.015
+```
+
+Use `lookup-train` to capture the training forward, including prefetch.
+Eval runs after the full training loop. Different batches can have very
+different hit rates. In the 80%-footprint reference workload, eval batch
+18 reads from host memory and batch 50 hits entirely in cache.
+
+The H100 SXM example uses aggregate HBM bandwidth and one Gen5 x16 link
+ceiling per PCIe direction, in decimal GB/s. The report divides physical
+counter bytes by unprofiled CUDA-event time. Its lower bound allows all three
+resources to overlap and assumes the observed byte counts stay fixed.
+Useful embedding payload and serialized phase dependencies can be analyzed
+separately using the cache miss and dirty row counts.
+
 ### Nsight Systems (nsys) profiling
 
 `--profile nsys` switches the run to a dedicated nsys-friendly path:
