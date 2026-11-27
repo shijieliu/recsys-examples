@@ -52,6 +52,14 @@ struct EvalTier {
     return -1;
   }
 
+  __device__ void copy(int64_t tid, int64_t row, int64_t word_bytes,
+                       uint8_t *dst, int lane) const {
+    const int64_t stride = value_dims ? value_dims[tid] : value_dim;
+    const int64_t bytes = (emb_dims ? emb_dims[tid] : emb_dim) * word_bytes;
+    const auto *src = reinterpret_cast<const uint8_t *>(ptrs[tid]) + row * stride * word_bytes;
+    copy_cache_region(src, dst, bytes, lane, kEvalLanes);
+  }
+
   __device__ const uint8_t *address(int64_t tid, int64_t row, int64_t word_bytes) const {
     const int64_t stride = value_dims ? value_dims[tid] : value_dim;
     return reinterpret_cast<const uint8_t *>(ptrs[tid]) + row * stride * word_bytes;
@@ -80,9 +88,10 @@ __global__ void lookup_cached_embedding_rows_kernel(
   if (!lane) missing[i] = row < 0;
   if (row < 0) return;
   auto *dst = output + i * primary.emb_dim * word_bytes;
-  const auto &tier = hit ? primary : backing;
-  copy_cache_region(tier.address(tid, row, word_bytes), dst, tier.width(tid, word_bytes),
-                    lane, kEvalLanes);
+  // Keep each tier's layout in registers; taking the address of a selected
+  // kernel-argument struct can spill it to thread-local memory.
+  if (hit) primary.copy(tid, row, word_bytes, dst, lane);
+  else backing.copy(tid, row, word_bytes, dst, lane);
 }
 
 // On a single HBM tier the hash probe is short. Use a different request per
