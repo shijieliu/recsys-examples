@@ -66,7 +66,11 @@ from dynamicemb.dynamicemb_config import (
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
-from dynamicemb.initializer import MultiTableInitializer, fp8_out_of_range_risk
+from dynamicemb.initializer import (
+    ConstantInitializer,
+    MultiTableInitializer,
+    fp8_out_of_range_risk,
+)
 from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
@@ -909,6 +913,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             [option.eval_initializer_args for option in self._dynamicemb_options],
             device,
         )
+        if (
+            type(self._eval_initializer) is ConstantInitializer
+            and type(self._storage) is DynamicEmbStorage
+            and (self._cache is not None or self._storage._state.tables[0].is_device_buffer())
+        ):
+            self._eval_initializer.prepare_eval_rows(
+                device, self._storage.embedding_dtype(), self._storage.max_embedding_dim()
+            )
 
     def _create_admitter(self) -> None:
         """Turn the tables' admission configurations into the one this runs.

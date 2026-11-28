@@ -142,7 +142,7 @@ __device__ __forceinline__ int read_only_probe_128(
 __global__ void lookup_hbm_embedding_rows_kernel(
     EvalTier tier, const uint64_t *keys, const int64_t *tids,
     const int64_t *count, int64_t capacity, int64_t word_bytes,
-    uint8_t *output, bool *missing) {
+    uint8_t *output, bool *missing, const uint8_t *defaults, int64_t default_stride) {
   const int lane = threadIdx.x & 31;
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t base = i - lane;
@@ -178,7 +178,11 @@ __global__ void lookup_hbm_embedding_rows_kernel(
         }
       }
     }
-    missing[i] = !src;
+    if (missing) missing[i] = !src;
+    if (!src && defaults) {
+      src = defaults + tid * default_stride;
+      bytes = tier.emb_dim * word_bytes;
+    }
   }
   for (int j = lane / kEvalLanes; j < 32; j += 32 / kEvalLanes) {
     const auto addr = __shfl_sync(0xffffffff, reinterpret_cast<unsigned long long>(src), j);
@@ -188,6 +192,23 @@ __global__ void lookup_hbm_embedding_rows_kernel(
       copy_cache_region(reinterpret_cast<const uint8_t *>(addr), dst, width,
                         lane % kEvalLanes, kEvalLanes);
     }
+  }
+}
+
+// Look at one flag per lane and cooperate only on rows missing from both tiers.
+// The common all-hit case reads a contiguous byte mask and performs no stores.
+__global__ void fill_missing_eval_rows(
+    const bool *missing, const int64_t *tids, const int64_t *count, int64_t n,
+    const uint8_t *defaults, int64_t default_stride, uint8_t *out, int64_t row_bytes) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int64_t live = counted_limit(count, n);
+  unsigned todo = __ballot_sync(0xffffffff, i < live && missing[i]);
+  while (todo) {
+    const int64_t row = i - lane + __ffs(todo) - 1;
+    const auto *src = defaults + (default_stride ? tids[row] * default_stride : 0);
+    copy_cache_region(src, out + row * row_bytes, row_bytes, lane, 32);
+    todo &= todo - 1;
   }
 }
 
@@ -232,10 +253,11 @@ EvalTier eval_tier(const EvalMap &spec, at::Device device, int64_t tables) {
           ptrs.data_ptr<int64_t>(), per_table(edims), per_table(widths), edim, width};
 }
 
-std::tuple<at::Tensor, at::Tensor, CacheOptionalTensor> lookup_embedding_rows(
+std::tuple<at::Tensor, CacheOptionalTensor, CacheOptionalTensor> lookup_embedding_rows(
     at::Tensor keys, at::Tensor tids, const EvalMap &primary_map,
     const std::optional<OverflowMap> &overflow_map, const std::optional<EvalMap> &backing_map,
-    const CacheOptionalTensor &num_valid, std::optional<int64_t> host_num_valid, bool record_hits) {
+    const CacheOptionalTensor &num_valid, std::optional<int64_t> host_num_valid, bool record_hits,
+    const CacheOptionalTensor &defaults) {
   TORCH_CHECK(keys.is_cuda() && (keys.scalar_type() == at::kLong || keys.scalar_type() == at::kUInt64),
               "expected 64-bit CUDA keys");
   const auto device = keys.device();
@@ -265,10 +287,23 @@ std::tuple<at::Tensor, at::Tensor, CacheOptionalTensor> lookup_embedding_rows(
   const int64_t n = counted_host_limit(host_num_valid, keys.numel());
   const auto *count = counted_num_valid_ptr(num_valid, device);
   auto output = at::empty({keys.numel(), primary.emb_dim}, keys.options().dtype(dtype));
-  auto missing = at::empty_like(keys, keys.options().dtype(at::kBool));
-  CacheOptionalTensor hits;
+  CacheOptionalTensor missing, hits;
+  const uint8_t *default_ptr = nullptr;
+  int64_t default_stride = 0;
+  if (defaults) {
+    TORCH_CHECK(defaults->device() == device && defaults->scalar_type() == dtype &&
+                defaults->is_contiguous() && defaults->dim() == 2 &&
+                (defaults->size(0) == 1 || defaults->size(0) == tables) &&
+                defaults->size(1) == primary.emb_dim, "invalid eval default rows");
+    default_ptr = static_cast<const uint8_t *>(defaults->data_ptr());
+    default_stride = defaults->size(0) == 1 ? 0 : primary.emb_dim * output.element_size();
+  }
+  if (backing_map || !defaults) {
+    missing = at::empty_like(keys, keys.options().dtype(at::kBool));
+  }
+  auto *misses = missing ? missing->data_ptr<bool>() : nullptr;
   TORCH_CHECK(!record_hits || backing_map, "hit metrics require a cache");
-  if (record_hits) hits = at::empty_like(missing);
+  if (record_hits) hits = at::empty_like(keys, keys.options().dtype(at::kBool));
   if (n) {
     constexpr int threads = 256;
     const int blocks = (n + threads / kEvalLanes - 1) / (threads / kEvalLanes);
@@ -279,17 +314,23 @@ std::tuple<at::Tensor, at::Tensor, CacheOptionalTensor> lookup_embedding_rows(
     if (backing_map) {
       lookup_cached_embedding_rows_kernel<<<blocks, threads, 0, stream>>>(
           primary, overflow, ovf_offsets, backing, input, table_ids, count, n,
-          output.element_size(), out, missing.data_ptr<bool>(), hits ? hits->data_ptr<bool>() : nullptr);
+          output.element_size(), out, misses, hits ? hits->data_ptr<bool>() : nullptr);
+      if (defaults) {
+        DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+        fill_missing_eval_rows<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+            misses, table_ids, count, n, default_ptr, default_stride, out,
+            primary.emb_dim * output.element_size());
+      }
     } else {
       TORCH_CHECK(!overflow_map, "direct HBM lookup expects a single map");
       TORCH_CHECK(primary.table.bucket_capacity_ % Table::BucketType::BufferDim == 0,
                   "direct HBM lookup requires a bucket with complete 16-byte digest vectors");
       lookup_hbm_embedding_rows_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
-          primary, input, table_ids, count, n, output.element_size(), out, missing.data_ptr<bool>());
+          primary, input, table_ids, count, n, output.element_size(), out, misses, default_ptr, default_stride);
     }
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  return {output, missing, hits};
+  return {output, defaults ? std::nullopt : missing, hits};
 }
 } // namespace
 } // namespace dyn_emb
@@ -298,5 +339,6 @@ void bind_cache_eval(py::module &m) {
   m.def("lookup_embedding_rows", &dyn_emb::lookup_embedding_rows, py::arg("keys"),
         py::arg("table_ids"), py::arg("primary_map"), py::arg("overflow"),
         py::arg("backing_map"), py::arg("num_valid") = py::none(),
-        py::arg("host_num_valid") = py::none(), py::arg("record_cache_hits") = false);
+        py::arg("host_num_valid") = py::none(), py::arg("record_cache_hits") = false,
+        py::arg("defaults") = py::none());
 }

@@ -38,6 +38,7 @@ import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.device_count import read_host_count
+from dynamicemb.initializer import ConstantInitializer
 from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
     META_EMBEDDING_DIM,
     META_EMBEDDING_DTYPE,
@@ -4793,7 +4794,10 @@ def _eval_lookup_storage(
             num_valid,
             host_num_valid,
             False,
+            initializer._eval_rows if type(initializer) is ConstantInitializer else None,
         )
+        if missing is None:
+            return embs
         num_missing, missing_indices, _ = flagged_compact(
             missing, [], num_valid, host_num_valid=host_num_valid
         )
@@ -4847,9 +4851,12 @@ def _eval_lookup_cached(
             keys.to(table.key_type), table_ids, _eval_row_map(cache._state),
             overflow, _eval_row_map(storage._state), num_valid, host_num_valid,
             cache._record_cache_metrics,
+            initializer._eval_rows if type(initializer) is ConstantInitializer else None,
         )
         if hits is not None:
             cache.record_lookup_metrics(hits, num_valid, host_num_valid)
+        if missing is None:
+            return embs
         # Stable selection preserves input order, including the assignment of
         # RNG state to each missing embedding in the ordinary initializer.
         num_missing, positions, _ = flagged_compact(

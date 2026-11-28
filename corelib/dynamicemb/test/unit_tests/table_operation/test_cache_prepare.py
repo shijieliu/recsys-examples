@@ -495,6 +495,20 @@ def test_eval_lookup_copies_final_rows(dtype, host_n, device_n):
         keys, tids, (cache_map, cache_layout), overflow, (backing_map, backing_layout),
         _ids([device_n]), host_n, True,
     )
+    defaults = torch.arange(8, device="cuda").view(2, 4).to(dtype)
+    filled, no_mask, filled_hits = lookup_embedding_rows(
+        keys, tids, (cache_map, cache_layout), overflow, (backing_map, backing_layout),
+        _ids([device_n]), host_n, True, defaults,
+    )
+    assert no_mask is None
+    assert torch.equal(filled_hits[:8], hits[:8])
+    for i in range(8):
+        tid = tids[i].item()
+        if missing[i]:
+            assert torch.equal(filled[i], defaults[tid])
+        else:
+            width = [3, 4][tid]
+            assert torch.equal(filled[i, :width], values[i, :width])
     ck = cache.lookup_with_overflow(keys[:8], tids[:8], const)
     _, back_hits, back_rows = backing.lookup(keys[:8], tids[:8], const)
     assert torch.equal(hits[:8], ck[1])
