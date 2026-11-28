@@ -318,3 +318,32 @@ def test_eval_ranges_falls_back_for_custom_initializer():
     out = eval_lookup(model._storage, keys, None, init, table_ranges=ranges,
                       num_valid=torch.tensor([8], device="cuda"), host_num_valid=5)
     torch.testing.assert_close(out[:4], torch.tensor([11.,12.,123.,130.], device="cuda")[:,None].expand(-1,128))
+
+
+def test_mapped_eval_converts_host_values_for_mixed_dtype_hybrid():
+    from dataclasses import replace
+    from dynamicemb.key_value_table import HybridStorage, _insert_key_values
+    from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
+
+    primary = DynamicEmbTableOptions(
+        dim=8, index_type=torch.int64, embedding_dtype=torch.float32,
+        device_id=torch.cuda.current_device(), init_capacity=128, max_capacity=128,
+        bucket_capacity=128, local_hbm_for_values=4096, caching=False,
+    )
+    backing = replace(primary, embedding_dtype=torch.float16, local_hbm_for_values=0)
+    storage = HybridStorage([primary], [backing], SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+    keys = torch.tensor([7, 11, 13, 11], device="cuda")
+    ids = torch.zeros_like(keys)
+    rows = torch.arange(16, device="cuda", dtype=torch.float32).view(2, 8) / 3
+    _insert_key_values(storage._hbm, keys[:1], ids[:1], rows[:1], None, False)
+    _insert_key_values(storage._host, keys[1:2], ids[1:2], rows[1:].half(), None, False)
+    storage.training = False
+
+    def fill_missing(output, keys, count, tids, positions):
+        assert positions[:count.item()].tolist() == [2]
+        output[2].fill_(-7)
+
+    out = _eval_lookup_storage(storage, keys, ids, fill_missing)
+    host_row = rows[1].half().float()
+    expected = torch.stack((rows[0], host_row, torch.full_like(rows[0], -7), host_row))
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)

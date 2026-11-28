@@ -4778,7 +4778,14 @@ def _readonly_eval_states(storage):
         return None, None
     if primary.training or primary.key_index_map.enable_overflow_:
         return None, None
-    if backing is not None and (backing.training or backing.key_index_map.enable_overflow_):
+    # A manually constructed hybrid may need its ordinary converting gather.
+    if backing is not None and (
+        backing.training
+        or backing.key_index_map.enable_overflow_
+        or backing.emb_dtype != primary.emb_dtype
+        or backing.emb_dim != primary.emb_dim
+        or backing.num_tables != primary.num_tables
+    ):
         return None, None
     return primary, backing
 
