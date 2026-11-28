@@ -301,8 +301,9 @@ def test_deferred_cache_exchange(width, reserve, has_victims):
         assert torch.equal(backing_rows[physical[:n]], dirty)
 
 
-def test_ordered_duplex_preserves_staging_and_dirty_destinations():
-    bucket, n, width = 1024, 32768, 128
+@pytest.mark.parametrize("width,offset_word,n", [(128, 0, 32768), (384, 1, 132096)])
+def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_word, n):
+    bucket = 1024
     cache = get_scored_table([n], bucket_capacity=bucket, enable_overflow=True)
     backing = get_scored_table([4 * n], bucket_capacity=bucket, use_rows=True)
     candidates = torch.arange(5 * n, device="cuda") + 1
@@ -319,9 +320,15 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations():
     old_slots = cache.insert(old, torch.zeros_like(old), score)
 
     device = keys.device
-    host_owner = HostExtendableBuffer((2 * n, width), torch.float32, device)
-    backing_rows = host_owner.tensor()
-    truth = torch.arange(2 * n * width, device=device, dtype=torch.float32).view(-1, width)
+    # The one-word offset exercises raw table pointers that cannot use a
+    # 16-byte vector or bulk store. The three stripes represent weights and moments.
+    owner = HostExtendableBuffer((2 * n * width + offset_word,), torch.float32, device)
+    words = owner.tensor()
+    backing_rows = words[offset_word:].view(-1, width)
+    indices = torch.arange(2 * n * width, device=device, dtype=torch.int32)
+    truth = (indices % (1 << 23)).float().view(-1, width)
+    # Keep rows identifiable even across repeated exact-FP32 word patterns.
+    truth[:, 0] = torch.arange(2 * n, device=device)
     backing_rows[physical.to(backing_rows.device)] = truth.to(backing_rows.device)
     dirty = -truth[:n] - 1
     cached = torch.empty((n + cache.overflow_bucket_capacity_, width), device=device)
