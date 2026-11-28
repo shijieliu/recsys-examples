@@ -275,6 +275,21 @@ class UniformInitializer(MultiTableInitializer):
 
 
 class ConstantInitializer(MultiTableInitializer):
+    _eval_rows: Optional[torch.Tensor] = None
+
+    def prepare_eval_rows(self, device, dtype, width):
+        """Encode default rows once using the table's ordinary initializer.
+
+        Tables with the same constant share a single row. The native lookup
+        can copy its raw bytes for any storage dtype, including FP8.
+        """
+        per_table = self._table_params is not None
+        rows = self._table_params.shape[0] if per_table else 1
+        values = torch.empty((rows, width), dtype=dtype, device=device)
+        table_ids = torch.arange(rows, device=device) if per_table else None
+        self(values, None, table_ids=table_ids)
+        self._eval_rows = values
+
     @staticmethod
     def table_param_rows(args_list):
         return [[args.value] for args in args_list]

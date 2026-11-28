@@ -37,7 +37,7 @@ namespace dyn_emb {
  * @param keys Input keys tensor (int64 or uint64), sorted by table.
  * @param segmented_range Table boundary offsets (int64, size = num_tables+1).
  *                        segmented_range[t] is the start index in keys for
- *                        table t; segmented_range[num_tables] == num_keys.
+ *                        table t; segmented_range[num_tables] is the live input length, at most num_keys.
  * @param num_tables Total number of tables
  * @param input_frequencies Controls frequency counting behavior:
  *                          - Undefined/empty tensor with numel()==0: Enable

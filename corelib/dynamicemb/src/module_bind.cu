@@ -28,6 +28,7 @@ void bind_index_calculation_op(py::module &m);
 void bind_initializer_op(py::module &m);
 void bind_table_operation(py::module &m);
 void bind_cache_prepare(py::module &m);
+void bind_cache_eval(py::module &m);
 void bind_cache_exchange(py::module &m);
 void bind_vmm_op(py::module &m);
 #ifndef DEMB_NO_HIER_OUTPUT_DIST // defined by setup.py without NCCL >= 2.30.7
@@ -46,6 +47,7 @@ PYBIND11_MODULE(dynamicemb_extensions, m) {
   bind_utils(m);
   bind_table_operation(m);
   bind_cache_prepare(m);
+  bind_cache_eval(m);
   bind_cache_exchange(m);
   bind_vmm_op(m);
 #ifndef DEMB_NO_HIER_OUTPUT_DIST

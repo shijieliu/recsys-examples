@@ -24,11 +24,11 @@ namespace dyn_emb {
 
 // Largest offset index with offsets[i] <= row. Equal offsets skip empty segments.
 __device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
-                                                         int n, int64_t val) {
+                                                         int n, int64_t val, int64_t stride = 1) {
   int lo = 0, hi = n;
   while (lo < hi) {
     int mid = (lo + hi) / 2;
-    if (arr[mid] <= val) {
+    if (arr[mid * stride] <= val) {
       lo = mid + 1;
     } else {
       hi = mid;

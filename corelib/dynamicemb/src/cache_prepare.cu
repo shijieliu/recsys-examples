@@ -41,6 +41,7 @@ struct StagingRows {
   bool fp32_words;
   bool ftrl;
   bool *missing;
+  bool defer_backing_hits;
 };
 
 template <typename V, typename Generator>
@@ -70,7 +71,9 @@ __device__ __forceinline__ void initialize_cache_row(
 // vector reads per lane before writing contiguous staging memory.
 template <int RowVectors>
 __device__ void stage_full_rows(const StagingRows &rows, uint4 *values) {
-  constexpr int tile_rows = 128 * 4 / RowVectors;
+  constexpr int tile_rows = cache_rows_per_tile<RowVectors>;
+  constexpr int iterations = tile_rows * RowVectors / 128;
+  static_assert((tile_rows * RowVectors) % 128 == 0);
   __shared__ const uint4 *sources[tile_rows];
   const int t = threadIdx.x;
   const int64_t n = *rows.num_misses;
@@ -86,21 +89,21 @@ __device__ void stage_full_rows(const StagingRows &rows, uint4 *values) {
     if (!__syncthreads_or(unsafe)) {
       // The block-wide metadata barrier verified every row is present and
       // aligned. Adjacent threads now write adjacent vectors of staging.
-      uint4 data[4];
+      uint4 data[iterations];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
+      for (int j = 0; j < iterations; ++j) {
         const auto *src = sources[(j * 128 + t) / RowVectors] + (j * 128 + t) % RowVectors;
         auto &v = data[j];
         asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" :
                      "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src));
       }
 #pragma unroll
-      for (int j = 0; j < 4; ++j)
+      for (int j = 0; j < iterations; ++j)
         values[begin * RowVectors + t + j * 128] = data[j];
     } else if constexpr (RowVectors == 16) {
       CacheTransfer256 transfers[4];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
+      for (int j = 0; j < iterations; ++j) {
         const int row = j * 8 + t / 16;
         transfers[j].src = sources[row];
         transfers[j].dst = sources[row] ? values + (begin + row) * 16 : nullptr;
@@ -108,7 +111,7 @@ __device__ void stage_full_rows(const StagingRows &rows, uint4 *values) {
       copy_cache_transfers_256(transfers, t % 16);
     } else {
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
+      for (int j = 0; j < iterations; ++j) {
         const int vector = j * 128 + t;
         const auto *row = sources[vector / RowVectors];
         if (!row) continue;
@@ -136,9 +139,22 @@ void stage_cache_misses_kernel(StagingRows rows, V *values,
       stage_full_rows<16>(rows, reinterpret_cast<uint4 *>(values));
       return;
     }
-  } else if (!rows.layout_tags && rows.max_value_dim * sizeof(V) == 1024 && *rows.num_new == 0) {
-    stage_full_rows<64>(rows, reinterpret_cast<uint4 *>(values));
-    return;
+  } else if (!rows.layout_tags) {
+    const int64_t bytes = rows.max_value_dim * sizeof(V);
+    if ((bytes == 512 || bytes == 1024 || bytes == 1536) && *rows.num_new == 0) {
+      if (rows.defer_backing_hits) {
+        const int64_t n = *rows.num_misses;
+        for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+             i += int64_t(blockDim.x) * gridDim.x)
+          rows.missing[i] = false;
+        return;
+      }
+      auto *out = reinterpret_cast<uint4 *>(values);
+      if (bytes == 512) stage_full_rows<32>(rows, out);
+      else if (bytes == 1024) stage_full_rows<64>(rows, out);
+      else stage_full_rows<96>(rows, out);
+      return;
+    }
   }
   const int lanes = 1 << lane_shift;
   const int lane = threadIdx.x & (lanes - 1);
@@ -269,7 +285,7 @@ PrepareResult prepare_cache_lookup(
     const BackingLookupMap &backing, const CacheValueLayout &layout,
     const CacheScoreArg &cache_score, const CacheScoreArg &backing_score,
     const InitializerSpec &init, CacheOptionalTensor weights,
-    CacheOptionalTensor scores) {
+    CacheOptionalTensor scores, CacheOptionalTensor deferred_sources) {
   const auto &[main, buckets, bucket_capacity, pins, overflow, overflow_capacity,
                overflow_offsets, score_words, global_caps] = cache;
   const auto &[back_table, back_buckets, back_capacity, back_rows, back_words,
@@ -315,6 +331,12 @@ PrepareResult prepare_cache_lookup(
   TORCH_CHECK(policy != ScorePolicyType::LruLfu || back_words == 2,
               "LruLfu requires two backing score words");
   check_initializer(init, keys, tables, dtype);
+  if (deferred_sources) {
+    const auto row_bytes = max_value * c10::elementSize(dtype);
+    TORCH_CHECK(!vdims && (row_bytes == 512 || row_bytes == 1536),
+                "deferred reads require uniform 512- or 1536-byte rows");
+    check_vector(*deferred_sources, device, at::kLong, 0, "deferred source output");
+  }
   auto values = at::empty({keys.numel(), max_value}, keys.options().dtype(dtype));
   auto missing = at::empty({keys.numel()}, keys.options().dtype(at::kBool));
   auto num_unique = key_offsets.narrow(0, tables, 1);
@@ -331,6 +353,7 @@ PrepareResult prepare_cache_lookup(
         num_unique, false, {});
     auto &miss_keys = *fields[0];
     auto &miss_ids = *fields[1];
+    if (deferred_sources) deferred_sources->set_(*fields[4]);
     // Selection produces the new-row count before staging. On an all-backing-
     // hit batch the payload kernel can skip the initializer, including its
     // RNG worker mapping, without reading a count on the CPU.
@@ -342,7 +365,7 @@ PrepareResult prepare_cache_lookup(
                        fields[4]->data_ptr<int64_t>(), fields[5] ? fields[5]->data_ptr<int64_t>() : nullptr,
                        edims ? edims->data_ptr<int64_t>() : nullptr,
                        vdims ? vdims->data_ptr<int64_t>() : nullptr, max_emb, max_value, initial_accum,
-                       words, ftrl, missing.data_ptr<bool>()};
+                       words, ftrl, missing.data_ptr<bool>(), bool(deferred_sources)};
       constexpr int block = StageLaunch::block;
       // Preserve the random generator's worker-to-element assignment.
       const int lane_shift = rng ? 5 : cache_copy_lane_shift(max_value * values.element_size());
@@ -389,5 +412,5 @@ void bind_cache_prepare(py::module &m) {
         py::arg("keys"), py::arg("key_offsets"), py::arg("cache_map"),
         py::arg("backing_map"), py::arg("value_layout"), py::arg("cache_score"),
         py::arg("backing_score"), py::arg("initializer"), py::arg("weights") = py::none(),
-        py::arg("scores") = py::none());
+        py::arg("scores") = py::none(), py::arg("deferred_sources") = py::none());
 }

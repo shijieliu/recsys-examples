@@ -38,6 +38,7 @@ import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.device_count import read_host_count
+from dynamicemb.initializer import ConstantInitializer
 from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
     META_EMBEDDING_DIM,
     META_EMBEDDING_DTYPE,
@@ -93,6 +94,10 @@ from dynamicemb_extensions import (
     fill_rows,
     flagged_compact,
     gather_embedding,
+    expand_table_ids_cuda,
+    grouped_mapped_eval,
+    lookup_embedding_rows,
+    segmented_unique_cuda,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
@@ -1481,6 +1486,11 @@ def load_from_flat_by(
         out_rows,
         num_valid=num_valid,
         host_num_valid=host_num_valid,
+        uniform_value_dim=(
+            state.value_dim
+            if state.uniform_value_shape and not state.key_index_map.enable_overflow_
+            else 0
+        ),
     )
 
 
@@ -4737,22 +4747,125 @@ def flush_cache(
 # ---------------------------------------------------------------------------
 
 
+def _cache_value_layout(state: DynamicEmbTableState):
+    return (
+        state.table_ptrs_dev,
+        None if state.uniform_value_shape else state.table_emb_dims,
+        None if state.uniform_value_shape else state.table_value_dims,
+        state.emb_dim,
+        state.value_dim,
+        state.emb_dtype,
+    )
+
+
+def _backing_lookup_map(state: DynamicEmbTableState):
+    table = state.key_index_map
+    return (
+        table.table_storage_, table.table_bucket_offsets_, table.bucket_capacity_,
+        table.rows_, table.num_scores_, table.table_global_capacities_,
+    )
+
+
+def _eval_row_map(state: DynamicEmbTableState):
+    return _backing_lookup_map(state), _cache_value_layout(state)
+
+
+def _readonly_eval_states(storage):
+    """Return the concrete value tiers an eval probe may read, in lookup order."""
+    if type(storage) is DynamicEmbStorage:
+        primary, backing = storage._state, None
+    elif type(storage) is HybridStorage:
+        primary, backing = storage._hbm, storage._host
+    else:
+        return None, None
+    if primary.training or primary.key_index_map.enable_overflow_:
+        return None, None
+    # A manually constructed hybrid may need its ordinary converting gather.
+    if backing is not None and (
+        backing.training
+        or backing.key_index_map.enable_overflow_
+        or backing.emb_dtype != primary.emb_dtype
+        or backing.emb_dim != primary.emb_dim
+        or backing.num_tables != primary.num_tables
+    ):
+        return None, None
+    return primary, backing
+
+
+def _expand_eval_ranges(ranges, capacity, num_valid):
+    # Generic storage and custom initializers consume one table ID per key.
+    # The final boundary excludes padded keys from those consumers.
+    table_ids = expand_table_ids_cuda(ranges.contiguous(), capacity)
+    end = ranges[-1:]
+    count = end if num_valid is None else torch.minimum(end, num_valid.reshape(1))
+    return table_ids, count
+
+
+_MIN_GROUPED_HOST_EVAL_KEYS = 262144
+
+
 def _eval_lookup_storage(
     storage: Storage,
     keys: torch.Tensor,
-    table_ids: torch.Tensor,
+    table_ids: Optional[torch.Tensor],
     initializer: Callable,
     num_valid: Optional[torch.Tensor] = None,
     *,
     host_num_valid: Optional[int] = None,
+    table_ranges: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    (num_missing, _, missing_indices, _, _, _, _, embs) = storage.find(
-        keys,
-        table_ids,
-        copy_mode=CopyMode.EMBEDDING,
-        num_valid=num_valid,
-        host_num_valid=host_num_valid,
-    )
+    state, backing = _readonly_eval_states(storage)
+    defaults = initializer._eval_rows if type(initializer) is ConstantInitializer else None
+    if table_ids is None and (state is None or backing is not None or defaults is None):
+        table_ids, num_valid = _expand_eval_ranges(table_ranges, keys.numel(), num_valid)
+    if state is not None:
+        keys = keys.to(state.key_index_map.key_type).contiguous()
+        # On mapped host storage, group repeated requests by source address
+        # before reading across PCIe. Smaller batches use the direct probe.
+        if (
+            table_ids is None
+            and num_valid is None
+            and host_num_valid is None
+            and state.uniform_value_shape
+            and state.emb_dim * state.emb_dtype.itemsize == 512
+            and not state.tables[0].is_device_buffer()
+            and _MIN_GROUPED_HOST_EVAL_KEYS <= keys.numel() < 2**31 - 1
+            and state.num_tables <= 1024
+        ):
+            ranges = table_ranges.contiguous()
+            _, unique, inverse, unique_ranges, _ = segmented_unique_cuda(
+                keys, ranges, state.num_tables, None
+            )
+            return grouped_mapped_eval(
+                unique, unique_ranges, inverse, ranges[-1:], _eval_row_map(state), defaults
+            )
+        if table_ids is not None:
+            table_ids = table_ids.contiguous()
+        embs, missing, _ = lookup_embedding_rows(
+            keys,
+            table_ids,
+            _eval_row_map(state),
+            None,
+            _eval_row_map(backing) if backing is not None else None,
+            num_valid,
+            host_num_valid,
+            False,
+            defaults,
+            table_ranges if table_ids is None else None,
+        )
+        if missing is None:
+            return embs
+        num_missing, missing_indices, _ = flagged_compact(
+            missing, [], num_valid, host_num_valid=host_num_valid
+        )
+    else:
+        num_missing, _, missing_indices, _, _, _, _, embs = storage.find(
+            keys,
+            table_ids,
+            copy_mode=CopyMode.EMBEDDING,
+            num_valid=num_valid,
+            host_num_valid=host_num_valid,
+        )
     initializer(
         embs,
         keys,
@@ -4773,6 +4886,42 @@ def _eval_lookup_cached(
     *,
     host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
+    if (
+        isinstance(cache, DynamicEmbCache)
+        and isinstance(storage, DynamicEmbStorage)
+        and not cache._state.training
+        and not storage._state.training
+        and not storage._state.key_index_map.enable_overflow_
+    ):
+        cache._check_placement()
+        table = cache._state.key_index_map
+        overflow = (
+            table.overflow_table_storage_,
+            table.overflow_bucket_capacity_,
+            table.overflow_output_offsets_,
+        )
+        # Both tiers are read-only. Probe backing only on a cache miss and
+        # copy each embedding directly into its final output row.
+        keys = keys.contiguous()
+        table_ids = table_ids.contiguous()
+        embs, missing, hits = lookup_embedding_rows(
+            keys.to(table.key_type), table_ids, _eval_row_map(cache._state),
+            overflow, _eval_row_map(storage._state), num_valid, host_num_valid,
+            cache._record_cache_metrics,
+            initializer._eval_rows if type(initializer) is ConstantInitializer else None,
+        )
+        if hits is not None:
+            cache.record_lookup_metrics(hits, num_valid, host_num_valid)
+        if missing is None:
+            return embs
+        # Stable selection preserves input order, including the assignment of
+        # RNG state to each missing embedding in the ordinary initializer.
+        num_missing, positions, _ = flagged_compact(
+            missing, [], num_valid, host_num_valid=host_num_valid
+        )
+        initializer(embs, keys, num_missing, table_ids, positions)
+        return embs
+
     _, founds, cache_indices = cache.lookup(
         keys, table_ids, num_valid=num_valid, host_num_valid=host_num_valid
     )
@@ -4827,12 +4976,13 @@ def _eval_lookup_cached(
 def eval_lookup(
     storage: Storage,
     keys: torch.Tensor,
-    table_ids: torch.Tensor,
+    table_ids: Optional[torch.Tensor],
     initializer: Callable,
     *,
     num_valid: Optional[torch.Tensor] = None,
     cache: Optional[Cache] = None,
     host_num_valid: Optional[int] = None,
+    table_ranges: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eval-only lookup (no insertion, no admission, no backward) of the first
     ``num_valid`` keys.
@@ -4846,6 +4996,8 @@ def eval_lookup(
     of ``keys``, of which only the first ``num_valid`` are defined.
     """
     assert keys.dim() == 1
+    if (table_ids is None) == (table_ranges is None):
+        raise ValueError("Supply either table_ids or table_ranges.")
     if keys.numel() == 0:
         return torch.empty(
             0,
@@ -4861,7 +5013,10 @@ def eval_lookup(
             initializer,
             num_valid,
             host_num_valid=host_num_valid,
+            table_ranges=table_ranges,
         )
+    if table_ids is None:
+        table_ids, num_valid = _expand_eval_ranges(table_ranges, keys.numel(), num_valid)
     return _eval_lookup_cached(
         cache,
         storage,

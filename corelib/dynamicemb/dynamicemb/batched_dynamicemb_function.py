@@ -19,7 +19,7 @@ from enum import Enum, auto
 from typing import Callable, ContextManager, Optional, Tuple
 
 import torch
-from dynamicemb.async_erase import table_section
+from dynamicemb.async_erase import TableAccessGate, table_section
 from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
@@ -29,6 +29,8 @@ from dynamicemb.key_value_table import (
     DynamicEmbTableState,
     Storage,
     _append_evicted,
+    _cache_value_layout,
+    _backing_lookup_map,
     _find_keys,
     _lookup_keys,
     eval_lookup,
@@ -444,17 +446,6 @@ def _select_cache_rows(
         )
 
 
-def _cache_value_layout(state: DynamicEmbTableState):
-    return (
-        state.table_ptrs_dev,
-        None if state.uniform_value_shape else state.table_emb_dims,
-        None if state.uniform_value_shape else state.table_value_dims,
-        state.emb_dim,
-        state.value_dim,
-        state.emb_dtype,
-    )
-
-
 def _prefetch_cache_path(
     cache: DynamicEmbCache,
     storage: DynamicEmbStorage,
@@ -466,6 +457,8 @@ def _prefetch_cache_path(
     admitter: Optional[MultiTableAdmitter],
     external_storage: Optional[Storage] = None,
     key_scores: Optional[torch.Tensor] = None,
+    *,
+    gated: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
     """Stage cache misses, apply admission, and exchange rows with backing storage."""
     with torch.cuda.nvtx.range("_prefetch_cache_path"):
@@ -488,14 +481,7 @@ def _prefetch_cache_path(
             table.num_scores_,
             table.table_global_capacities_,
         )
-        backing_map = (
-            back.table_storage_,
-            back.table_bucket_offsets_,
-            back.bucket_capacity_,
-            back.rows_,
-            back.num_scores_,
-            back.table_global_capacities_,
-        )
+        backing_map = _backing_lookup_map(backing)
         backing_values = _cache_value_layout(backing)
         score_input = score_source(backing, accumulated_frequency, key_scores)
         cache_score = get_find_score_arg(state, unique_keys.numel(), device)
@@ -510,9 +496,22 @@ def _prefetch_cache_path(
             isinstance(optimizer, FTRLDynamicEmbeddingOptimizer),
         )
 
-        # Prepare pins cache hits and updates backing scores for every key. It
-        # stages complete backing values and initializes provisional rows before
-        # either table can evict a value needed by this batch.
+        # While the gate protects the backing rows, an exchange with no new
+        # keys can overlap its reads with writeback of disjoint cache victims.
+        deterministic = os.environ.get("DEMB_DETERMINISM_MODE") is not None
+        deferred_sources = None
+        if (
+            gated
+            and admitter is None
+            and external_storage is None
+            and not deterministic
+            and not _is_hbm_storage(storage)
+            and state.uniform_value_shape
+            and backing.uniform_value_shape
+            and backing.value_dim * backing.emb_dtype.itemsize in (512, 1536)
+            and unique_keys.numel() >= 4096
+        ):
+            deferred_sources = torch.empty(0, dtype=torch.int64, device=device)
         with torch.cuda.nvtx.range("op:prepare_cache_lookup"):
             miss_mask, slots, tids, num_misses, unique_rows, staged, missing = (
                 prepare_cache_lookup(
@@ -526,6 +525,7 @@ def _prefetch_cache_path(
                     init,
                     accumulated_frequency if admitter is not None else None,
                     score_input,
+                    deferred_sources=deferred_sources,
                 )
             )
 
@@ -573,7 +573,9 @@ def _prefetch_cache_path(
                     slots,
                     spill=external_storage is not None,
                     retain=EvictedItemMode.RETAIN_KEY in backing.evicted_item_mode,
-                    deterministic=os.environ.get("DEMB_DETERMINISM_MODE") is not None,
+                    deterministic=deterministic,
+                    backing_on_host=not backing.tables[0].is_device_buffer(),
+                    deferred_sources=deferred_sources,
                 )
             try:
                 # An external store can be user-defined Python. Deliver backing
@@ -897,6 +899,7 @@ def dynamicemb_prefetch(
                     admitter,
                     external_storage,
                     key_scores=unique_scores,
+                    gated=isinstance(table_gate, TableAccessGate),
                 )
                 # The cache addresses its own value buffer by cache slot: a cache is
                 # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
@@ -938,64 +941,60 @@ def dynamicemb_prefetch(
         )
 
 
-def dynamicemb_eval_forward(
+def dynamicemb_eval_sequence_forward(
+    indices: torch.Tensor,
+    cache: Optional[Cache],
+    storage: Storage,
+    table_ranges: torch.Tensor,
+    output_dtype: torch.dtype,
+    initializer: MultiTableInitializer,
+    embedding_dim: int,
+    output_alloc: Optional[OutputAlloc],
+) -> torch.Tensor:
+    """Look up one output row per input key in its original order."""
+    with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
+        ranges = table_ranges.long()
+        output_embs = eval_lookup(
+            storage,
+            indices,
+            None,
+            initializer,
+            cache=cache,
+            table_ranges=ranges,
+        )
+        # Decode stored FP8 values before converting or copying into caller-owned output.
+        output_embs = decode_table_values(output_embs, output_dtype)
+        alloc = (
+            output_alloc(indices.numel(), embedding_dim, output_dtype)
+            if output_alloc is not None
+            else None
+        )
+        if alloc is not None:
+            out, out_rows = alloc
+            if out_rows is None:
+                return out.copy_(output_embs)
+            return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
+        return output_embs
+
+
+def dynamicemb_eval_pooled_forward(
     indices: torch.Tensor,
     offsets: torch.Tensor,
     cache: Optional[Cache],
     storage: Storage,
-    feature_offsets: torch.Tensor,
+    indices_table_range: torch.Tensor,
     output_dtype: torch.dtype,
     initializer: MultiTableInitializer,
     layout: EmbeddingLayout,
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     pooling_weights: Optional[torch.Tensor] = None,
-    output_alloc: Optional[OutputAlloc] = None,
 ) -> torch.Tensor:
-    """Eval-only forward for all storage configurations (no autograd).
-
-    A sequence lookup's rows go where ``output_alloc`` says, if it has a
-    buffer for them (a call on the hierarchical dist whose lookup a pipeline
-    runs in eval mode), converted to ``output_dtype`` on the way.
-    """
+    """Look up distinct embeddings and reduce them into the requested bags."""
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
-        assert feature_offsets.numel() > 1
-
-        is_pooling = layout.is_pooling
+        assert indices_table_range.numel() > 1
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
-
-        indices_table_range = get_table_range(offsets, feature_offsets)
-
-        if not is_pooling:
-            table_ids = expand_table_ids_cuda(
-                indices_table_range,
-                indices.numel(),
-            )
-            output_embs = eval_lookup(
-                storage,
-                indices,
-                table_ids,
-                initializer,
-                cache=cache,
-                num_valid=indices_table_range[-1:].long(),
-            )
-            # Decode first: the allocator's copies below only convert dtypes, so
-            # an fp8 table's stored codes (256x the weights) would be copied out.
-            # Always: for any other table this is a ``.to`` that returns the
-            # tensor itself when the dtype already matches.
-            output_embs = decode_table_values(output_embs, output_dtype)
-            alloc = (
-                output_alloc(*layout.sequence_shape(), output_dtype)
-                if output_alloc is not None
-                else None
-            )
-            if alloc is not None:
-                out, out_rows = alloc
-                if out_rows is None:
-                    return out.copy_(output_embs)
-                return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
-            return output_embs
 
         frequency_counts_int64 = (
             frequency_counters.long() if frequency_counters is not None else None

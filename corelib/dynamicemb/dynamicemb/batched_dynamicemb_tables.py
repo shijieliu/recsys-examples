@@ -37,7 +37,8 @@ from dynamicemb.batched_dynamicemb_function import (
     OutputAlloc,
     PrefetchState,
     StorageMode,
-    dynamicemb_eval_forward,
+    dynamicemb_eval_pooled_forward,
+    dynamicemb_eval_sequence_forward,
     dynamicemb_prefetch,
     refresh_slots_after_rehash,
     release_slot_pins,
@@ -66,7 +67,11 @@ from dynamicemb.dynamicemb_config import (
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
-from dynamicemb.initializer import MultiTableInitializer, fp8_out_of_range_risk
+from dynamicemb.initializer import (
+    ConstantInitializer,
+    MultiTableInitializer,
+    fp8_out_of_range_risk,
+)
 from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
@@ -102,7 +107,7 @@ from dynamicemb.utils import (
     FP8_STORAGE_DTYPE,
     checkpoint_dtype,
 )
-from dynamicemb_extensions import device_timestamp
+from dynamicemb_extensions import device_timestamp, get_table_range
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
     CounterBasedRegularizationDefinition,
@@ -909,6 +914,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             [option.eval_initializer_args for option in self._dynamicemb_options],
             device,
         )
+        if (
+            type(self._eval_initializer) is ConstantInitializer
+            and type(self._storage) in (DynamicEmbStorage, HybridStorage)
+        ):
+            self._eval_initializer.prepare_eval_rows(
+                device, self._storage.embedding_dtype(), self._storage.max_embedding_dim()
+            )
 
     def _create_admitter(self) -> None:
         """Turn the tables' admission configurations into the one this runs.
@@ -1178,19 +1190,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size = (
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
-        # Built per call because batch_size comes from the input; see
-        # dynamicemb/lookup_layout.py for what the fields mean.
-        layout = EmbeddingLayout(
-            pooling_mode=self.pooling_mode,
-            batch_size=batch_size,
-            feature_num=self.feature_num,
-            num_keys=indices.numel(),
-            total_D=self.total_D,
-            max_D=self.max_D,
-            common_D=self.common_D,
-            D_offsets=self.D_offsets_t,
-            feature_dims_vec4=self.feature_dims_vec4,
-        )
         if pooling_weights is not None:
             if frequency_counters is not None:
                 # Both are fed from the single KJT weights channel: the
@@ -1247,19 +1246,57 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
-            return dynamicemb_eval_forward(
+            if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+                if self.common_D is None or self.D_offsets_t is not None:
+                    raise ValueError("sequence lookup requires a uniform embedding dimension")
+                if (
+                    type(self._storage) is DynamicEmbStorage
+                    and self._cache is None
+                    and len(self.table_offsets_in_feature) == self.feature_num + 1
+                ):
+                    # One table starts at every feature. The jagged offsets already
+                    # contain every table boundary, separated by batch_size entries.
+                    table_ranges = offsets[::batch_size]
+                else:
+                    table_ranges = get_table_range(offsets, self.feature_offsets)
+                return dynamicemb_eval_sequence_forward(
+                    indices,
+                    self._cache,
+                    self._storage,
+                    table_ranges,
+                    self.output_dtype,
+                    self._eval_initializer,
+                    self.common_D,
+                    self.output_alloc,
+                )
+
+        # Built per call because batch_size comes from the input; see
+        # dynamicemb/lookup_layout.py for what the fields mean.
+        layout = EmbeddingLayout(
+            pooling_mode=self.pooling_mode,
+            batch_size=batch_size,
+            feature_num=self.feature_num,
+            num_keys=indices.numel(),
+            total_D=self.total_D,
+            max_D=self.max_D,
+            common_D=self.common_D,
+            D_offsets=self.D_offsets_t,
+            feature_dims_vec4=self.feature_dims_vec4,
+        )
+        if not self.training:
+            table_ranges = get_table_range(offsets, self.feature_offsets)
+            return dynamicemb_eval_pooled_forward(
                 indices,
                 offsets,
                 self._cache,
                 self._storage,
-                self.feature_offsets,
+                table_ranges,
                 self.output_dtype,
                 self._eval_initializer,
                 layout,
                 self._evict_strategy,
                 frequency_counters,
                 pooling_weights,
-                self.output_alloc,
             )
 
         if any([not o.training for o in self._dynamicemb_options]):

@@ -27,7 +27,7 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.key_value_table import get_insert_score_arg, store_to_flat
+from dynamicemb.key_value_table import get_insert_score_arg, load_from_flat, store_to_flat
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.types import CopyMode
 
@@ -49,11 +49,11 @@ def nan_for_unwritten_memory():
     torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
 
 
-def make_model():
+def make_model(cache_rows=CACHE_ROWS, dim=DIM):
     assert torch.cuda.is_available()
     options = [
         DynamicEmbTableOptions(
-            dim=DIM,
+            dim=dim,
             max_capacity=STORAGE_CAPACITY,
             init_capacity=STORAGE_CAPACITY,
             bucket_capacity=128,
@@ -61,7 +61,7 @@ def make_model():
             index_type=torch.int64,
             embedding_dtype=torch.float32,
             # SGD keeps no optimizer state: a row is DIM floats.
-            local_hbm_for_values=CACHE_ROWS * DIM * 4,
+            local_hbm_for_values=cache_rows * dim * 4,
             caching=True,
             # A row holds its key: key % 100000 in every column.
             initializer_args=DynamicEmbInitializerArgs(
@@ -82,9 +82,9 @@ def make_model():
     assert cache is not None
     km = cache._state.key_index_map
     # One bucket and an overflow area of three: the state's capacity counts both.
-    assert km.capacity_ == CACHE_ROWS
+    assert km.capacity_ == cache_rows
     assert km.overflow_bucket_capacity_ == 3 * CACHE_ROWS
-    assert cache._state.capacity == CACHE_SLOTS
+    assert cache._state.capacity == cache_rows + km.overflow_bucket_capacity_
     return model
 
 
@@ -95,10 +95,12 @@ def prefetch(model, keys):
     return model._prefetch_states[-1]
 
 
-def test_refused_keys_stop_the_prefetch_and_keep_the_storage():
-    model = make_model()
-    # The failing prefetch hits key 1 and evicts a dirty row for key 10001.
-    warm_keys = torch.tensor([1, 10001], dtype=torch.int64, device="cuda")
+@pytest.mark.parametrize("preload_backing,num_keys", [(False, 6000), (True, 6000), (True, 40960)])
+def test_refused_keys_stop_the_prefetch_and_keep_the_storage(preload_backing, num_keys):
+    dim = 128 if preload_backing else DIM
+    model = make_model(dim=dim)
+    # The failing prefetch hits key 1 and evicts one dirty row outside the requested keys.
+    warm_keys = torch.tensor([1, num_keys + 1], dtype=torch.int64, device="cuda")
     offsets = torch.tensor([0, 2], dtype=torch.int64, device="cuda")
     with torch.no_grad():
         model(warm_keys, offsets)
@@ -106,11 +108,16 @@ def test_refused_keys_stop_the_prefetch_and_keep_the_storage():
     victim_tid = torch.zeros_like(victim)
     _, found, slot = model._cache.lookup(victim, victim_tid, num_valid=full_count(victim))
     assert found.item()
-    dirty_value = torch.full((1, DIM), -7.0, device="cuda")
+    dirty_value = torch.full((1, dim), -7.0, device="cuda")
     store_to_flat(
         model._cache._state, slot, victim_tid, dirty_value, num_valid=full_count(slot)
     )
-    keys = torch.arange(1, 6001, dtype=torch.int64, device="cuda")
+    keys = torch.arange(1, num_keys + 1, dtype=torch.int64, device="cuda")
+    if preload_backing:
+        # The zero-new report permits deferred reads until the same report
+        # reveals refusals. The accepted rows must still get their values.
+        stored = keys[1:].float()[:, None].expand(-1, dim).contiguous()
+        model._storage.insert(keys[1:], torch.zeros_like(keys[1:]), stored)
     with pytest.raises(
         RuntimeError, match=rf"could not place {keys.numel() - CACHE_SLOTS} keys"
     ):
@@ -130,8 +137,14 @@ def test_refused_keys_stop_the_prefetch_and_keep_the_storage():
     )
     founds, values = found[5], found[7]
     assert bool(founds.all())
-    expected = (keys % 100000).float()[:, None].expand(-1, DIM)
+    expected = (keys % 100000).float()[:, None].expand(-1, dim)
     torch.testing.assert_close(values, expected, rtol=0, atol=0)
+    if preload_backing:
+        _, cached, slots = model._cache.lookup(keys, table_ids)
+        reads = load_from_flat(
+            model._cache._state, slots[cached], table_ids[cached], copy_mode=CopyMode.EMBEDDING
+        )
+        torch.testing.assert_close(reads, expected[cached], rtol=0, atol=0)
     found = model._storage.find(
         victim, victim_tid, copy_mode=CopyMode.EMBEDDING, num_valid=full_count(victim)
     )
@@ -185,6 +198,56 @@ def test_dense_reservation_evicts_oldest_unpinned_rows(monkeypatch):
     assert int(table._ref_counter.sum()) == 525
 
 
+@pytest.mark.parametrize(
+    ("num_misses", "scores"),
+    [(8, "ascending"), (96, "ascending"), (31, "equal"),
+     (31, "shared_bits"), (31, "wide"), (31, "cross_word")],
+)
+def test_sparse_cache_reservation_keeps_oldest_unpinned_order(monkeypatch, num_misses, scores):
+    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
+    model = make_model(cache_rows=16 * CACHE_ROWS)
+    table = model._cache._state.key_index_map
+    # Concentrate all new keys in one bucket of an otherwise much larger
+    # cache. Eight misses skip ranking, 31 use the short list, and 96
+    # exhaust it and exercise the ordinary exact LRU search.
+    keys = torch.arange(1, 48 * CACHE_ROWS, device="cuda")
+    grouped, offsets, _ = table.bucketize_keys(keys, torch.zeros_like(keys))
+    assert offsets[1].item() >= CACHE_ROWS + num_misses
+    old = grouped[:CACHE_ROWS].contiguous()
+    incoming = grouped[CACHE_ROWS:CACHE_ROWS + num_misses].contiguous()
+    tids = torch.zeros_like(old)
+    with torch.no_grad():
+        model(old, old.new_tensor([0, old.numel()]))
+    prefetch(model, old[:25])
+    score = torch.arange(CACHE_ROWS, device=old.device)
+    if scores == "equal":
+        score.zero_()
+    elif scores == "shared_bits":
+        score = (1 << 40) | ((score % 19) << 10) | 5
+    elif scores == "wide":
+        score = ((score % 3) << 36) | (score % 19)
+    elif scores == "cross_word":
+        score = (1 << 33) - 2048 + (score * 71 % 4096)
+    name = table.score_names_[0]
+    _, present, old_slots = table.lookup(old, tids, ScoreArg(name, score, ScorePolicy.ASSIGN))
+    assert present.all()
+    # Equal scores preserve the scalar reducer's physical slot tie-break.
+    order = old_slots[25:].argsort() + 25
+    victims = order[score[order].argsort(stable=True)[:num_misses]]
+    expected = torch.ones_like(present)
+    expected[victims] = False
+
+    # Capacity >=4096 selects the cooperative reservation, while the exact
+    # device count is only num_misses and the spare suffix is uninitialized.
+    prefetch(model, incoming.repeat((4096 + num_misses - 1) // num_misses))
+    readonly = ScoreArg(name, None, ScorePolicy.CONST)
+    _, present, _ = table.lookup(old, tids, readonly)
+    torch.testing.assert_close(present, expected)
+    _, present, slots = table.lookup(incoming, tids[:num_misses], readonly)
+    assert present.all() and slots.unique().numel() == num_misses
+    assert int(table._ref_counter.sum()) == 25 + num_misses
+
+
 def test_failed_preparation_preserves_dirty_victim_and_hit_pins(monkeypatch):
     model = make_model()
     warm = torch.tensor([1, 10001], device="cuda")
@@ -203,16 +266,16 @@ def test_failed_preparation_preserves_dirty_victim_and_hit_pins(monkeypatch):
     prepare = lookup.prepare_cache_lookup
     fail_once = True
 
-    def fail_during_compaction(*args):
+    def fail_during_compaction(*args, **kwargs):
         nonlocal fail_once
         if fail_once:
             fail_once = False
             # The first probe pins the warm row. An invalid weight column then
             # fails while the native op is packing the misses.
             return prepare(
-                *args[:-2], torch.zeros_like(args[0], dtype=torch.float32), args[-1]
+                *args[:-2], torch.zeros_like(args[0], dtype=torch.float32), args[-1], **kwargs
             )
-        return prepare(*args)
+        return prepare(*args, **kwargs)
 
     monkeypatch.setattr(lookup, "prepare_cache_lookup", fail_during_compaction)
     with pytest.raises(RuntimeError, match="8-byte"):

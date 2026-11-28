@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "cache_batch.cuh"
+#include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAException.h>
+#include <cub/device/device_radix_sort.cuh>
 #include "cache_row_copy.cuh"
 #include "cache_deterministic.h"
 #include <c10/cuda/CUDAGuard.h>
@@ -157,8 +160,9 @@ __global__ void install_rows_tiled(ValuePointers table, SlotLayout map, const in
                                    const int64_t *tids, const uint4 *staged,
                                    const int64_t *outputs, int64_t *unique_slots,
                                    int64_t output_size, int64_t count) {
-  constexpr int vectors_per_tile = 512;
-  constexpr int tile_rows = vectors_per_tile / RowVectors;
+  constexpr int tile_rows = cache_rows_per_tile<RowVectors>;
+  constexpr int vectors_per_tile = tile_rows * RowVectors;
+  static_assert(vectors_per_tile % kThreads == 0);
   constexpr int iterations = vectors_per_tile / kThreads;
   __shared__ uintptr_t dst[tile_rows];
   const int t = threadIdx.x;
@@ -299,6 +303,198 @@ __global__ void copy_victims_dense_256(const int64_t *sources, const int64_t *ta
   copy_cache_transfers_256(transfers, lane);
 }
 
+// Adjacent CTAs pull a tile of incoming rows and push a tile of dirty rows.
+// Every warp issues whole 128-byte segments in each direction.
+template <int RowVectors>
+__global__ void exchange_backing_rows(const int64_t *incoming, uint4 *staged,
+                                      int64_t n, const int64_t *dirty_sources,
+                                      const int64_t *dirty_targets, int64_t victims,
+                                      const int64_t *new_count) {
+  if (new_count && *new_count) return;  // prepare already staged a mixed batch
+  constexpr int tile_rows = cache_rows_per_tile<RowVectors>;
+  constexpr int iterations = tile_rows * RowVectors / kThreads;
+  static_assert(tile_rows * RowVectors % kThreads == 0);
+  const bool writeback = dirty_sources && (blockIdx.x & 1);
+  const int64_t tile = dirty_sources ? blockIdx.x / 2 : blockIdx.x;
+  const int64_t first = tile * tile_rows;
+  const int64_t limit = writeback ? victims : n;
+  if (first >= limit) return;
+
+  uint4 data[iterations];
+  uint4 *targets[iterations];
+#pragma unroll
+  for (int j = 0; j < iterations; ++j) {
+    const int vec = j * kThreads + threadIdx.x;
+    const int64_t row = first + vec / RowVectors;
+    targets[j] = nullptr;
+    if (row >= limit) continue;
+    const int column = vec % RowVectors;
+    const auto *src = reinterpret_cast<const uint4 *>(
+        writeback ? dirty_sources[row] : incoming[row]);
+    auto *dst = writeback ? reinterpret_cast<uint4 *>(dirty_targets[row])
+                          : staged + row * RowVectors;
+    if (!src || !dst) continue;
+    if ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) {
+      memcpy(reinterpret_cast<char *>(dst) + column * sizeof(uint4),
+             reinterpret_cast<const char *>(src) + column * sizeof(uint4), sizeof(uint4));
+      continue;
+    }
+    targets[j] = dst + column;
+    auto &v = data[j];
+    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" :
+                 "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src + column));
+  }
+#pragma unroll
+  for (int j = 0; j < iterations; ++j) {
+    if (targets[j]) *targets[j] = data[j];
+  }
+}
+
+void transfer_backing_rows(const Tensor &incoming, Tensor &values, int64_t n,
+                           const int64_t *dirty_sources, const int64_t *dirty_targets,
+                           int64_t victims, const int64_t *new_count, cudaStream_t stream) {
+  const auto launch = [&](auto row_vectors) {
+    constexpr int width = decltype(row_vectors)::value;
+    constexpr int tile_rows = cache_rows_per_tile<width>;
+    const int64_t tiles = (n + tile_rows - 1) / tile_rows;
+    exchange_backing_rows<width><<<dirty_sources ? 2 * tiles : tiles, kThreads, 0, stream>>>(
+        incoming.data_ptr<int64_t>(), static_cast<uint4 *>(values.data_ptr()), n,
+        dirty_sources, dirty_targets, victims, new_count);
+  };
+  if (values.size(1) * values.element_size() == 512)
+    launch(std::integral_constant<int, 32>{});
+  else
+    launch(std::integral_constant<int, 96>{});
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Sort transient address pairs; slot publication and retained keys still use
+// the reservation's original row order.
+std::pair<Tensor, Tensor> group_host_addresses(const Tensor &addresses, const Tensor &partners,
+                                              cudaStream_t stream) {
+  auto out_addresses = at::empty_like(addresses);
+  auto out_partners = at::empty_like(partners);
+  // Keep nearby mapped backing pages together. Skipping the page offset lets
+  // CUB avoid spending radix passes ordering separate rows of the same page.
+  constexpr int first_bit = 21, last_bit = 49;
+  size_t bytes = 0;
+  auto sort = [&](void *storage) {
+    return cub::DeviceRadixSort::SortPairs(
+        storage, bytes, addresses.data_ptr<int64_t>(), out_addresses.data_ptr<int64_t>(),
+        partners.data_ptr<int64_t>(), out_partners.data_ptr<int64_t>(), addresses.numel(),
+        first_bit, last_bit, stream);
+  };
+  C10_CUDA_CHECK(sort(nullptr));
+  auto tmp = at::empty({static_cast<int64_t>(bytes)}, addresses.options().dtype(at::kByte));
+  C10_CUDA_CHECK(sort(tmp.data_ptr()));
+  return {out_addresses, out_partners};
+}
+
+// Order reads and writes by their shared 512 KiB host region, then by
+// direction. The unsorted low bits retain the original row index, so we
+// can find the full addresses and the staging row after one radix sort.
+constexpr int kOrdinalBits = 33;
+constexpr uint64_t kOrdinalMask = (uint64_t{1} << kOrdinalBits) - 1;
+constexpr uint64_t kRegionMask = (uint64_t{1} << 30) - 1;
+
+__global__ void encode_exchange_order(
+    const int64_t *incoming, int64_t n, const int64_t *dirty, int64_t victims,
+    uint64_t *order) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n + victims) return;
+  const bool write = i >= n;
+  const int64_t index = write ? i - n : i;
+  const uint64_t address = write ? dirty[index] : incoming[index];
+  const uint64_t region = (address >> 19) & kRegionMask;
+  order[i] = (((region << 1) | write) << kOrdinalBits) | uint64_t(index);
+}
+
+Tensor group_exchange_rows(const Tensor &incoming, int64_t n, const Tensor &targets,
+                           cudaStream_t stream) {
+  const int64_t total = n + targets.numel();
+  auto keys = at::empty({total}, incoming.options());
+  auto sorted = at::empty_like(keys);
+  auto *in = reinterpret_cast<uint64_t *>(keys.data_ptr<int64_t>());
+  auto *out = reinterpret_cast<uint64_t *>(sorted.data_ptr<int64_t>());
+  encode_exchange_order<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+      incoming.data_ptr<int64_t>(), n, targets.data_ptr<int64_t>(), targets.numel(), in);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  size_t bytes = 0;
+  auto sort = [&](void *storage) {
+    return cub::DeviceRadixSort::SortKeys(storage, bytes, in, out, total, kOrdinalBits, 64, stream);
+  };
+  C10_CUDA_CHECK(sort(nullptr));
+  auto tmp = at::empty({static_cast<int64_t>(bytes)}, incoming.options().dtype(at::kByte));
+  C10_CUDA_CHECK(sort(tmp.data_ptr()));
+  return sorted;
+}
+
+// Nearby reads and dirty writes travel in the same worklist. A warp holds
+// four rows in flight and each lane copies one vector per 512-byte stripe.
+constexpr int64_t kMinOrderedVictims = 32768;
+template <int RowVectors, bool Prefetch = false>
+__global__ void exchange_ordered_rows(
+    const int64_t *incoming, const int64_t *order, uint4 *staged, int64_t n,
+    const int64_t *dirty_sources, const int64_t *dirty_targets, int64_t victims,
+    const int64_t *live_count = nullptr, const int64_t *new_count = nullptr) {
+  if constexpr (Prefetch) {
+    // Mixed batches were already initialized and copied by preparation.
+    if (*new_count || *live_count < kMinOrderedVictims) return;
+    n = n < *live_count ? n : *live_count;
+  }
+  constexpr int rows_per_warp = 4, warps = kThreads / 32;
+  constexpr int rows_per_tile = rows_per_warp * warps;
+  constexpr int stripes = RowVectors / 32;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int64_t limit = n + victims;
+  for (int64_t base = int64_t(blockIdx.x) * rows_per_tile; base < limit;
+       base += int64_t(gridDim.x) * rows_per_tile) {
+    const uint4 *src[rows_per_warp];
+    uint4 *dst[rows_per_warp], payload[rows_per_warp][stripes];
+#pragma unroll
+    for (int j = 0; j < rows_per_warp; ++j) {
+      const int64_t i = base + j * warps + warp;
+      src[j] = nullptr;
+      dst[j] = nullptr;
+      if (i < limit) {
+        const uint64_t key = Prefetch ? uint64_t(i) : uint64_t(order[i]);
+        const bool push = !Prefetch && ((key >> kOrdinalBits) & 1);
+        const int64_t index = key & kOrdinalMask;
+        src[j] = reinterpret_cast<const uint4 *>(push ? dirty_sources[index] : incoming[index]);
+        dst[j] = push ? reinterpret_cast<uint4 *>(dirty_targets[index]) : staged + index * RowVectors;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < rows_per_warp; ++j) {
+      if (!src[j] || !dst[j]) continue;
+      if ((reinterpret_cast<uintptr_t>(src[j]) | reinterpret_cast<uintptr_t>(dst[j])) & 15) {
+#pragma unroll
+        for (int v = 0; v < stripes; ++v) {
+          const int offset = (v * 32 + lane) * sizeof(uint4);
+          memcpy(reinterpret_cast<char *>(dst[j]) + offset,
+                 reinterpret_cast<const char *>(src[j]) + offset, sizeof(uint4));
+        }
+        dst[j] = nullptr;
+      } else {
+#pragma unroll
+        for (int v = 0; v < stripes; ++v) {
+          if constexpr (Prefetch)
+            payload[j][v] = __ldcg(src[j] + v * 32 + lane);
+          else
+            payload[j][v] = src[j][v * 32 + lane];
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < rows_per_warp; ++j) {
+      if (!src[j] || !dst[j]) continue;
+#pragma unroll
+      for (int v = 0; v < stripes; ++v)
+        dst[j][v * 32 + lane] = payload[j][v];
+    }
+  }
+}
+
 template <typename F>
 void launch_rows(const Tensor &values, int64_t bound, F &&kernel) {
   if (bound == 0) return;
@@ -320,7 +516,7 @@ ExchangeResult exchange_cache_storage(
     const MutationLayout &mutation_layout, const CacheScoreArg &cache_score,
     const CacheScoreArg &backing_score, const CacheCandidates &candidates,
     const BackingCandidates &new_backing, Tensor values, Tensor slot_indices,
-    bool spill, bool retain, bool deterministic) {
+    bool spill, bool retain, bool deterministic, Opt deferred_sources, bool backing_on_host) {
   const auto &[cache_storage, cache_offsets, cache_cap, pins, overflow, ovf_cap,
                ovf_offsets, cache_words, cache_global] = cache_map;
   const auto &[back_storage, back_offsets, back_cap, rows, back_words, back_global] = backing_map;
@@ -386,6 +582,14 @@ ExchangeResult exchange_cache_storage(
   };
   check_scores(cache_score, n, cache_words);
   check_scores(backing_score, b_keys.numel(), back_words);
+  if (deferred_sources) {
+    check(*deferred_sources, at::kLong, n);
+    const auto row_bytes = values.size(1) * values.element_size();
+    TORCH_CHECK(!spill && !deterministic && !c_rows && !std::get<2>(cache_values) &&
+                    !std::get<2>(backing_values) && values.size(0) >= n &&
+                    (row_bytes == 512 || row_bytes == 1536),
+                "invalid deferred cache exchange");
+  }
   check(c_tids, at::kLong, n);
   check(output_rows, at::kLong, n);
   if (c_rows) check(*c_rows, at::kLong, n);
@@ -442,9 +646,38 @@ ExchangeResult exchange_cache_storage(
   auto status = at::empty({4}, c_tids.options());
   auto host = at::empty({4}, c_tids.options().device(at::kCPU).pinned_memory(true));
   auto stream = at::cuda::getCurrentCUDAStream(values.device().index());
-  // Everything a backing hit supplied was staged before admission. Reserving
-  // cache slots first makes its placement report the only host decision here.
+  const int64_t width_bytes = values.size(1) * values.element_size();
+  int64_t prefix_bound = 0;
+  at::cuda::CUDAEvent prefix_event;
+  bool prefix_pending = false;
+  auto join_prefix = [&] {
+    if (prefix_pending) {
+      prefix_event.block(stream);
+      prefix_pending = false;
+    }
+  };
+  // Cache reservation reports backing admissions without another host wait.
   try {
+    if (deferred_sources && backing_on_host && !retain && width_bytes == 512 && n >= kMinOrderedVictims &&
+        std::get<1>(cache_score) == ScorePolicyType::GlobalTimer) {
+      // The backing map and staged values are stable while only cache metadata
+      // is reserved. Joining the caller stream before publishing or unwinding
+      // keeps all tensor views and their physical backing owners alive.
+      auto prefetch_stream = at::cuda::getStreamFromPool(false, values.get_device());
+      if (prefetch_stream == stream) prefetch_stream = at::cuda::getStreamFromPool(false, values.get_device());
+      // Waiting on an event snapshots its current record. Allocate it here
+      // before issuing reads, then re-record it on the reader for the join.
+      prefix_event.record(stream);
+      prefix_event.block(prefetch_stream);
+      prefix_bound = std::min<int64_t>(n, (24 << 20) / width_bytes);
+      const int grid = std::max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount / 4);
+      exchange_ordered_rows<32, true><<<grid, kThreads, 0, prefetch_stream>>>(
+          deferred_sources->data_ptr<int64_t>(), nullptr, static_cast<uint4 *>(values.data_ptr()),
+          prefix_bound, nullptr, nullptr, 0, c_count.data_ptr<int64_t>(), new_count);
+      prefix_event.record(prefetch_stream);
+      prefix_pending = true;
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     auto ranked = !deterministic && std::get<1>(cache_score) == ScorePolicyType::GlobalTimer
                       ? try_ranked_cache_reservation(cache_map, cache_sizes, ovf_sizes,
                                                      c_keys, c_tids, c_count, b_count, status)
@@ -462,11 +695,35 @@ ExchangeResult exchange_cache_storage(
     const int64_t attempted = counts[0], evicted = counts[1], refused = counts[2];
     TORCH_CHECK(attempted >= 0 && attempted <= n && refused >= 0 &&
                     refused <= evicted && evicted <= attempted, "invalid cache placement report");
-    if (attempted == 0) return {0, 0, 0, {}};
+    if (attempted == 0) {
+      join_prefix();
+      return {0, 0, 0, {}};
+    }
 
     const auto backing_limit = std::min(attempted, b_keys.numel());
     const int64_t backing_bound =
         ranked ? std::clamp<int64_t>(counts[3], 0, backing_limit) : backing_limit;
+    const bool short_rows = width_bytes == 512;
+    // Limit sorting to the large sparse exchanges of uniform rows.
+    const bool order_duplex = backing_on_host && evicted >= kMinOrderedVictims &&
+                              (short_rows || width_bytes == 1536) &&
+                              attempted <= static_cast<int64_t>(kOrdinalMask) &&
+                              evicted <= static_cast<int64_t>(kOrdinalMask);
+    const bool duplex = deferred_sources && ranked && backing_bound == 0 &&
+                        refused == 0 && evicted > 0 && (!short_rows || order_duplex);
+    // On mixed/refused or unranked paths, leave all backing mutations and
+    // reads in their established order. The prefix worker is a no-op for
+    // mixed batches. A successful ordered exchange can overlap victim lookup.
+    if (!duplex) join_prefix();
+    const int64_t prefix = attempted < kMinOrderedVictims ? 0 : std::min(prefix_bound, attempted);
+    const int64_t remaining = attempted - prefix;
+    if (deferred_sources && !duplex && remaining && (!ranked || backing_bound == 0)) {
+      // A fallback with no new backing rows may have prefetched some inputs.
+      // The device predicate skips this read if preparation staged a mixed batch.
+      auto sources = prefix ? deferred_sources->narrow(0, prefix, remaining) : *deferred_sources;
+      auto staged = prefix ? values.narrow(0, prefix, remaining) : values;
+      transfer_backing_rows(sources, staged, remaining, nullptr, nullptr, 0, ranked ? nullptr : new_count, stream);
+    }
     auto [back_slots, back_count, back_keys, victim_slots, back_scores, victim_tids] =
         back.insert(b_keys, b_tids, b_count, backing_score, spill, retain,
                     deterministic, {}, backing_bound);
@@ -513,9 +770,39 @@ ExchangeResult exchange_cache_storage(
       auto addresses = lookup_backing_values(
           backing_map, backing_values, ev_keys, ev_tids, {std::nullopt, ScorePolicyType::Const},
           {}, {}, std::get<0>(cache_values), ev_slots);
+      Tensor targets = addresses.backing, sources = *addresses.sources;
+      if (!duplex && backing_on_host && !spill && !addresses.layout_tags &&
+          victims >= 32768 && short_rows) {
+        std::tie(targets, sources) = group_host_addresses(targets, sources, stream);
+      }
       Opt gone_values;
       if (spill) gone_values = at::empty({victims, values.size(1)}, values.options());
-      if (!spill && !addresses.layout_tags && values.size(1) * values.element_size() == 256) {
+      if (duplex && order_duplex) {
+        // Each incoming key missed cache, and all true hits are pinned.
+        // With no backing insert the victims and inputs own disjoint rows.
+        auto incoming = prefix ? deferred_sources->narrow(0, prefix, remaining) : *deferred_sources;
+        auto order = group_exchange_rows(incoming, remaining, targets, stream);
+        const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        const auto exchange_rows = [&](auto vectors) {
+          constexpr int width = decltype(vectors)::value;
+          // Limit the number of sparse host regions in flight. Three-stripe
+          // Adam rows benefit from twice as many blocks as single-stripe SGD rows.
+          const int grid = std::max(1, sms / (width == 32 ? 4 : 2));
+          exchange_ordered_rows<width><<<grid, kThreads, 0, stream>>>(
+              incoming.data_ptr<int64_t>(), order.data_ptr<int64_t>(),
+              static_cast<uint4 *>(values.data_ptr()) + prefix * width, remaining, sources.data_ptr<int64_t>(),
+              targets.data_ptr<int64_t>(), victims);
+        };
+        if (short_rows) exchange_rows(std::integral_constant<int, 32>{});
+        else exchange_rows(std::integral_constant<int, 96>{});
+        DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+      } else if (duplex) {
+        // Unique miss keys and eviction victims identify disjoint backing
+        // rows. With no backing insert, every source address is still valid.
+        transfer_backing_rows(*deferred_sources, values, attempted,
+                              addresses.sources->data_ptr<int64_t>(),
+                              addresses.backing.data_ptr<int64_t>(), victims, nullptr, stream);
+      } else if (!spill && !addresses.layout_tags && values.size(1) * values.element_size() == 256) {
         constexpr int rows_per_block = kThreads / 16 * 4;
         copy_victims_dense_256<<<(victims + rows_per_block - 1) / rows_per_block,
                                  kThreads, 0, stream>>>(
@@ -525,7 +812,7 @@ ExchangeResult exchange_cache_storage(
         launch_rows(values, victims, [&](auto word, int grid, int shift) {
           using W = decltype(word);
           copy_victims<W><<<grid, kThreads, 0, stream>>>(
-              cv, addresses.sources->data_ptr<int64_t>(), addresses.backing.data_ptr<int64_t>(),
+              cv, sources.data_ptr<int64_t>(), targets.data_ptr<int64_t>(),
               addresses.layout_tags ? addresses.layout_tags->data_ptr<int64_t>() : nullptr,
               gone_values ? static_cast<W *>(gone_values->data_ptr()) : nullptr,
               values.stride(0), victims, shift);
@@ -537,6 +824,7 @@ ExchangeResult exchange_cache_storage(
         spills.emplace_back(*fields[0], *fields[1], gone_values, gone_count, gone_rows);
       }
     }
+    join_prefix();
     // Dirty cache slots have reached backing or spill buffers. On partial
     // refusal the accepted rows still receive their values, but no new pin
     // belongs to this failed batch and no slot is published for backward.
@@ -545,10 +833,11 @@ ExchangeResult exchange_cache_storage(
     // the gathered sources and ragged table layouts on the general copier.
     if (!cv.value_dims && !cache_inputs && attempted >= 4096 && attempted <= values.size(0) &&
         reinterpret_cast<uintptr_t>(values.data_ptr()) % alignof(uint4) == 0 &&
-        (row_bytes == 256 || row_bytes == 1024 || row_bytes == 2048)) {
+        (row_bytes == 256 || row_bytes == 512 || row_bytes == 1024 ||
+         row_bytes == 1536 || row_bytes == 2048)) {
       const auto launch_tile = [&](auto row_vectors) {
         constexpr int width = decltype(row_vectors)::value;
-        constexpr int rows_per_tile = 512 / width;
+        constexpr int rows_per_tile = cache_rows_per_tile<width>;
         const auto grid = (attempted + rows_per_tile - 1) / rows_per_tile;
         install_rows_tiled<width><<<grid, kThreads, 0, stream>>>(
             cv, cm, slots.data_ptr<int64_t>(), cache_tids,
@@ -557,8 +846,12 @@ ExchangeResult exchange_cache_storage(
       };
       if (row_bytes == 256)
         launch_tile(std::integral_constant<int, 16>{});
+      else if (row_bytes == 512)
+        launch_tile(std::integral_constant<int, 32>{});
       else if (row_bytes == 1024)
         launch_tile(std::integral_constant<int, 64>{});
+      else if (row_bytes == 1536)
+        launch_tile(std::integral_constant<int, 96>{});
       else
         launch_tile(std::integral_constant<int, 128>{});
       DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -574,6 +867,7 @@ ExchangeResult exchange_cache_storage(
     }
     return {attempted, evicted, refused, std::move(spills)};
   } catch (const std::exception &e) {
+    join_prefix();
     throw CachePlacementError(e.what());
   }
 }
@@ -590,5 +884,5 @@ void bind_cache_exchange(pybind11::module &m) {
         py::arg("backing_values"), py::arg("mutation_layout"), py::arg("cache_score"),
         py::arg("backing_score"), py::arg("cache_candidates"), py::arg("new_backing"),
         py::arg("values"), py::arg("slot_indices"), py::arg("spill"), py::arg("retain"),
-        py::arg("deterministic") = false);
+        py::arg("deterministic") = false, py::arg("deferred_sources") = py::none(), py::arg("backing_on_host") = false);
 }
