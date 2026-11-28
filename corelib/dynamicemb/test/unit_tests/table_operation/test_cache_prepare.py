@@ -301,8 +301,10 @@ def test_deferred_cache_exchange(width, reserve, has_victims):
         assert torch.equal(backing_rows[physical[:n]], dirty)
 
 
-@pytest.mark.parametrize("width,offset_word,n", [(128, 0, 32768), (384, 1, 132096)])
-def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_word, n):
+@pytest.mark.parametrize("width,offset_word,n,empty", [
+    (128, 0, 32768, 0), (128, 1, 33792, 1), (384, 1, 132096, 0),
+])
+def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_word, n, empty):
     bucket = 1024
     cache = get_scored_table([n], bucket_capacity=bucket, enable_overflow=True)
     backing = get_scored_table([4 * n], bucket_capacity=bucket, use_rows=True)
@@ -317,7 +319,10 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_w
     const = (None, ScorePolicy.CONST)
     score = ScoreArg("timestamp", *const)
     physical = backing.insert(keys, torch.zeros_like(keys), score)
-    old_slots = cache.insert(old, torch.zeros_like(old), score)
+    # With an empty slot, the two directions have unequal lengths and the
+    # last tile of the mixed worklist has an odd number of rows.
+    resident = old[:n - empty]
+    old_slots = cache.insert(resident, torch.zeros_like(resident), score)
 
     device = keys.device
     # The one-word offset exercises raw table pointers that cannot use a
@@ -330,7 +335,7 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_w
     # Keep rows identifiable even across repeated exact-FP32 word patterns.
     truth[:, 0] = torch.arange(2 * n, device=device)
     backing_rows[physical.to(backing_rows.device)] = truth.to(backing_rows.device)
-    dirty = -truth[:n] - 1
+    dirty = -truth[:n - empty] - 1
     cached = torch.empty((n + cache.overflow_bucket_capacity_, width), device=device)
     cached[old_slots] = dirty
 
@@ -349,10 +354,12 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_w
         (None, ScorePolicy.GLOBAL_TIMER), const, (staged[0], staged[1], None, pos, count),
         (new[0], new[1], new[3], new[2]), staged[2], slots, False, False,
         deferred_sources=deferred, backing_on_host=True)
-    assert result[:3] == (n, n, 0)
+    assert result[:3] == (n, n - empty, 0)
     assert slots.unique().numel() == n
     assert torch.equal(staged[2], truth[n:]) and torch.equal(cached[slots], truth[n:])
-    assert torch.equal(backing_rows.to(device)[physical[:n]], dirty)
+    backing_result = backing_rows.to(device)[physical[:n]]
+    assert torch.equal(backing_result[:n - empty], dirty)
+    assert torch.equal(backing_result[n - empty:], truth[n - empty:n])
     assert int(cache._ref_counter.sum()) == n and torch.all(cache._ref_counter[slots] == 1)
 
 

@@ -389,13 +389,12 @@ std::pair<Tensor, Tensor> group_host_addresses(const Tensor &addresses, const Te
   return {out_addresses, out_partners};
 }
 
-// Sort both directions at once. Bit 63 places all incoming rows first, so
-// the two CTA pools know the boundary without reading a device counter.
-// Bits 35..62 group nearby 2 MiB host regions. The low 35 bits retain the
-// original row index. Only ordering is truncated, never a source address.
-constexpr int kOrdinalBits = 35;
+// Order reads and writes by their shared 512 KiB host region, then by
+// direction. The unsorted low bits retain the original row index, so we
+// can find the full addresses and the staging row after one radix sort.
+constexpr int kOrdinalBits = 33;
 constexpr uint64_t kOrdinalMask = (uint64_t{1} << kOrdinalBits) - 1;
-constexpr uint64_t kRegionMask = (uint64_t{1} << 28) - 1;
+constexpr uint64_t kRegionMask = (uint64_t{1} << 30) - 1;
 
 __global__ void encode_exchange_order(
     const int64_t *incoming, int64_t n, const int64_t *dirty, int64_t victims,
@@ -405,8 +404,8 @@ __global__ void encode_exchange_order(
   const bool write = i >= n;
   const int64_t index = write ? i - n : i;
   const uint64_t address = write ? dirty[index] : incoming[index];
-  const uint64_t region = (address >> 21) & kRegionMask;
-  order[i] = (uint64_t{write} << 63) | (region << kOrdinalBits) | uint64_t(index);
+  const uint64_t region = (address >> 19) & kRegionMask;
+  order[i] = (((region << 1) | write) << kOrdinalBits) | uint64_t(index);
 }
 
 Tensor group_exchange_rows(const Tensor &incoming, int64_t n, const Tensor &targets,
@@ -429,33 +428,30 @@ Tensor group_exchange_rows(const Tensor &incoming, int64_t n, const Tensor &targ
   return sorted;
 }
 
-// Each pool traverses its address-sorted worklist. A warp holds four rows
-// in flight and each lane copies one 16-byte vector per 512-byte stripe.
+// Nearby reads and dirty writes travel in the same worklist. A warp holds
+// four rows in flight and each lane copies one vector per 512-byte stripe.
 template <int RowVectors>
 __global__ void exchange_ordered_rows(
     const int64_t *incoming, const int64_t *order, uint4 *staged, int64_t n,
-    const int64_t *dirty_sources, const int64_t *dirty_targets, int64_t victims,
-    int blocks_per_pool) {
+    const int64_t *dirty_sources, const int64_t *dirty_targets, int64_t victims) {
   constexpr int rows_per_warp = 4, warps = kThreads / 32;
   constexpr int rows_per_tile = rows_per_warp * warps;
   constexpr int stripes = RowVectors / 32;
-  // Interleave the two CTA pools for the three-stripe weight/moment rows.
-  const bool push = stripes == 1 ? blockIdx.x >= blocks_per_pool : bool(blockIdx.x & 1);
-  const int block = stripes == 1 ? (push ? blockIdx.x - blocks_per_pool : blockIdx.x)
-                                 : blockIdx.x / 2;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const int64_t limit = push ? victims : n;
-  for (int64_t base = int64_t(block) * rows_per_tile; base < limit;
-       base += int64_t(blocks_per_pool) * rows_per_tile) {
+  const int64_t limit = n + victims;
+  for (int64_t base = int64_t(blockIdx.x) * rows_per_tile; base < limit;
+       base += int64_t(gridDim.x) * rows_per_tile) {
     const uint4 *src[rows_per_warp];
     uint4 *dst[rows_per_warp], payload[rows_per_warp][stripes];
 #pragma unroll
     for (int j = 0; j < rows_per_warp; ++j) {
-      const int64_t i = base + (stripes == 1 ? j * warps + warp : warp * rows_per_warp + j);
+      const int64_t i = base + j * warps + warp;
       src[j] = nullptr;
       dst[j] = nullptr;
       if (i < limit) {
-        const int64_t index = uint64_t(order[(push ? n : 0) + i]) & kOrdinalMask;
+        const uint64_t key = uint64_t(order[i]);
+        const bool push = (key >> kOrdinalBits) & 1;
+        const int64_t index = key & kOrdinalMask;
         src[j] = reinterpret_cast<const uint4 *>(push ? dirty_sources[index] : incoming[index]);
         dst[j] = push ? reinterpret_cast<uint4 *>(dirty_targets[index]) : staged + index * RowVectors;
       }
@@ -474,8 +470,7 @@ __global__ void exchange_ordered_rows(
       } else {
 #pragma unroll
         for (int v = 0; v < stripes; ++v) {
-          if constexpr (stripes == 1) payload[j][v] = src[j][lane];
-          else payload[j][v] = __ldcg(src[j] + v * 32 + lane);
+          payload[j][v] = src[j][v * 32 + lane];
         }
       }
     }
@@ -738,13 +733,16 @@ ExchangeResult exchange_cache_storage(
         // Each incoming key missed cache, and all true hits are pinned.
         // With no backing insert the victims and inputs own disjoint rows.
         auto order = group_exchange_rows(*deferred_sources, attempted, targets, stream);
-        const int pool = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
         const auto exchange_rows = [&](auto vectors) {
           constexpr int width = decltype(vectors)::value;
-          exchange_ordered_rows<width><<<2 * pool, kThreads, 0, stream>>>(
+          // Limit the number of sparse host regions in flight. Three-stripe
+          // Adam rows benefit from twice as many blocks as single-stripe SGD rows.
+          const int grid = std::max(1, sms / (width == 32 ? 4 : 2));
+          exchange_ordered_rows<width><<<grid, kThreads, 0, stream>>>(
               deferred_sources->data_ptr<int64_t>(), order.data_ptr<int64_t>(),
               static_cast<uint4 *>(values.data_ptr()), attempted, sources.data_ptr<int64_t>(),
-              targets.data_ptr<int64_t>(), victims, pool);
+              targets.data_ptr<int64_t>(), victims);
         };
         if (short_rows) exchange_rows(std::integral_constant<int, 32>{});
         else exchange_rows(std::integral_constant<int, 96>{});
