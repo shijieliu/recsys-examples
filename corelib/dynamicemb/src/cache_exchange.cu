@@ -389,44 +389,103 @@ std::pair<Tensor, Tensor> group_host_addresses(const Tensor &addresses, const Te
   return {out_addresses, out_partners};
 }
 
-// Each pool traverses its own address-sorted worklist. A warp moves four
-// whole 512-byte rows: 32 consecutive lanes each carry one 16-byte vector.
-__global__ void exchange_ordered_512(
-    const int64_t *incoming, const int64_t *staging_rows, uint4 *staged, int64_t n,
+// Sort both directions at once. Bit 63 places all incoming rows first, so
+// the two CTA pools know the boundary without reading a device counter.
+// Bits 35..62 group nearby 2 MiB host regions. The low 35 bits retain the
+// original row index. Only ordering is truncated, never a source address.
+constexpr int kOrdinalBits = 35;
+constexpr uint64_t kOrdinalMask = (uint64_t{1} << kOrdinalBits) - 1;
+constexpr uint64_t kRegionMask = (uint64_t{1} << 28) - 1;
+
+__global__ void encode_exchange_order(
+    const int64_t *incoming, int64_t n, const int64_t *dirty, int64_t victims,
+    uint64_t *order) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n + victims) return;
+  const bool write = i >= n;
+  const int64_t index = write ? i - n : i;
+  const uint64_t address = write ? dirty[index] : incoming[index];
+  const uint64_t region = (address >> 21) & kRegionMask;
+  order[i] = (uint64_t{write} << 63) | (region << kOrdinalBits) | uint64_t(index);
+}
+
+Tensor group_exchange_rows(const Tensor &incoming, int64_t n, const Tensor &targets,
+                           cudaStream_t stream) {
+  const int64_t total = n + targets.numel();
+  auto keys = at::empty({total}, incoming.options());
+  auto sorted = at::empty_like(keys);
+  auto *in = reinterpret_cast<uint64_t *>(keys.data_ptr<int64_t>());
+  auto *out = reinterpret_cast<uint64_t *>(sorted.data_ptr<int64_t>());
+  encode_exchange_order<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+      incoming.data_ptr<int64_t>(), n, targets.data_ptr<int64_t>(), targets.numel(), in);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  size_t bytes = 0;
+  auto sort = [&](void *storage) {
+    return cub::DeviceRadixSort::SortKeys(storage, bytes, in, out, total, kOrdinalBits, 64, stream);
+  };
+  C10_CUDA_CHECK(sort(nullptr));
+  auto tmp = at::empty({static_cast<int64_t>(bytes)}, incoming.options().dtype(at::kByte));
+  C10_CUDA_CHECK(sort(tmp.data_ptr()));
+  return sorted;
+}
+
+// Each pool traverses its address-sorted worklist. A warp holds four rows
+// in flight and each lane copies one 16-byte vector per 512-byte stripe.
+template <int RowVectors>
+__global__ void exchange_ordered_rows(
+    const int64_t *incoming, const int64_t *order, uint4 *staged, int64_t n,
     const int64_t *dirty_sources, const int64_t *dirty_targets, int64_t victims,
     int blocks_per_pool) {
   constexpr int rows_per_warp = 4, warps = kThreads / 32;
   constexpr int rows_per_tile = rows_per_warp * warps;
-  const bool push = blockIdx.x >= blocks_per_pool;
-  const int block = push ? blockIdx.x - blocks_per_pool : blockIdx.x;
+  constexpr int stripes = RowVectors / 32;
+  // Interleave the two CTA pools for the three-stripe weight/moment rows.
+  const bool push = stripes == 1 ? blockIdx.x >= blocks_per_pool : bool(blockIdx.x & 1);
+  const int block = stripes == 1 ? (push ? blockIdx.x - blocks_per_pool : blockIdx.x)
+                                 : blockIdx.x / 2;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t limit = push ? victims : n;
   for (int64_t base = int64_t(block) * rows_per_tile; base < limit;
        base += int64_t(blocks_per_pool) * rows_per_tile) {
     const uint4 *src[rows_per_warp];
-    uint4 *dst[rows_per_warp], payload[rows_per_warp];
+    uint4 *dst[rows_per_warp], payload[rows_per_warp][stripes];
 #pragma unroll
     for (int j = 0; j < rows_per_warp; ++j) {
-      const int64_t i = base + j * warps + warp;
-      src[j] = i < limit ? reinterpret_cast<const uint4 *>(
-          push ? dirty_sources[i] : incoming[i]) : nullptr;
-      dst[j] = i >= limit ? nullptr : push ? reinterpret_cast<uint4 *>(dirty_targets[i])
-                                           : staged + staging_rows[i] * 32;
+      const int64_t i = base + (stripes == 1 ? j * warps + warp : warp * rows_per_warp + j);
+      src[j] = nullptr;
+      dst[j] = nullptr;
+      if (i < limit) {
+        const int64_t index = uint64_t(order[(push ? n : 0) + i]) & kOrdinalMask;
+        src[j] = reinterpret_cast<const uint4 *>(push ? dirty_sources[index] : incoming[index]);
+        dst[j] = push ? reinterpret_cast<uint4 *>(dirty_targets[index]) : staged + index * RowVectors;
+      }
     }
 #pragma unroll
     for (int j = 0; j < rows_per_warp; ++j) {
       if (!src[j] || !dst[j]) continue;
       if ((reinterpret_cast<uintptr_t>(src[j]) | reinterpret_cast<uintptr_t>(dst[j])) & 15) {
-        memcpy(reinterpret_cast<char *>(dst[j]) + lane * sizeof(uint4),
-               reinterpret_cast<const char *>(src[j]) + lane * sizeof(uint4), sizeof(uint4));
+#pragma unroll
+        for (int v = 0; v < stripes; ++v) {
+          const int offset = (v * 32 + lane) * sizeof(uint4);
+          memcpy(reinterpret_cast<char *>(dst[j]) + offset,
+                 reinterpret_cast<const char *>(src[j]) + offset, sizeof(uint4));
+        }
         dst[j] = nullptr;
       } else {
-        payload[j] = src[j][lane];
+#pragma unroll
+        for (int v = 0; v < stripes; ++v) {
+          if constexpr (stripes == 1) payload[j][v] = src[j][lane];
+          else payload[j][v] = __ldcg(src[j] + v * 32 + lane);
+        }
       }
     }
 #pragma unroll
-    for (int j = 0; j < rows_per_warp; ++j)
-      if (src[j] && dst[j]) dst[j][lane] = payload[j];
+    for (int j = 0; j < rows_per_warp; ++j) {
+      if (!src[j] || !dst[j]) continue;
+#pragma unroll
+      for (int v = 0; v < stripes; ++v)
+        dst[j][v * 32 + lane] = payload[j][v];
+    }
   }
 }
 
@@ -605,8 +664,15 @@ ExchangeResult exchange_cache_storage(
     const auto backing_limit = std::min(attempted, b_keys.numel());
     const int64_t backing_bound =
         ranked ? std::clamp<int64_t>(counts[3], 0, backing_limit) : backing_limit;
-    const bool short_rows = values.size(1) * values.element_size() == 512;
-    const bool order_duplex = short_rows && backing_on_host && evicted >= 32768;
+    const auto width_bytes = values.size(1) * values.element_size();
+    const bool short_rows = width_bytes == 512;
+    // Sorting pays for itself on large sparse exchanges. At 1,536 bytes
+    // each, smaller batches already issue long enough transfers directly.
+    const bool order_duplex = backing_on_host &&
+                              ((short_rows && evicted >= 32768) ||
+                               (width_bytes == 1536 && evicted >= 131072)) &&
+                              attempted <= static_cast<int64_t>(kOrdinalMask) &&
+                              evicted <= static_cast<int64_t>(kOrdinalMask);
     const bool duplex = deferred_sources && ranked && backing_bound == 0 &&
                         refused == 0 && evicted > 0 && (!short_rows || order_duplex);
     if (deferred_sources && !duplex && (!ranked || backing_bound == 0)) {
@@ -662,8 +728,8 @@ ExchangeResult exchange_cache_storage(
           backing_map, backing_values, ev_keys, ev_tids, {std::nullopt, ScorePolicyType::Const},
           {}, {}, std::get<0>(cache_values), ev_slots);
       Tensor targets = addresses.backing, sources = *addresses.sources;
-      if (backing_on_host && !spill && !addresses.layout_tags &&
-          victims >= 32768 && values.size(1) * values.element_size() == 512) {
+      if (!duplex && backing_on_host && !spill && !addresses.layout_tags &&
+          victims >= 32768 && short_rows) {
         std::tie(targets, sources) = group_host_addresses(targets, sources, stream);
       }
       Opt gone_values;
@@ -671,14 +737,17 @@ ExchangeResult exchange_cache_storage(
       if (duplex && order_duplex) {
         // Each incoming key missed cache, and all true hits are pinned.
         // With no backing insert the victims and inputs own disjoint rows.
-        auto staging_rows = at::arange(attempted, deferred_sources->options());
-        auto [incoming, ordered_staging] = group_host_addresses(
-            deferred_sources->narrow(0, 0, attempted), staging_rows, stream);
+        auto order = group_exchange_rows(*deferred_sources, attempted, targets, stream);
         const int pool = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-        exchange_ordered_512<<<2 * pool, kThreads, 0, stream>>>(
-            incoming.data_ptr<int64_t>(), ordered_staging.data_ptr<int64_t>(),
-            static_cast<uint4 *>(values.data_ptr()), attempted, sources.data_ptr<int64_t>(),
-            targets.data_ptr<int64_t>(), victims, pool);
+        const auto exchange_rows = [&](auto vectors) {
+          constexpr int width = decltype(vectors)::value;
+          exchange_ordered_rows<width><<<2 * pool, kThreads, 0, stream>>>(
+              deferred_sources->data_ptr<int64_t>(), order.data_ptr<int64_t>(),
+              static_cast<uint4 *>(values.data_ptr()), attempted, sources.data_ptr<int64_t>(),
+              targets.data_ptr<int64_t>(), victims, pool);
+        };
+        if (short_rows) exchange_rows(std::integral_constant<int, 32>{});
+        else exchange_rows(std::integral_constant<int, 96>{});
         DEMB_CUDA_KERNEL_LAUNCH_CHECK();
       } else if (duplex) {
         // Unique miss keys and eviction victims identify disjoint backing
