@@ -94,9 +94,26 @@ __global__ void lookup_cached_embedding_rows_kernel(
   else backing.copy(tid, row, word_bytes, dst, lane);
 }
 
-// Look ahead by one 16-slot digest vector on a full-width bucket. Loading
-// both aligned vectors first lets the device service independent reads while
-// each lane validates its candidates. Visit slots in the original order.
+// Encode the four 4-slot words of a digest vector. For each word, bits 0..3
+// identify candidate keys and bits 4..7 identify possible empty slots. This
+// matches Bucket::probe's order even when the key has the empty-slot digest.
+__device__ __forceinline__ uint32_t pack_probe_candidates(
+    uint4 digests, uint32_t target, uint32_t empty) {
+  using Comparator = Table::BucketType::VectorComparator;
+  const uint32_t words[] = {digests.x, digests.y, digests.z, digests.w};
+  uint32_t packed = 0;
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    const uint32_t matches = Comparator::compare(words[w], target);
+    const uint32_t vacancies = Comparator::compare(words[w], empty);
+    const uint32_t flags = matches | (vacancies << 4);
+    // The four byte weights 1, 2, 4, 8 gather the low and high flags into
+    // separate nibbles in the high byte of the product.
+    packed |= ((flags * 0x01020408u) >> 24) << (w * 8);
+  }
+  return packed;
+}
+
 __device__ __forceinline__ int read_only_probe_128(
     Table::BucketType main, uint64_t key, uint64_t hash,
     const int64_t *bucket_rows) {
@@ -108,30 +125,21 @@ __device__ __forceinline__ int read_only_probe_128(
 #pragma unroll 1
   for (int group = 0; group < 8; group += 2) {
     const int index = (start + group) & 7;
-    const uint4 pair[2] = {digest[index], digest[(index + 1) & 7]};
-#pragma unroll
-    for (int p = 0; p < 2; ++p) {
-      const uint4 vec = pair[p];
-      const uint32_t chunks[4] = {vec.x, vec.y, vec.z, vec.w};
-#pragma unroll
-      for (int word = 0; word < 4; ++word) {
-        int key_mask = Bucket::VectorComparator::compare(chunks[word], target);
-        int empty_mask = Bucket::VectorComparator::compare(chunks[word], empty);
-        const int base = (((index + p) & 7) << 4) + 4 * word;
-        while (key_mask) {
-          int pos = base + Bucket::VectorComparator::equal_index(key_mask);
-          auto *candidate = reinterpret_cast<Bucket::AtomicKey *>(main.keys(pos));
-          // Fetch the row map entry while checking the atomic key. Its
-          // contents are consumed only after the key matches.
-          if (bucket_rows) asm volatile("prefetch.global.L2 [%0];" : : "l"(bucket_rows + pos));
-          if (candidate->load(cuda::std::memory_order_relaxed) == key) return pos;
-        }
-        while (empty_mask) {
-          int pos = base + Bucket::VectorComparator::equal_index(empty_mask);
-          auto *candidate = reinterpret_cast<Bucket::AtomicKey *>(main.keys(pos));
-          if (candidate->load(cuda::std::memory_order_relaxed) == Bucket::empty_key()) return -1;
-        }
-      }
+    const uint4 first = digest[index], second = digest[(index + 1) & 7];
+    uint64_t candidates = (uint64_t{pack_probe_candidates(second, target, empty)} << 32) |
+                          pack_probe_candidates(first, target, empty);
+    // One iteration per possible match or empty slot across 32 digests.
+    while (candidates) {
+      const int bit = __ffsll(candidates) - 1;
+      const int slot = (index * 16 + (bit >> 3) * 4 + (bit & 3)) & 127;
+      const bool check_empty = bit & 4;
+      auto *candidate = reinterpret_cast<Bucket::AtomicKey *>(main.keys(slot));
+      if (bucket_rows && !check_empty)
+        asm volatile("prefetch.global.L2 [%0];" : : "l"(bucket_rows + slot));
+      const auto stored_key = candidate->load(cuda::std::memory_order_relaxed);
+      if (!check_empty && stored_key == key) return slot;
+      if (check_empty && stored_key == Bucket::empty_key()) return -1;
+      candidates &= candidates - 1;
     }
   }
   return -1;

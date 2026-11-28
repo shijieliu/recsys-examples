@@ -46,6 +46,43 @@ def test_eval_probes_crowded_bucket_in_table_order():
         lookup_embedding_rows(queries, tids, (small, layout), None, None)
 
 
+@pytest.mark.parametrize("early_empty", [False, True])
+@pytest.mark.parametrize("same_as_empty_digest", [False, True])
+def test_eval_digest_candidates_preserve_slot_order(early_empty, same_as_empty_digest):
+    from dynamicemb.key_ownership import murmur3_fmix64
+
+    def digest(key):
+        return (int(murmur3_fmix64(key)) >> 32) & 255
+
+    target = next(
+        k for k in range(30000)
+        if int(murmur3_fmix64(k)) & 112 == 112
+        and (digest(k) == digest(-1)) == same_as_empty_digest
+        and digest(k) != digest(-2)
+    )
+    collision = next(k for k in range(target + 1, target + 30000) if digest(k) == digest(target))
+    # Starting at 112, a false digest match forces the probe to continue.
+    # After wraparound, the key in slot 3 takes precedence over the empty
+    # slot in the same four-slot word. An earlier empty word stops the probe.
+    slots = [-2] * 128
+    slots[112], slots[0], slots[3] = collision, -1, target
+    if early_empty:
+        slots[116] = -1
+    table = get_scored_table([128], bucket_capacity=128, use_rows=True)
+    storage = table.table_storage_
+    storage[:1024].view(torch.int64).copy_(torch.tensor(slots, device="cuda"))
+    storage[1024:1152].copy_(torch.tensor([digest(k) for k in slots], dtype=torch.uint8, device="cuda"))
+    rows = torch.arange(128, device="cuda").roll(5)
+    mapping = (storage, table.table_bucket_offsets_, 128, rows, table.num_scores_, None)
+    values = torch.arange(128, dtype=torch.float32, device="cuda").reshape(128, 1)
+    layout = (torch.tensor([values.data_ptr()], device="cuda"), None, None, 1, 1, values.dtype)
+    keys = torch.tensor([target], device="cuda")
+    output, missing, _ = lookup_embedding_rows(keys, torch.zeros_like(keys), (mapping, layout), None, None)
+    assert missing.item() == early_empty
+    if not early_empty:
+        torch.testing.assert_close(output[0], values[rows[3]])
+
+
 @pytest.mark.parametrize("table_stride", [128, 384])
 @pytest.mark.parametrize("live,host_bound", [(6, None), (4, 5), (0, 5)])
 @pytest.mark.parametrize("reorder", [False, True])
