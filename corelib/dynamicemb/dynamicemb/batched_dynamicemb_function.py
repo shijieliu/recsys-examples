@@ -941,7 +941,43 @@ def dynamicemb_prefetch(
         )
 
 
-def dynamicemb_eval_forward(
+def dynamicemb_eval_sequence_forward(
+    indices: torch.Tensor,
+    cache: Optional[Cache],
+    storage: Storage,
+    table_ranges: torch.Tensor,
+    output_dtype: torch.dtype,
+    initializer: MultiTableInitializer,
+    embedding_dim: int,
+    output_alloc: Optional[OutputAlloc],
+) -> torch.Tensor:
+    """Look up one output row per input key in its original order."""
+    with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
+        ranges = table_ranges.long()
+        output_embs = eval_lookup(
+            storage,
+            indices,
+            None,
+            initializer,
+            cache=cache,
+            table_ranges=ranges,
+        )
+        # Decode stored FP8 values before converting or copying into caller-owned output.
+        output_embs = decode_table_values(output_embs, output_dtype)
+        alloc = (
+            output_alloc(indices.numel(), embedding_dim, output_dtype)
+            if output_alloc is not None
+            else None
+        )
+        if alloc is not None:
+            out, out_rows = alloc
+            if out_rows is None:
+                return out.copy_(output_embs)
+            return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
+        return output_embs
+
+
+def dynamicemb_eval_pooled_forward(
     indices: torch.Tensor,
     offsets: torch.Tensor,
     cache: Optional[Cache],
@@ -953,49 +989,12 @@ def dynamicemb_eval_forward(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     pooling_weights: Optional[torch.Tensor] = None,
-    output_alloc: Optional[OutputAlloc] = None,
 ) -> torch.Tensor:
-    """Eval-only forward for all storage configurations (no autograd).
-
-    A sequence lookup's rows go where ``output_alloc`` says, if it has a
-    buffer for them (a call on the hierarchical dist whose lookup a pipeline
-    runs in eval mode), converted to ``output_dtype`` on the way.
-    """
+    """Look up distinct embeddings and reduce them into the requested bags."""
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
         assert indices_table_range.numel() > 1
 
-        is_pooling = layout.is_pooling
-
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
-
-        if not is_pooling:
-            ranges = indices_table_range.long()
-            table_ids = None if cache is None else expand_table_ids_cuda(ranges, indices.numel())
-            output_embs = eval_lookup(
-                storage,
-                indices,
-                table_ids,
-                initializer,
-                cache=cache,
-                num_valid=ranges[-1:] if cache is not None else None,
-                table_ranges=ranges if cache is None else None,
-            )
-            # Decode first: the allocator's copies below only convert dtypes, so
-            # an fp8 table's stored codes (256x the weights) would be copied out.
-            # Always: for any other table this is a ``.to`` that returns the
-            # tensor itself when the dtype already matches.
-            output_embs = decode_table_values(output_embs, output_dtype)
-            alloc = (
-                output_alloc(*layout.sequence_shape(), output_dtype)
-                if output_alloc is not None
-                else None
-            )
-            if alloc is not None:
-                out, out_rows = alloc
-                if out_rows is None:
-                    return out.copy_(output_embs)
-                return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
-            return output_embs
 
         frequency_counts_int64 = (
             frequency_counters.long() if frequency_counters is not None else None
