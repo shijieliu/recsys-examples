@@ -661,11 +661,9 @@ ExchangeResult exchange_cache_storage(
         ranked ? std::clamp<int64_t>(counts[3], 0, backing_limit) : backing_limit;
     const auto width_bytes = values.size(1) * values.element_size();
     const bool short_rows = width_bytes == 512;
-    // Sorting pays for itself on large sparse exchanges. At 1,536 bytes
-    // each, smaller batches already issue long enough transfers directly.
-    const bool order_duplex = backing_on_host &&
-                              ((short_rows && evicted >= 32768) ||
-                               (width_bytes == 1536 && evicted >= 131072)) &&
+    // Limit sorting to the large sparse exchanges of uniform rows.
+    const bool order_duplex = backing_on_host && evicted >= 32768 &&
+                              (short_rows || width_bytes == 1536) &&
                               attempted <= static_cast<int64_t>(kOrdinalMask) &&
                               evicted <= static_cast<int64_t>(kOrdinalMask);
     const bool duplex = deferred_sources && ranked && backing_bound == 0 &&
