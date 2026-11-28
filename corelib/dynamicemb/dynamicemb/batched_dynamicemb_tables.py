@@ -106,7 +106,7 @@ from dynamicemb.utils import (
     FP8_STORAGE_DTYPE,
     checkpoint_dtype,
 )
-from dynamicemb_extensions import device_timestamp
+from dynamicemb_extensions import device_timestamp, get_table_range
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
     CounterBasedRegularizationDefinition,
@@ -1258,12 +1258,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
+            if (
+                type(self._storage) is DynamicEmbStorage
+                and self._cache is None
+                and not layout.is_pooling
+                and len(self.table_offsets_in_feature) == self.feature_num + 1
+            ):
+                # One table starts at every feature. The jagged offsets already
+                # contain every table boundary, separated by batch_size entries.
+                table_ranges = offsets[::batch_size]
+            else:
+                table_ranges = get_table_range(offsets, self.feature_offsets)
             return dynamicemb_eval_forward(
                 indices,
                 offsets,
                 self._cache,
                 self._storage,
-                self.feature_offsets,
+                table_ranges,
                 self.output_dtype,
                 self._eval_initializer,
                 layout,

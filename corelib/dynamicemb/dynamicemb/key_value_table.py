@@ -94,6 +94,7 @@ from dynamicemb_extensions import (
     fill_rows,
     flagged_compact,
     gather_embedding,
+    expand_table_ids_cuda,
     lookup_embedding_rows,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
@@ -4782,19 +4783,33 @@ def _readonly_eval_states(storage):
     return primary, backing
 
 
+def _expand_eval_ranges(ranges, capacity, num_valid):
+    # Generic storage and custom initializers consume one table ID per key.
+    # The final boundary excludes padded keys from those consumers.
+    table_ids = expand_table_ids_cuda(ranges.contiguous(), capacity)
+    end = ranges[-1:]
+    count = end if num_valid is None else torch.minimum(end, num_valid.reshape(1))
+    return table_ids, count
+
+
 def _eval_lookup_storage(
     storage: Storage,
     keys: torch.Tensor,
-    table_ids: torch.Tensor,
+    table_ids: Optional[torch.Tensor],
     initializer: Callable,
     num_valid: Optional[torch.Tensor] = None,
     *,
     host_num_valid: Optional[int] = None,
+    table_ranges: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     state, backing = _readonly_eval_states(storage)
+    defaults = initializer._eval_rows if type(initializer) is ConstantInitializer else None
+    if table_ids is None and (state is None or backing is not None or defaults is None):
+        table_ids, num_valid = _expand_eval_ranges(table_ranges, keys.numel(), num_valid)
     if state is not None:
         keys = keys.contiguous()
-        table_ids = table_ids.contiguous()
+        if table_ids is not None:
+            table_ids = table_ids.contiguous()
         embs, missing, _ = lookup_embedding_rows(
             keys.to(state.key_index_map.key_type),
             table_ids,
@@ -4804,7 +4819,8 @@ def _eval_lookup_storage(
             num_valid,
             host_num_valid,
             False,
-            initializer._eval_rows if type(initializer) is ConstantInitializer else None,
+            defaults,
+            table_ranges if table_ids is None else None,
         )
         if missing is None:
             return embs
@@ -4929,12 +4945,13 @@ def _eval_lookup_cached(
 def eval_lookup(
     storage: Storage,
     keys: torch.Tensor,
-    table_ids: torch.Tensor,
+    table_ids: Optional[torch.Tensor],
     initializer: Callable,
     *,
     num_valid: Optional[torch.Tensor] = None,
     cache: Optional[Cache] = None,
     host_num_valid: Optional[int] = None,
+    table_ranges: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eval-only lookup (no insertion, no admission, no backward) of the first
     ``num_valid`` keys.
@@ -4948,6 +4965,8 @@ def eval_lookup(
     of ``keys``, of which only the first ``num_valid`` are defined.
     """
     assert keys.dim() == 1
+    if (table_ids is None) == (table_ranges is None):
+        raise ValueError("Supply either table_ids or table_ranges.")
     if keys.numel() == 0:
         return torch.empty(
             0,
@@ -4963,7 +4982,10 @@ def eval_lookup(
             initializer,
             num_valid,
             host_num_valid=host_num_valid,
+            table_ranges=table_ranges,
         )
+    if table_ids is None:
+        table_ids, num_valid = _expand_eval_ranges(table_ranges, keys.numel(), num_valid)
     return _eval_lookup_cached(
         cache,
         storage,

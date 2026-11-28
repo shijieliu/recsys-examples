@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "cache_batch.cuh"
 #include "cache_row_copy.cuh"
+#include "segment_offsets.cuh"
 #include "table_operation/kernels.cuh"
 #include <c10/cuda/CUDAGuard.h>
 
@@ -145,23 +146,42 @@ __device__ __forceinline__ int read_only_probe_128(
   return -1;
 }
 
+// Most warps lie inside one table. For up to 32 tables, each lane reads
+// one table end; the ballot skips all empty segments at the start of a warp.
+// Only requests crossing the next boundary need a per-request upper bound.
+__device__ __forceinline__ int eval_range_table(const int64_t *ranges, int tables,
+                                                int64_t i, int64_t base, int lane, int64_t stride) {
+  if (tables == 1) return 0;
+  if (tables <= 32) {
+    const auto end = lane < tables ? ranges[(lane + 1) * stride] : INT64_MAX;
+    const int tid = __popc(__ballot_sync(0xffffffffu, end <= base));
+    const auto table_end = __shfl_sync(0xffffffffu, static_cast<long long>(end), tid);
+    if (i < table_end) return tid;
+  }
+  return binary_search_upper_bound(ranges, tables + 1, i, stride);
+}
+
 // On a single HBM tier the hash probe is short. Use a different request per
 // lane, then shuffle the 32 addresses into groups for coalesced output writes.
+template <bool Segmented>
 __global__ void lookup_hbm_embedding_rows_kernel(
     EvalTier tier, const uint64_t *keys, const int64_t *tids,
     const int64_t *count, int64_t capacity, int64_t word_bytes,
-    uint8_t *output, bool *missing, const uint8_t *defaults, int64_t default_stride) {
+    uint8_t *output, bool *missing, const uint8_t *defaults, int64_t default_stride, int tables, int64_t range_stride) {
   const int lane = threadIdx.x & 31;
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t base = i - lane;
-  const int64_t live = counted_limit(count, capacity);
+  auto live = counted_limit(count, capacity);
+  if constexpr (Segmented) live = min(live, tids[tables * range_stride]);
   if (base >= live) return;
 
+  int64_t table = 0;
+  if constexpr (Segmented) table = eval_range_table(tids, tables, i, base, lane, range_stride);
   const uint8_t *src = nullptr;
   int64_t bytes = 0;
   if (i < live) {
     const auto key = keys[i];
-    const auto tid = tids[i];
+    const auto tid = Segmented ? table : tids[i];
     if (Table::BucketType::is_valid(key)) {
       const int64_t hash = Table::hash(key);
       int64_t bucket = 0, begin, cap;
@@ -262,18 +282,27 @@ EvalTier eval_tier(const EvalMap &spec, at::Device device, int64_t tables) {
 }
 
 std::tuple<at::Tensor, CacheOptionalTensor, CacheOptionalTensor> lookup_embedding_rows(
-    at::Tensor keys, at::Tensor tids, const EvalMap &primary_map,
+    at::Tensor keys, const CacheOptionalTensor &tids, const EvalMap &primary_map,
     const std::optional<OverflowMap> &overflow_map, const std::optional<EvalMap> &backing_map,
     const CacheOptionalTensor &num_valid, std::optional<int64_t> host_num_valid, bool record_hits,
-    const CacheOptionalTensor &defaults) {
+    const CacheOptionalTensor &defaults, const CacheOptionalTensor &table_ranges) {
   TORCH_CHECK(keys.is_cuda() && (keys.scalar_type() == at::kLong || keys.scalar_type() == at::kUInt64),
               "expected 64-bit CUDA keys");
   const auto device = keys.device();
   const c10::cuda::CUDAGuard guard(device);
   check_vector(keys, device, keys.scalar_type(), "keys");
-  check_vector(tids, device, at::kLong, "table ids");
-  TORCH_CHECK(keys.numel() == tids.numel(), "expected one table id per key");
   const int64_t tables = std::get<1>(std::get<0>(primary_map)).numel() - 1;
+  TORCH_CHECK(bool(tids) != bool(table_ranges), "supply either table ids or table ranges");
+  const auto &table_rows = tids ? *tids : *table_ranges;
+  if (tids) {
+    check_vector(table_rows, device, at::kLong, "table ids");
+  } else {
+    TORCH_CHECK(table_rows.device() == device && table_rows.scalar_type() == at::kLong &&
+                table_rows.dim() == 1, "expected a CUDA int64 vector of table ranges");
+  }
+  TORCH_CHECK(table_rows.numel() == (tids ? keys.numel() : tables + 1),
+              "invalid table id or range length");
+  TORCH_CHECK(!table_ranges || !backing_map, "table ranges require a single storage tier");
   const auto primary = eval_tier(primary_map, device, tables);
   const auto dtype = std::get<5>(std::get<1>(primary_map));
   EvalTier backing{};
@@ -317,7 +346,7 @@ std::tuple<at::Tensor, CacheOptionalTensor, CacheOptionalTensor> lookup_embeddin
     const int blocks = (n + threads / kEvalLanes - 1) / (threads / kEvalLanes);
     const auto stream = at::cuda::getCurrentCUDAStream().stream();
     const auto *input = reinterpret_cast<const uint64_t *>(keys.data_ptr());
-    const auto *table_ids = tids.data_ptr<int64_t>();
+    const auto *table_ids = table_rows.data_ptr<int64_t>();
     auto *out = static_cast<uint8_t *>(output.data_ptr());
     if (backing_map) {
       lookup_cached_embedding_rows_kernel<<<blocks, threads, 0, stream>>>(
@@ -333,8 +362,14 @@ std::tuple<at::Tensor, CacheOptionalTensor, CacheOptionalTensor> lookup_embeddin
       TORCH_CHECK(!overflow_map, "direct HBM lookup expects a single map");
       TORCH_CHECK(primary.table.bucket_capacity_ % Table::BucketType::BufferDim == 0,
                   "direct HBM lookup requires a bucket with complete 16-byte digest vectors");
-      lookup_hbm_embedding_rows_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
-          primary, input, table_ids, count, n, output.element_size(), out, misses, default_ptr, default_stride);
+      const auto launch = [&](auto segmented) {
+        constexpr bool from_ranges = decltype(segmented)::value;
+        lookup_hbm_embedding_rows_kernel<from_ranges><<<(n + threads - 1) / threads, threads, 0, stream>>>(
+            primary, input, table_ids, count, n, output.element_size(), out, misses,
+            default_ptr, default_stride, tables, table_rows.stride(0));
+      };
+      if (table_ranges) launch(std::true_type{});
+      else launch(std::false_type{});
     }
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -348,5 +383,5 @@ void bind_cache_eval(py::module &m) {
         py::arg("table_ids"), py::arg("primary_map"), py::arg("overflow"),
         py::arg("backing_map"), py::arg("num_valid") = py::none(),
         py::arg("host_num_valid") = py::none(), py::arg("record_cache_hits") = false,
-        py::arg("defaults") = py::none());
+        py::arg("defaults") = py::none(), py::arg("table_ranges") = py::none());
 }

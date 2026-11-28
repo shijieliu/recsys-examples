@@ -946,7 +946,7 @@ def dynamicemb_eval_forward(
     offsets: torch.Tensor,
     cache: Optional[Cache],
     storage: Storage,
-    feature_offsets: torch.Tensor,
+    indices_table_range: torch.Tensor,
     output_dtype: torch.dtype,
     initializer: MultiTableInitializer,
     layout: EmbeddingLayout,
@@ -962,26 +962,23 @@ def dynamicemb_eval_forward(
     runs in eval mode), converted to ``output_dtype`` on the way.
     """
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
-        assert feature_offsets.numel() > 1
+        assert indices_table_range.numel() > 1
 
         is_pooling = layout.is_pooling
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
 
-        indices_table_range = get_table_range(offsets, feature_offsets)
-
         if not is_pooling:
-            table_ids = expand_table_ids_cuda(
-                indices_table_range,
-                indices.numel(),
-            )
+            ranges = indices_table_range.long()
+            table_ids = None if cache is None else expand_table_ids_cuda(ranges, indices.numel())
             output_embs = eval_lookup(
                 storage,
                 indices,
                 table_ids,
                 initializer,
                 cache=cache,
-                num_valid=indices_table_range[-1:].long(),
+                num_valid=ranges[-1:] if cache is not None else None,
+                table_ranges=ranges if cache is None else None,
             )
             # Decode first: the allocator's copies below only convert dtypes, so
             # an fp8 table's stored codes (256x the weights) would be copied out.

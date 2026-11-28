@@ -189,9 +189,9 @@ def test_eval_full_hbm_table_rows_and_per_table_misses():
     torch.testing.assert_close(out[:6], expect, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("hybrid,shared_feature", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
-def test_mapped_eval_reads_each_tier_and_uses_table_defaults(hybrid, optimizer):
+def test_mapped_eval_reads_each_tier_and_uses_table_defaults(hybrid, optimizer, shared_feature):
     from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage, _insert_key_values
 
     dev = torch.device("cuda")
@@ -209,7 +209,7 @@ def test_mapped_eval_reads_each_tier_and_uses_table_defaults(hybrid, optimizer):
         for t in range(2)
     ]
     model = BatchedDynamicEmbeddingTablesV2(
-        table_options=options, table_names=["a", "b"], feature_table_map=[0, 1],
+        table_options=options, table_names=["a", "b"], feature_table_map=[0, 0, 1] if shared_feature else [0, 1],
         pooling_mode=DynamicEmbPoolingMode.NONE, output_dtype=torch.float32, optimizer=optimizer,
     ).eval()
     storage = model._storage
@@ -225,7 +225,8 @@ def test_mapped_eval_reads_each_tier_and_uses_table_defaults(hybrid, optimizer):
     else:
         storage.insert(keys, tids, payload)
     q = torch.tensor([17, 29, 29, 47, -1, 17, 47, 29, 17, -3, 47, 29], device=dev)
-    out = model(q, torch.tensor([0, 7, 12], device=dev))
+    offsets = [0, 1, 3, 5, 7, 9, 12] if shared_feature else [0, 3, 7, 9, 12]
+    out = model(q, torch.tensor(offsets, device=dev))
     reference_rows = []
     for i, key in enumerate(q.tolist()):
         tid = int(i >= 7)
@@ -243,3 +244,77 @@ def test_mapped_eval_reads_each_tier_and_uses_table_defaults(hybrid, optimizer):
     bounded = _eval_lookup_storage(storage, q, ids, model._eval_initializer,
         torch.tensor([10], device=dev), host_num_valid=9)
     torch.testing.assert_close(bounded[:9], reference[:9], atol=0, rtol=0)
+
+@pytest.mark.parametrize("tables,range_stride", [(1, 3), (7, 1), (7, 5), (41, 3)])
+@pytest.mark.parametrize("shared_default,live,bound", [(True, 81, None), (False, 40, 59), (False, 17, 8), (False, 0, 90)])
+def test_hbm_eval_compact_ranges(tables, range_stride, shared_default, live, bound):
+    device = torch.device("cuda")
+    lengths = [0] * tables
+    if tables == 1:
+        lengths[0] = 81
+    else:
+        lengths[1], lengths[3], lengths[-2] = 6, 29, 46
+    # Poison the intervening bag offsets so a contiguous read cannot appear correct.
+    bag_offsets = torch.full((tables * range_stride + 1,), -1, dtype=torch.int64, device=device)
+    ranges = bag_offsets[::range_stride]
+    ranges.copy_(torch.tensor([0] + lengths, device=device).cumsum(0))
+    active = torch.tensor([t for t in range(tables) if lengths[t]], device=device)
+    key_map = get_scored_table([128] * tables, bucket_capacity=128, use_rows=True)
+    score = ScoreArg("timestamp", None, ScorePolicy.CONST)
+    key_map.insert(torch.full_like(active, 19), active, score)
+    dims = torch.tensor([13 + t % 9 for t in range(tables)], device=device)
+    strides = torch.tensor([32 + (t % 3) * 4 for t in range(tables)], device=device)
+    payloads = [torch.full((128, int(strides[t])), 1000. + t, device=device) for t in range(tables)]
+    ptrs = torch.tensor([p.data_ptr() for p in payloads], device=device)
+    layout = (ptrs, dims, strides, 24, 40, torch.float32)
+    maps = (key_map.table_storage_, key_map.table_bucket_offsets_, 128, key_map.rows_,
+            key_map.num_scores_, key_map.table_global_capacities_)
+    keys = torch.tensor([19, 887, -1, 19] * 23, device=device)
+    tids = torch.tensor([t for t,n in enumerate(lengths) for _ in range(n)] + [9999] * 11, device=device)
+    count = torch.tensor([live], device=device)
+    defaults = (torch.arange(24 * (1 if shared_default else tables), device=device, dtype=torch.float32)
+                .view(-1, 24).add_(-500))
+    common = [(maps, layout), None, None, count, bound, False]
+    n = min(81, live, len(keys) if bound is None else bound)
+    actual, missing, _ = lookup_embedding_rows(keys, None, *common, defaults, table_ranges=ranges)
+    expected, _, _ = lookup_embedding_rows(keys, tids, *common, defaults)
+    assert missing is None
+    for i in range(n):
+        width = int(dims[tids[i]]) if int(keys[i]) == 19 else 24
+        torch.testing.assert_close(actual[i, :width], expected[i, :width], atol=0, rtol=0)
+    # With no default tensor, preserve the original-order missing flags. A
+    # capacity suffix after the final range can contain arbitrary values.
+    _, missing, _ = lookup_embedding_rows(keys, None, *common, table_ranges=ranges)
+    torch.testing.assert_close(missing[:n], keys[:n] != 19)
+
+
+def test_eval_ranges_falls_back_for_custom_initializer():
+    from dynamicemb.key_value_table import eval_lookup
+
+    options = [
+        DynamicEmbTableOptions(
+            dim=128, index_type=torch.int64, embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(), max_capacity=4096,
+            bucket_capacity=128, local_hbm_for_values=2**23,
+            score_strategy=DynamicEmbScoreStrategy.NO_EVICTION, caching=False,
+        )
+        for _ in range(2)
+    ]
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=options, table_names=["a", "b"], feature_table_map=[0, 1],
+        pooling_mode=DynamicEmbPoolingMode.NONE, output_dtype=torch.float32,
+        optimizer=EmbOptimType.SGD,
+    ).eval()
+    model._storage.training = False
+    keys = torch.tensor([11, 11, 21, 27, 9999, 9999], device="cuda")
+    ranges = torch.tensor([0, 2, 4], device="cuda")
+
+    def init(buffer, keys, count, tids, positions):
+        selected = positions[:int(count)]
+        assert selected.tolist() == [0, 1, 2, 3]
+        assert tids[selected].tolist() == [0, 0, 1, 1]
+        buffer[selected] = (keys[selected] + tids[selected] * 100 + selected).float()[:, None]
+
+    out = eval_lookup(model._storage, keys, None, init, table_ranges=ranges,
+                      num_valid=torch.tensor([8], device="cuda"), host_num_valid=5)
+    torch.testing.assert_close(out[:4], torch.tensor([11.,12.,123.,130.], device="cuda")[:,None].expand(-1,128))
