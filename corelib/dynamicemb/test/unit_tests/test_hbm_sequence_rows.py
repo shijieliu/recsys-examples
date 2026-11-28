@@ -347,3 +347,99 @@ def test_mapped_eval_converts_host_values_for_mixed_dtype_hybrid():
     host_row = rows[1].half().float()
     expected = torch.stack((rows[0], host_row, torch.full_like(rows[0], -7), host_row))
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("width,dtype,offset", [(128, torch.float32, 0), (13, torch.float16, 1)])
+def test_grouped_mapped_eval_reuses_hot_row_without_writing_optimizer_words(width, dtype, offset):
+    from dynamicemb_extensions import grouped_mapped_eval
+
+    dev = torch.device("cuda")
+    keys = torch.tensor([17, 29, 77, 17, 29, -1], device=dev)
+    tids = torch.tensor([0, 0, 0, 1, 1, 1], device=dev)
+    inputs = torch.tensor(([0] * 131 + [1, 2] * 17 + [3, 4, 5] * 29), device=dev)
+    # Interleave the original destinations, including runs spanning multiple
+    # 32-row groups after sorting by source. Repeated table defaults are runs.
+    generator = torch.Generator().manual_seed(23)
+    inputs = inputs[torch.randperm(inputs.numel(), generator=generator).to(dev)]
+    n, live = inputs.numel() + 7, inputs.numel()
+    inverse = torch.full((n,), 9999, device=dev)
+    inverse[:live] = inputs
+    unique = torch.full((n,), -1, device=dev)
+    unique[:keys.numel()] = keys
+    ranges = torch.tensor([0, 3, 6], device=dev)
+    table = get_scored_table([128, 128], bucket_capacity=128, use_rows=True)
+    score = ScoreArg("timestamp", None, ScorePolicy.CONST)
+    selected = [0, 1, 3, 4]
+    table.insert(keys[selected], tids[selected], score)
+    _, _, rows = table.lookup(keys[selected], tids[selected], score)
+    stride = width + offset + 3
+    buffers = [torch.zeros((128, stride), dtype=dtype, pin_memory=True) for _ in range(2)]
+    for item, row in zip(selected, rows.tolist()):
+        buffers[tids[item].item()][row, offset:offset + width].copy_(
+            torch.arange(width, dtype=dtype) + (item + 1) * 32
+        )
+    ptrs = torch.tensor([buf[:, offset:].data_ptr() for buf in buffers], device=dev)
+    layout = ptrs, None, None, width, stride, dtype
+    mapping = (table.table_storage_, table.table_bucket_offsets_, 128, table.rows_,
+               table.num_scores_, table.table_global_capacities_)
+    defaults = torch.empty((2, width), dtype=dtype, device=dev)
+    defaults[0].fill_(-31)
+    defaults[1].fill_(-55)
+    result = grouped_mapped_eval(
+        unique, ranges, inverse, torch.tensor([live], device=dev), (mapping, layout), defaults
+    )
+    expected = torch.stack([
+        torch.arange(width, device=dev, dtype=dtype) + (i + 1) * 32
+        if i in selected else defaults[tids[i]] for i in range(6)
+    ])
+    torch.testing.assert_close(result[:live], expected[inputs], atol=0, rtol=0)
+    empty = grouped_mapped_eval(
+        unique, ranges, inverse, torch.tensor([0], device=dev), (mapping, layout), defaults
+    )
+    assert empty.shape == result.shape
+
+
+def test_grouped_mapped_eval_public_sequence_respects_device_tail(monkeypatch):
+    import dynamicemb.key_value_table as kv
+
+    dev = torch.device("cuda")
+    options = [
+        DynamicEmbTableOptions(
+            dim=256, index_type=torch.int64, embedding_dtype=torch.float16,
+            device_id=torch.cuda.current_device(), init_capacity=128, max_capacity=128,
+            bucket_capacity=128, local_hbm_for_values=0, caching=False,
+            eval_initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT, value=float(-t - 1)
+            ),
+        )
+        for t in range(2)
+    ]
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=options, table_names=["a", "b"], feature_table_map=[0, 1],
+        pooling_mode=DynamicEmbPoolingMode.NONE, output_dtype=torch.float32, optimizer=EmbOptimType.SGD,
+    ).eval()
+    q = torch.tensor([7, 9, 7, -1, 7, 9, 11, 9], device=dev)
+    tids = torch.tensor([0, 1], device=dev)
+    weights = torch.arange(512, device=dev, dtype=torch.float16).view(2, 256)
+    model._storage.insert(q[[0, 5]], tids, weights)
+    grouped = kv.grouped_mapped_eval
+    calls = []
+
+    def capture(*args):
+        calls.append(args[0].shape)
+        return grouped(*args)
+
+    monkeypatch.setattr(kv, "_MIN_GROUPED_HOST_EVAL_KEYS", 1)
+    monkeypatch.setattr(kv, "grouped_mapped_eval", capture)
+    offsets = torch.tensor([0, 4, 8], device=dev)
+    expected = torch.stack([
+        weights[0], torch.full_like(weights[0], -1), weights[0], torch.full_like(weights[0], -1),
+        torch.full_like(weights[0], -2), weights[1], torch.full_like(weights[0], -2), weights[1],
+    ])
+    torch.testing.assert_close(model(q, offsets), expected.float(), atol=0, rtol=0)
+    # The populated input capacity runs past the final device-side table
+    # boundary. Neither unique nor scatter may dereference that suffix.
+    ranges = torch.tensor([0, 4, 7], device=dev)
+    limited = kv.eval_lookup(model._storage, q, None, model._eval_initializer, table_ranges=ranges)
+    torch.testing.assert_close(limited[:7], expected[:7], atol=0, rtol=0)
+    assert len(calls) == 2

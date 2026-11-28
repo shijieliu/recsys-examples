@@ -95,7 +95,9 @@ from dynamicemb_extensions import (
     flagged_compact,
     gather_embedding,
     expand_table_ids_cuda,
+    grouped_mapped_eval,
     lookup_embedding_rows,
+    segmented_unique_cuda,
 )
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
@@ -4799,6 +4801,9 @@ def _expand_eval_ranges(ranges, capacity, num_valid):
     return table_ids, count
 
 
+_MIN_GROUPED_HOST_EVAL_KEYS = 262144
+
+
 def _eval_lookup_storage(
     storage: Storage,
     keys: torch.Tensor,
@@ -4814,11 +4819,30 @@ def _eval_lookup_storage(
     if table_ids is None and (state is None or backing is not None or defaults is None):
         table_ids, num_valid = _expand_eval_ranges(table_ranges, keys.numel(), num_valid)
     if state is not None:
-        keys = keys.contiguous()
+        keys = keys.to(state.key_index_map.key_type).contiguous()
+        # On mapped host storage, group repeated requests by source address
+        # before reading across PCIe. Smaller batches use the direct probe.
+        if (
+            table_ids is None
+            and num_valid is None
+            and host_num_valid is None
+            and state.uniform_value_shape
+            and state.emb_dim * state.emb_dtype.itemsize == 512
+            and not state.tables[0].is_device_buffer()
+            and _MIN_GROUPED_HOST_EVAL_KEYS <= keys.numel() < 2**31 - 1
+            and state.num_tables <= 1024
+        ):
+            ranges = table_ranges.contiguous()
+            _, unique, inverse, unique_ranges, _ = segmented_unique_cuda(
+                keys, ranges, state.num_tables, None
+            )
+            return grouped_mapped_eval(
+                unique, unique_ranges, inverse, ranges[-1:], _eval_row_map(state), defaults
+            )
         if table_ids is not None:
             table_ids = table_ids.contiguous()
         embs, missing, _ = lookup_embedding_rows(
-            keys.to(state.key_index_map.key_type),
+            keys,
             table_ids,
             _eval_row_map(state),
             None,

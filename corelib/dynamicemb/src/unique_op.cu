@@ -287,6 +287,7 @@ segmented_unique_core(
     s_segrange[i] = d_segmented_range[i];
   __syncthreads();
 
+  num_keys = min(num_keys, static_cast<size_t>(s_segrange[num_tables]));
   for (size_t wave = static_cast<size_t>(blockIdx.x) * B; wave < num_keys;
        wave += static_cast<size_t>(gridDim.x) * B) {
     for (int t = tid; t < num_tables; t += B)
@@ -435,6 +436,7 @@ __global__ void segmented_unique_finalize(
     for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
       unique_table_offsets[i] = s_off[i];
 
+  num_keys = min(num_keys, static_cast<size_t>(s_seg[num_tables]));
   const int nt1 = static_cast<int>(num_tables) + 1;
   const int64_t stride = blockDim.x * gridDim.x;
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
@@ -536,14 +538,14 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   }
 
   // Debug validation of segmented_range (enabled via DYNAMICEMB_DEBUG=1).
-  // Checks: starts at 0, ends at num_keys, monotonically non-decreasing.
+  // The final offset may leave an inactive capacity suffix.
   if (std::getenv("DYNAMICEMB_DEBUG")) {
     at::Tensor sr_cpu = segmented_range.to(at::kCPU);
     const int64_t *sr = sr_cpu.data_ptr<int64_t>();
     TORCH_CHECK(sr[0] == 0,
                 "segmented_range[0] must be 0, got ", sr[0]);
-    TORCH_CHECK(sr[num_tables] == num_keys,
-                "segmented_range[num_tables] must equal num_keys (", num_keys,
+    TORCH_CHECK(sr[num_tables] <= num_keys,
+                "segmented_range[num_tables] must be at most num_keys (", num_keys,
                 "), got ", sr[num_tables]);
     for (int64_t t = 0; t < num_tables; ++t) {
       TORCH_CHECK(sr[t + 1] >= sr[t],

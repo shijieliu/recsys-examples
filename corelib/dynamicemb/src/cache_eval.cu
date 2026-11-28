@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "segment_offsets.cuh"
 #include "table_operation/kernels.cuh"
 #include <c10/cuda/CUDAGuard.h>
+#include <cub/device/device_radix_sort.cuh>
 
 namespace dyn_emb {
 namespace {
@@ -375,10 +376,158 @@ std::tuple<at::Tensor, CacheOptionalTensor, CacheOptionalTensor> lookup_embeddin
   }
   return {output, defaults ? std::nullopt : missing, hits};
 }
+// Resolve each distinct (table, key) to the resident value or its encoded
+// table default. The pinned/host value is only dereferenced after sorting.
+__global__ void resolve_mapped_eval_sources(
+    EvalTier primary, const uint64_t *keys, const int64_t *ranges, int tables, int n, int word_bytes, const uint8_t *defaults,
+    int64_t default_stride, int64_t *sources) {
+  const int i = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / kEvalLanes;
+  if (i >= n || i >= ranges[tables]) return;
+  const uint64_t key = keys[i];
+  const int64_t tid = binary_search_upper_bound(ranges, tables + 1, i);
+  const int64_t hash = Table::hash(key);
+  const uint8_t *src = defaults + default_stride * tid;
+  if (Table::BucketType::is_valid(key)) {
+    auto row = primary.find(key, hash, tid);
+    if (row >= 0) src = primary.address(tid, row, word_bytes);
+  }
+  if (!(threadIdx.x % kEvalLanes)) sources[i] = reinterpret_cast<int64_t>(src);
+}
+
+__global__ void mapped_eval_order(const int64_t *sources, const int64_t *inverse,
+                                  const int64_t *unique_count, const int64_t *count,
+                                  int n, int64_t *by_address, int *ordinals) {
+  const int i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int64_t uid = i < counted_limit(count, n) ? inverse[i] : -1;
+  by_address[i] = uid >= 0 && uid < counted_limit(unique_count, n) ? sources[uid] : 0;
+  ordinals[i] = i;
+}
+
+// Each lane holds one destination in a run and one stripe of the source row.
+// Broadcast destinations while retaining the source stripe in its register.
+template <typename T>
+__device__ void fan_out_row(const T *src, T *out, int64_t width,
+                            int dest, int copies, int lane) {
+  for (int64_t base = 0; base < width; base += 32) {
+    const auto element = base + lane;
+    T value{};
+    if (element < width) value = src[element];
+    for (int j = 0; j < copies; ++j) {
+      const int ordinal = __shfl_sync(0xffffffff, dest, j);
+      if (element < width) out[ordinal * width + element] = value;
+    }
+  }
+}
+
+template <bool Continuation>
+__global__ void fan_out_mapped_eval_rows(
+    const int64_t *addresses, const int *ordinals, int n, int64_t width,
+    uint8_t *out) {
+  const int lane = threadIdx.x & 31;
+  const int64_t warp = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  const int64_t i = Continuation ? warp * 32 : warp;
+  if (i >= n) return;
+  const auto address = addresses[i];
+  if (!address) return;
+  const bool same = i > 0 && addresses[i - 1] == address;
+  if (same != Continuation) return;
+  const uint8_t *src = reinterpret_cast<const uint8_t *>(address);
+  if constexpr (Continuation) {
+    // A hot row can span many tiles. Only the first tile fetches it across
+    // PCIe. Independent continuation warps use its published final GPU row.
+    int64_t left = 0, right = i - 1;
+    while (left < right) {
+      const int64_t mid = left + (right - left) / 2;
+      if (addresses[mid] < address) left = mid + 1;
+      else right = mid;
+    }
+    src = out + int64_t(ordinals[left]) * width;
+  }
+  const int64_t q = i + lane;
+  const bool match = q < n && (q >> 5) == (i >> 5) && addresses[q] == address;
+  const int copies = __popc(__ballot_sync(0xffffffff, match));
+  const int dest = match ? ordinals[q] : 0;
+  if (!(reinterpret_cast<uintptr_t>(src) % 16) && !(width % 16)) {
+    fan_out_row(reinterpret_cast<const uint4 *>(src), reinterpret_cast<uint4 *>(out),
+                width / 16, dest, copies, lane);
+  } else {
+    fan_out_row(src, out, width, dest, copies, lane);
+  }
+}
+
+at::Tensor grouped_mapped_eval(at::Tensor keys, at::Tensor ranges, at::Tensor reverse,
+    at::Tensor count, const EvalMap &primary_map, at::Tensor defaults) {
+  const auto device = keys.device();
+  TORCH_CHECK(keys.is_cuda() && (keys.scalar_type() == at::kLong || keys.scalar_type() == at::kUInt64),
+              "expected 64-bit CUDA keys");
+  const c10::cuda::CUDAGuard guard(device);
+  check_vector(keys, device, keys.scalar_type(), "keys");
+  check_vector(ranges, device, at::kLong, "unique table ranges");
+  check_vector(reverse, device, at::kLong, "inverse");
+  TORCH_CHECK(reverse.numel() == keys.numel() &&
+              keys.numel() < std::numeric_limits<int>::max(), "expected equal input capacities");
+  const int64_t tables = std::get<1>(std::get<0>(primary_map)).numel() - 1;
+  const auto primary = eval_tier(primary_map, device, tables);
+  const auto dtype = std::get<5>(std::get<1>(primary_map));
+  TORCH_CHECK(!primary.emb_dims, "grouped eval expects uniform embedding width");
+  TORCH_CHECK(ranges.numel() == tables + 1, "expected one unique range per table");
+  TORCH_CHECK(defaults.device() == device && defaults.scalar_type() == dtype &&
+              defaults.is_contiguous() && defaults.dim() == 2 &&
+              (defaults.size(0) == 1 || defaults.size(0) == tables) &&
+              defaults.size(1) == primary.emb_dim, "invalid constant default rows");
+  const auto *range_ptr = ranges.data_ptr<int64_t>();
+  const auto *unique_ptr = range_ptr + tables;
+  const auto *count_ptr = counted_num_valid_ptr(count, device);
+  const int n = keys.numel();
+  auto out = at::empty({n, primary.emb_dim}, keys.options().dtype(dtype));
+  if (!n) return out;
+  auto sources = at::empty_like(reverse);
+  auto addresses = at::empty_like(reverse);
+  auto ordinals = at::empty({n}, keys.options().dtype(at::kInt));
+  auto sorted = at::empty_like(addresses);
+  auto positions = at::empty_like(ordinals);
+  constexpr int threads = 256;
+  const int64_t blocks = (int64_t(n) + threads - 1) / threads;
+  const int64_t probe_blocks = (int64_t(n) * kEvalLanes + threads - 1) / threads;
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const int64_t row_bytes = primary.emb_dim * out.element_size();
+  resolve_mapped_eval_sources<<<probe_blocks, threads, 0, stream>>>(
+      primary, static_cast<const uint64_t *>(keys.data_ptr()), range_ptr, tables,
+      n, out.element_size(), static_cast<const uint8_t *>(defaults.data_ptr()),
+      defaults.size(0) == 1 ? 0 : row_bytes, sources.data_ptr<int64_t>());
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  mapped_eval_order<<<blocks, threads, 0, stream>>>(sources.data_ptr<int64_t>(),
+      reverse.data_ptr<int64_t>(), unique_ptr, count_ptr, n, addresses.data_ptr<int64_t>(),
+      ordinals.data_ptr<int>());
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  size_t bytes = 0;
+  auto sort = [&](void *storage) {
+    return cub::DeviceRadixSort::SortPairs(storage, bytes, addresses.data_ptr<int64_t>(),
+        sorted.data_ptr<int64_t>(), ordinals.data_ptr<int>(), positions.data_ptr<int>(),
+        n, 0, 64, stream);
+  };
+  C10_CUDA_CHECK(sort(nullptr));
+  auto tmp = at::empty({int64_t(bytes)}, keys.options().dtype(at::kByte));
+  C10_CUDA_CHECK(sort(tmp.data_ptr()));
+  const int64_t first_blocks = (int64_t(n) * 32 + threads - 1) / threads;
+  fan_out_mapped_eval_rows<false><<<first_blocks, threads, 0, stream>>>(
+      sorted.data_ptr<int64_t>(), positions.data_ptr<int>(), n, row_bytes,
+      static_cast<uint8_t *>(out.data_ptr()));
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  fan_out_mapped_eval_rows<true><<<blocks, threads, 0, stream>>>(
+      sorted.data_ptr<int64_t>(), positions.data_ptr<int>(), n, row_bytes,
+      static_cast<uint8_t *>(out.data_ptr()));
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
 } // namespace
 } // namespace dyn_emb
 
 void bind_cache_eval(py::module &m) {
+  m.def("grouped_mapped_eval", &dyn_emb::grouped_mapped_eval, py::arg("unique_keys"),
+        py::arg("unique_table_ranges"), py::arg("inverse"), py::arg("num_valid"),
+        py::arg("primary_map"), py::arg("defaults"));
   m.def("lookup_embedding_rows", &dyn_emb::lookup_embedding_rows, py::arg("keys"),
         py::arg("table_ids"), py::arg("primary_map"), py::arg("overflow"),
         py::arg("backing_map"), py::arg("num_valid") = py::none(),
