@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from dynamicemb.extendable_tensor import HostExtendableBuffer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,
@@ -298,6 +299,54 @@ def test_deferred_cache_exchange(width, reserve, has_victims):
     assert torch.all(cache._ref_counter[slots[:n]] == 1)
     if has_victims:
         assert torch.equal(backing_rows[physical[:n]], dirty)
+
+
+def test_ordered_duplex_preserves_staging_and_dirty_destinations():
+    bucket, n, width = 1024, 32768, 128
+    cache = get_scored_table([n], bucket_capacity=bucket, enable_overflow=True)
+    backing = get_scored_table([4 * n], bucket_capacity=bucket, use_rows=True)
+    candidates = torch.arange(5 * n, device="cuda") + 1
+    by_bucket, offsets, _ = cache.bucketize_keys(candidates, torch.zeros_like(candidates))
+    assert int(offsets.diff().min()) >= 2 * bucket
+    tile = offsets[:-1, None] + torch.arange(bucket, device="cuda")
+    old = by_bucket[tile.flatten()]
+    # Mix home buckets so contiguous staging rows have different source pages.
+    incoming = by_bucket[(tile + bucket).T.flatten()]
+    keys = torch.cat((old, incoming))
+    const = (None, ScorePolicy.CONST)
+    score = ScoreArg("timestamp", *const)
+    physical = backing.insert(keys, torch.zeros_like(keys), score)
+    old_slots = cache.insert(old, torch.zeros_like(old), score)
+
+    device = keys.device
+    host_owner = HostExtendableBuffer((2 * n, width), torch.float32, device)
+    backing_rows = host_owner.tensor()
+    truth = torch.arange(2 * n * width, device=device, dtype=torch.float32).view(-1, width)
+    backing_rows[physical.to(backing_rows.device)] = truth.to(backing_rows.device)
+    dirty = -truth[:n] - 1
+    cached = torch.empty((n + cache.overflow_bucket_capacity_, width), device=device)
+    cached[old_slots] = dirty
+
+    def layout(rows):
+        return _ids([rows.data_ptr()]), None, None, width, width, rows.dtype
+
+    cache_map, backing_map = _maps(cache, backing)
+    deferred = _ids([])
+    _, slots, _, count, pos, staged, new = prepare_cache_lookup(
+        incoming, _ids([0, n]), cache_map, backing_map, layout(backing_rows), const, const,
+        ("constant", [0.0], None, None, 0.0, False, False), deferred_sources=deferred)
+    mutation = (cache.bucket_sizes, cache.overflow_bucket_sizes, cache.score_fn_key_,
+                backing.bucket_sizes, backing.row_counters_, backing.row_limits_, backing.score_fn_key_)
+    result = exchange_cache_storage(
+        cache_map, backing_map, layout(cached), layout(backing_rows), mutation,
+        (None, ScorePolicy.GLOBAL_TIMER), const, (staged[0], staged[1], None, pos, count),
+        (new[0], new[1], new[3], new[2]), staged[2], slots, False, False,
+        deferred_sources=deferred, backing_on_host=True)
+    assert result[:3] == (n, n, 0)
+    assert slots.unique().numel() == n
+    assert torch.equal(staged[2], truth[n:]) and torch.equal(cached[slots], truth[n:])
+    assert torch.equal(backing_rows.to(device)[physical[:n]], dirty)
+    assert int(cache._ref_counter.sum()) == n and torch.all(cache._ref_counter[slots] == 1)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float8_e4m3fn])

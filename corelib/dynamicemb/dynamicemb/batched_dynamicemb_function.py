@@ -508,7 +508,7 @@ def _prefetch_cache_path(
             and not _is_hbm_storage(storage)
             and state.uniform_value_shape
             and backing.uniform_value_shape
-            and backing.value_dim * backing.emb_dtype.itemsize == 1536
+            and backing.value_dim * backing.emb_dtype.itemsize in (512, 1536)
             and unique_keys.numel() >= 4096
         ):
             deferred_sources = torch.empty(0, dtype=torch.int64, device=device)
