@@ -13,7 +13,37 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import _eval_lookup_storage
-from dynamicemb_extensions import load_from_flat_table_emb
+from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy, get_scored_table
+from dynamicemb_extensions import load_from_flat_table_emb, lookup_embedding_rows
+
+
+def test_eval_probes_crowded_bucket_in_table_order():
+    table = get_scored_table([128], bucket_capacity=128, use_rows=True)
+    # A nearly full bucket exercises long probe chains and wraparound. Include
+    # misses and reserved keys in the lookup alongside the inserted keys.
+    keys = torch.arange(1, 122, dtype=torch.int64, device="cuda")
+    score = ScoreArg("timestamp", None, ScorePolicy.CONST)
+    table.insert(keys, torch.zeros_like(keys), score)
+    queries = torch.arange(-3, 151, device="cuda")
+    tids = torch.zeros_like(queries)
+    _, found, rows = table.lookup(queries, tids, score)
+    assert found.sum().item() == keys.numel()
+
+    payload = torch.arange(128 * 4, dtype=torch.float32, device="cuda").view(128, 4)
+    pointers = torch.tensor([payload.data_ptr()], device="cuda")
+    layout = (pointers, None, None, 4, 4, payload.dtype)
+    mapping = (table.table_storage_, table.table_bucket_offsets_, 128, table.rows_,
+               table.num_scores_, table.table_global_capacities_)
+    values, missing, _ = lookup_embedding_rows(queries, tids, (mapping, layout), None, None)
+    assert torch.equal(missing, ~found)
+    assert torch.equal(values[found], payload[rows[found]])
+
+    # DynamicEmb rounds bucket sizes up to 16. A raw caller supplying only
+    # four digest bytes cannot satisfy a read of one 16-byte digest vector.
+    storage, offsets, _, row_map, words, capacities = mapping
+    small = (storage[:storage.numel() // 32], offsets, 4, row_map[:4], words, capacities)
+    with pytest.raises(RuntimeError, match="16-byte digest"):
+        lookup_embedding_rows(queries, tids, (small, layout), None, None)
 
 
 @pytest.mark.parametrize("table_stride", [128, 384])

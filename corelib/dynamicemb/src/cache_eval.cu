@@ -94,6 +94,49 @@ __global__ void lookup_cached_embedding_rows_kernel(
   else backing.copy(tid, row, word_bytes, dst, lane);
 }
 
+// Look ahead by one 16-slot digest vector on a full-width bucket. Loading
+// both aligned vectors first lets the device service independent reads while
+// each lane validates its candidates. Visit slots in the original order.
+__device__ __forceinline__ int read_only_probe_128(
+    Table::BucketType main, uint64_t key, uint64_t hash,
+    const int64_t *bucket_rows) {
+  using Bucket = Table::BucketType;
+  const uint32_t target = Bucket::digest_to_vector(Bucket::hashcode_to_digest(hash));
+  const uint32_t empty = Bucket::digest_to_vector(Bucket::empty_digest());
+  const auto *digest = reinterpret_cast<const uint4 *>(main.digests(0));
+  const int start = (hash & 127) / 16;
+#pragma unroll 1
+  for (int group = 0; group < 8; group += 2) {
+    const int index = (start + group) & 7;
+    const uint4 pair[2] = {digest[index], digest[(index + 1) & 7]};
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const uint4 vec = pair[p];
+      const uint32_t chunks[4] = {vec.x, vec.y, vec.z, vec.w};
+#pragma unroll
+      for (int word = 0; word < 4; ++word) {
+        int key_mask = Bucket::VectorComparator::compare(chunks[word], target);
+        int empty_mask = Bucket::VectorComparator::compare(chunks[word], empty);
+        const int base = (((index + p) & 7) << 4) + 4 * word;
+        while (key_mask) {
+          int pos = base + Bucket::VectorComparator::equal_index(key_mask);
+          auto *candidate = reinterpret_cast<Bucket::AtomicKey *>(main.keys(pos));
+          // Fetch the row map entry while checking the atomic key. Its
+          // contents are consumed only after the key matches.
+          if (bucket_rows) asm volatile("prefetch.global.L2 [%0];" : : "l"(bucket_rows + pos));
+          if (candidate->load(cuda::std::memory_order_relaxed) == key) return pos;
+        }
+        while (empty_mask) {
+          int pos = base + Bucket::VectorComparator::equal_index(empty_mask);
+          auto *candidate = reinterpret_cast<Bucket::AtomicKey *>(main.keys(pos));
+          if (candidate->load(cuda::std::memory_order_relaxed) == Bucket::empty_key()) return -1;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
 // On a single HBM tier the hash probe is short. Use a different request per
 // lane, then shuffle the 32 addresses into groups for coalesced output writes.
 __global__ void lookup_hbm_embedding_rows_kernel(
@@ -119,7 +162,14 @@ __global__ void lookup_hbm_embedding_rows_kernel(
         auto main = tier.table[bucket];
         const auto width = tier.table.bucket_capacity();
         int64_t slot = hash % width, steps = 0;
-        if (main.probe<1>(key, slot, steps) == Table::BucketType::ProbeResult::Existed) {
+        bool found;
+        if (width == 128) {
+          slot = read_only_probe_128(main, key, hash, tier.rows ? tier.rows + bucket * 128 : nullptr);
+          found = slot >= 0;
+        } else {
+          found = main.probe<1>(key, slot, steps) == Table::BucketType::ProbeResult::Existed;
+        }
+        if (found) {
           const auto row = tier.rows ? tier.rows[bucket * width + slot] : (bucket - begin) * width + slot;
           if (row >= 0) {
             src = tier.address(tid, row, word_bytes);
@@ -232,6 +282,8 @@ std::tuple<at::Tensor, at::Tensor, CacheOptionalTensor> lookup_embedding_rows(
           output.element_size(), out, missing.data_ptr<bool>(), hits ? hits->data_ptr<bool>() : nullptr);
     } else {
       TORCH_CHECK(!overflow_map, "direct HBM lookup expects a single map");
+      TORCH_CHECK(primary.table.bucket_capacity_ % Table::BucketType::BufferDim == 0,
+                  "direct HBM lookup requires a bucket with complete 16-byte digest vectors");
       lookup_hbm_embedding_rows_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
           primary, input, table_ids, count, n, output.element_size(), out, missing.data_ptr<bool>());
     }
