@@ -95,12 +95,12 @@ def prefetch(model, keys):
     return model._prefetch_states[-1]
 
 
-@pytest.mark.parametrize("preload_backing", [False, True])
-def test_refused_keys_stop_the_prefetch_and_keep_the_storage(preload_backing):
+@pytest.mark.parametrize("preload_backing,num_keys", [(False, 6000), (True, 6000), (True, 40960)])
+def test_refused_keys_stop_the_prefetch_and_keep_the_storage(preload_backing, num_keys):
     dim = 128 if preload_backing else DIM
     model = make_model(dim=dim)
-    # The failing prefetch hits key 1 and evicts a dirty row for key 10001.
-    warm_keys = torch.tensor([1, 10001], dtype=torch.int64, device="cuda")
+    # The failing prefetch hits key 1 and evicts one dirty row outside the requested keys.
+    warm_keys = torch.tensor([1, num_keys + 1], dtype=torch.int64, device="cuda")
     offsets = torch.tensor([0, 2], dtype=torch.int64, device="cuda")
     with torch.no_grad():
         model(warm_keys, offsets)
@@ -112,7 +112,7 @@ def test_refused_keys_stop_the_prefetch_and_keep_the_storage(preload_backing):
     store_to_flat(
         model._cache._state, slot, victim_tid, dirty_value, num_valid=full_count(slot)
     )
-    keys = torch.arange(1, 6001, dtype=torch.int64, device="cuda")
+    keys = torch.arange(1, num_keys + 1, dtype=torch.int64, device="cuda")
     if preload_backing:
         # The zero-new report permits deferred reads until the same report
         # reveals refusals. The accepted rows must still get their values.

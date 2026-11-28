@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "cache_batch.cuh"
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAException.h>
 #include <cub/device/device_radix_sort.cuh>
 #include "cache_row_copy.cuh"
@@ -430,10 +431,17 @@ Tensor group_exchange_rows(const Tensor &incoming, int64_t n, const Tensor &targ
 
 // Nearby reads and dirty writes travel in the same worklist. A warp holds
 // four rows in flight and each lane copies one vector per 512-byte stripe.
-template <int RowVectors>
+constexpr int64_t kMinOrderedVictims = 32768;
+template <int RowVectors, bool Prefetch = false>
 __global__ void exchange_ordered_rows(
     const int64_t *incoming, const int64_t *order, uint4 *staged, int64_t n,
-    const int64_t *dirty_sources, const int64_t *dirty_targets, int64_t victims) {
+    const int64_t *dirty_sources, const int64_t *dirty_targets, int64_t victims,
+    const int64_t *live_count = nullptr, const int64_t *new_count = nullptr) {
+  if constexpr (Prefetch) {
+    // Mixed batches were already initialized and copied by preparation.
+    if (*new_count || *live_count < kMinOrderedVictims) return;
+    n = n < *live_count ? n : *live_count;
+  }
   constexpr int rows_per_warp = 4, warps = kThreads / 32;
   constexpr int rows_per_tile = rows_per_warp * warps;
   constexpr int stripes = RowVectors / 32;
@@ -449,8 +457,8 @@ __global__ void exchange_ordered_rows(
       src[j] = nullptr;
       dst[j] = nullptr;
       if (i < limit) {
-        const uint64_t key = uint64_t(order[i]);
-        const bool push = (key >> kOrdinalBits) & 1;
+        const uint64_t key = Prefetch ? uint64_t(i) : uint64_t(order[i]);
+        const bool push = !Prefetch && ((key >> kOrdinalBits) & 1);
         const int64_t index = key & kOrdinalMask;
         src[j] = reinterpret_cast<const uint4 *>(push ? dirty_sources[index] : incoming[index]);
         dst[j] = push ? reinterpret_cast<uint4 *>(dirty_targets[index]) : staged + index * RowVectors;
@@ -470,7 +478,10 @@ __global__ void exchange_ordered_rows(
       } else {
 #pragma unroll
         for (int v = 0; v < stripes; ++v) {
-          payload[j][v] = src[j][v * 32 + lane];
+          if constexpr (Prefetch)
+            payload[j][v] = __ldcg(src[j] + v * 32 + lane);
+          else
+            payload[j][v] = src[j][v * 32 + lane];
         }
       }
     }
@@ -635,8 +646,38 @@ ExchangeResult exchange_cache_storage(
   auto status = at::empty({4}, c_tids.options());
   auto host = at::empty({4}, c_tids.options().device(at::kCPU).pinned_memory(true));
   auto stream = at::cuda::getCurrentCUDAStream(values.device().index());
+  const int64_t width_bytes = values.size(1) * values.element_size();
+  int64_t prefix_bound = 0;
+  at::cuda::CUDAEvent prefix_event;
+  bool prefix_pending = false;
+  auto join_prefix = [&] {
+    if (prefix_pending) {
+      prefix_event.block(stream);
+      prefix_pending = false;
+    }
+  };
   // Cache reservation reports backing admissions without another host wait.
   try {
+    if (deferred_sources && backing_on_host && !retain && width_bytes == 512 && n >= kMinOrderedVictims &&
+        std::get<1>(cache_score) == ScorePolicyType::GlobalTimer) {
+      // The backing map and staged values are stable while only cache metadata
+      // is reserved. Joining the caller stream before publishing or unwinding
+      // keeps all tensor views and their physical backing owners alive.
+      auto prefetch_stream = at::cuda::getStreamFromPool(false, values.get_device());
+      if (prefetch_stream == stream) prefetch_stream = at::cuda::getStreamFromPool(false, values.get_device());
+      // Waiting on an event snapshots its current record. Allocate it here
+      // before issuing reads, then re-record it on the reader for the join.
+      prefix_event.record(stream);
+      prefix_event.block(prefetch_stream);
+      prefix_bound = std::min<int64_t>(n, (24 << 20) / width_bytes);
+      const int grid = std::max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount / 4);
+      exchange_ordered_rows<32, true><<<grid, kThreads, 0, prefetch_stream>>>(
+          deferred_sources->data_ptr<int64_t>(), nullptr, static_cast<uint4 *>(values.data_ptr()),
+          prefix_bound, nullptr, nullptr, 0, c_count.data_ptr<int64_t>(), new_count);
+      prefix_event.record(prefetch_stream);
+      prefix_pending = true;
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     auto ranked = !deterministic && std::get<1>(cache_score) == ScorePolicyType::GlobalTimer
                       ? try_ranked_cache_reservation(cache_map, cache_sizes, ovf_sizes,
                                                      c_keys, c_tids, c_count, b_count, status)
@@ -654,25 +695,34 @@ ExchangeResult exchange_cache_storage(
     const int64_t attempted = counts[0], evicted = counts[1], refused = counts[2];
     TORCH_CHECK(attempted >= 0 && attempted <= n && refused >= 0 &&
                     refused <= evicted && evicted <= attempted, "invalid cache placement report");
-    if (attempted == 0) return {0, 0, 0, {}};
+    if (attempted == 0) {
+      join_prefix();
+      return {0, 0, 0, {}};
+    }
 
     const auto backing_limit = std::min(attempted, b_keys.numel());
     const int64_t backing_bound =
         ranked ? std::clamp<int64_t>(counts[3], 0, backing_limit) : backing_limit;
-    const auto width_bytes = values.size(1) * values.element_size();
     const bool short_rows = width_bytes == 512;
     // Limit sorting to the large sparse exchanges of uniform rows.
-    const bool order_duplex = backing_on_host && evicted >= 32768 &&
+    const bool order_duplex = backing_on_host && evicted >= kMinOrderedVictims &&
                               (short_rows || width_bytes == 1536) &&
                               attempted <= static_cast<int64_t>(kOrdinalMask) &&
                               evicted <= static_cast<int64_t>(kOrdinalMask);
     const bool duplex = deferred_sources && ranked && backing_bound == 0 &&
                         refused == 0 && evicted > 0 && (!short_rows || order_duplex);
-    if (deferred_sources && !duplex && (!ranked || backing_bound == 0)) {
-      // The ordinary report omits the backing count. The device predicate
-      // skips the read if preparation already staged all hits before mutation.
-      transfer_backing_rows(*deferred_sources, values, attempted, nullptr, nullptr, 0,
-                            ranked ? nullptr : new_count, stream);
+    // On mixed/refused or unranked paths, leave all backing mutations and
+    // reads in their established order. The prefix worker is a no-op for
+    // mixed batches. A successful ordered exchange can overlap victim lookup.
+    if (!duplex) join_prefix();
+    const int64_t prefix = attempted < kMinOrderedVictims ? 0 : std::min(prefix_bound, attempted);
+    const int64_t remaining = attempted - prefix;
+    if (deferred_sources && !duplex && remaining && (!ranked || backing_bound == 0)) {
+      // A fallback with no new backing rows may have prefetched some inputs.
+      // The device predicate skips this read if preparation staged a mixed batch.
+      auto sources = prefix ? deferred_sources->narrow(0, prefix, remaining) : *deferred_sources;
+      auto staged = prefix ? values.narrow(0, prefix, remaining) : values;
+      transfer_backing_rows(sources, staged, remaining, nullptr, nullptr, 0, ranked ? nullptr : new_count, stream);
     }
     auto [back_slots, back_count, back_keys, victim_slots, back_scores, victim_tids] =
         back.insert(b_keys, b_tids, b_count, backing_score, spill, retain,
@@ -730,7 +780,8 @@ ExchangeResult exchange_cache_storage(
       if (duplex && order_duplex) {
         // Each incoming key missed cache, and all true hits are pinned.
         // With no backing insert the victims and inputs own disjoint rows.
-        auto order = group_exchange_rows(*deferred_sources, attempted, targets, stream);
+        auto incoming = prefix ? deferred_sources->narrow(0, prefix, remaining) : *deferred_sources;
+        auto order = group_exchange_rows(incoming, remaining, targets, stream);
         const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
         const auto exchange_rows = [&](auto vectors) {
           constexpr int width = decltype(vectors)::value;
@@ -738,8 +789,8 @@ ExchangeResult exchange_cache_storage(
           // Adam rows benefit from twice as many blocks as single-stripe SGD rows.
           const int grid = std::max(1, sms / (width == 32 ? 4 : 2));
           exchange_ordered_rows<width><<<grid, kThreads, 0, stream>>>(
-              deferred_sources->data_ptr<int64_t>(), order.data_ptr<int64_t>(),
-              static_cast<uint4 *>(values.data_ptr()), attempted, sources.data_ptr<int64_t>(),
+              incoming.data_ptr<int64_t>(), order.data_ptr<int64_t>(),
+              static_cast<uint4 *>(values.data_ptr()) + prefix * width, remaining, sources.data_ptr<int64_t>(),
               targets.data_ptr<int64_t>(), victims);
         };
         if (short_rows) exchange_rows(std::integral_constant<int, 32>{});
@@ -773,6 +824,7 @@ ExchangeResult exchange_cache_storage(
         spills.emplace_back(*fields[0], *fields[1], gone_values, gone_count, gone_rows);
       }
     }
+    join_prefix();
     // Dirty cache slots have reached backing or spill buffers. On partial
     // refusal the accepted rows still receive their values, but no new pin
     // belongs to this failed batch and no slot is published for backward.
@@ -815,6 +867,7 @@ ExchangeResult exchange_cache_storage(
     }
     return {attempted, evicted, refused, std::move(spills)};
   } catch (const std::exception &e) {
+    join_prefix();
     throw CachePlacementError(e.what());
   }
 }

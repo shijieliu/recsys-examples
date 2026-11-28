@@ -301,10 +301,11 @@ def test_deferred_cache_exchange(width, reserve, has_victims):
         assert torch.equal(backing_rows[physical[:n]], dirty)
 
 
-@pytest.mark.parametrize("width,offset_word,n,empty", [
-    (128, 0, 32768, 0), (128, 1, 33792, 1), (384, 1, 132096, 0),
+@pytest.mark.parametrize("width,offset_word,n,empty,missing", [
+    (128, 0, 32768, 0, 0), (128, 1, 33792, 1, 0), (384, 1, 132096, 0, 0),
+    (128, 0, 65536, 1, 1), (128, 0, 65536, 65536, 0),
 ])
-def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_word, n, empty):
+def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_word, n, empty, missing):
     bucket = 1024
     cache = get_scored_table([n], bucket_capacity=bucket, enable_overflow=True)
     backing = get_scored_table([4 * n], bucket_capacity=bucket, use_rows=True)
@@ -318,11 +319,12 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_w
     keys = torch.cat((old, incoming))
     const = (None, ScorePolicy.CONST)
     score = ScoreArg("timestamp", *const)
-    physical = backing.insert(keys, torch.zeros_like(keys), score)
+    stored = keys[:2 * n - missing]
+    physical = backing.insert(stored, torch.zeros_like(stored), score)
     # With an empty slot, the two directions have unequal lengths and the
     # last tile of the mixed worklist has an odd number of rows.
     resident = old[:n - empty]
-    old_slots = cache.insert(resident, torch.zeros_like(resident), score)
+    old_slots = cache.insert(resident, torch.zeros_like(resident), score) if resident.numel() else resident
 
     device = keys.device
     # The one-word offset exercises raw table pointers that cannot use a
@@ -334,7 +336,7 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_w
     truth = (indices % (1 << 23)).float().view(-1, width)
     # Keep rows identifiable even across repeated exact-FP32 word patterns.
     truth[:, 0] = torch.arange(2 * n, device=device)
-    backing_rows[physical.to(backing_rows.device)] = truth.to(backing_rows.device)
+    backing_rows[physical.to(backing_rows.device)] = truth[:stored.numel()].to(backing_rows.device)
     dirty = -truth[:n - empty] - 1
     cached = torch.empty((n + cache.overflow_bucket_capacity_, width), device=device)
     cached[old_slots] = dirty
@@ -346,14 +348,27 @@ def test_ordered_duplex_preserves_staging_and_dirty_destinations(width, offset_w
     deferred = _ids([])
     _, slots, _, count, pos, staged, new = prepare_cache_lookup(
         incoming, _ids([0, n]), cache_map, backing_map, layout(backing_rows), const, const,
-        ("constant", [0.0], None, None, 0.0, False, False), deferred_sources=deferred)
+        ("constant", [13.25], None, None, 0.0, False, False), deferred_sources=deferred)
     mutation = (cache.bucket_sizes, cache.overflow_bucket_sizes, cache.score_fn_key_,
                 backing.bucket_sizes, backing.row_counters_, backing.row_limits_, backing.score_fn_key_)
-    result = exchange_cache_storage(
-        cache_map, backing_map, layout(cached), layout(backing_rows), mutation,
-        (None, ScorePolicy.GLOBAL_TIMER), const, (staged[0], staged[1], None, pos, count),
-        (new[0], new[1], new[3], new[2]), staged[2], slots, False, False,
-        deferred_sources=deferred, backing_on_host=True)
+    # Exercise event edges when the public operator runs on a non-default
+    # caller stream. A mixed batch must finish ordinary initialization before
+    # any backing row is reassigned.
+    caller = torch.cuda.Stream()
+    caller.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(caller):
+        result = exchange_cache_storage(
+            cache_map, backing_map, layout(cached), layout(backing_rows), mutation,
+            (None, ScorePolicy.GLOBAL_TIMER), const, (staged[0], staged[1], None, pos, count),
+            (new[0], new[1], new[3], new[2]), staged[2], slots, False, False,
+            deferred_sources=deferred, backing_on_host=True)
+    torch.cuda.current_stream().wait_stream(caller)
+    assert int(new[2]) == missing
+    if missing:
+        truth[-missing:] = 13.25
+        _, found, row = backing.lookup(keys[-missing:], torch.zeros_like(keys[-missing:]), score)
+        assert bool(found.all())
+        assert torch.equal(backing_rows.to(device)[row], truth[-missing:])
     assert result[:3] == (n, n - empty, 0)
     assert slots.unique().numel() == n
     assert torch.equal(staged[2], truth[n:]) and torch.equal(cached[slots], truth[n:])
