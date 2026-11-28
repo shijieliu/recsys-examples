@@ -915,8 +915,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
         if (
             type(self._eval_initializer) is ConstantInitializer
-            and type(self._storage) is DynamicEmbStorage
-            and (self._cache is not None or self._storage._state.tables[0].is_device_buffer())
+            and type(self._storage) in (DynamicEmbStorage, HybridStorage)
         ):
             self._eval_initializer.prepare_eval_rows(
                 device, self._storage.embedding_dtype(), self._storage.max_embedding_dim()

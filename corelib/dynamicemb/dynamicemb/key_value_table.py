@@ -4767,6 +4767,21 @@ def _eval_row_map(state: DynamicEmbTableState):
     return _backing_lookup_map(state), _cache_value_layout(state)
 
 
+def _readonly_eval_states(storage):
+    """Return the concrete value tiers an eval probe may read, in lookup order."""
+    if type(storage) is DynamicEmbStorage:
+        primary, backing = storage._state, None
+    elif type(storage) is HybridStorage:
+        primary, backing = storage._hbm, storage._host
+    else:
+        return None, None
+    if primary.training or primary.key_index_map.enable_overflow_:
+        return None, None
+    if backing is not None and (backing.training or backing.key_index_map.enable_overflow_):
+        return None, None
+    return primary, backing
+
+
 def _eval_lookup_storage(
     storage: Storage,
     keys: torch.Tensor,
@@ -4776,13 +4791,8 @@ def _eval_lookup_storage(
     *,
     host_num_valid: Optional[int] = None,
 ) -> torch.Tensor:
-    if (
-        type(storage) is DynamicEmbStorage
-        and not storage.training
-        and storage._state.tables[0].is_device_buffer()
-        and not storage._state.key_index_map.enable_overflow_
-    ):
-        state = storage._state
+    state, backing = _readonly_eval_states(storage)
+    if state is not None:
         keys = keys.contiguous()
         table_ids = table_ids.contiguous()
         embs, missing, _ = lookup_embedding_rows(
@@ -4790,7 +4800,7 @@ def _eval_lookup_storage(
             table_ids,
             _eval_row_map(state),
             None,
-            None,
+            _eval_row_map(backing) if backing is not None else None,
             num_valid,
             host_num_valid,
             False,

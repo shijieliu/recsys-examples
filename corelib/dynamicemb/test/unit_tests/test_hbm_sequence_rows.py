@@ -187,3 +187,59 @@ def test_eval_full_hbm_table_rows_and_per_table_misses():
         ]
     )
     torch.testing.assert_close(out[:6], expect, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
+def test_mapped_eval_reads_each_tier_and_uses_table_defaults(hybrid, optimizer):
+    from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage, _insert_key_values
+
+    dev = torch.device("cuda")
+    dim = 32
+    value_dim = dim if optimizer == EmbOptimType.SGD else dim * 3
+    options = [
+        DynamicEmbTableOptions(
+            dim=dim, index_type=torch.int64, embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(), max_capacity=4096, bucket_capacity=128,
+            local_hbm_for_values=4096 * value_dim * 2 if hybrid else 0,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP, caching=False,
+            eval_initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT, value=float(-100 - t)),
+        )
+        for t in range(2)
+    ]
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=options, table_names=["a", "b"], feature_table_map=[0, 1],
+        pooling_mode=DynamicEmbPoolingMode.NONE, output_dtype=torch.float32, optimizer=optimizer,
+    ).eval()
+    storage = model._storage
+    assert type(storage) is (HybridStorage if hybrid else DynamicEmbStorage)
+    host = storage._host if hybrid else storage._state
+    assert not host.tables[0].is_device_buffer()
+    payload = torch.arange(4 * value_dim, dtype=torch.float32, device=dev).view(4, value_dim)
+    keys = torch.tensor([17, 17, 29, 29], device=dev)
+    tids = torch.tensor([0, 1, 0, 1], device=dev)
+    if hybrid:
+        _insert_key_values(storage._hbm, keys[:2], tids[:2], payload[:2], None, False)
+        _insert_key_values(host, keys[2:], tids[2:], payload[2:], None, False)
+    else:
+        storage.insert(keys, tids, payload)
+    q = torch.tensor([17, 29, 29, 47, -1, 17, 47, 29, 17, -3, 47, 29], device=dev)
+    out = model(q, torch.tensor([0, 7, 12], device=dev))
+    reference_rows = []
+    for i, key in enumerate(q.tolist()):
+        tid = int(i >= 7)
+        if key in (17, 29):
+            source = tid + (2 if key == 29 else 0)
+            reference_rows.append(payload[source, :dim])
+        else:
+            reference_rows.append(torch.full((dim,), float(-100 - tid), device=dev))
+    reference = torch.stack(reference_rows)
+    torch.testing.assert_close(out, reference, atol=0, rtol=0)
+
+    # An independent device bound and host bound apply to the original rows
+    # in the direct eval API; the invalid suffix table must never be addressed.
+    ids = torch.tensor([0] * 7 + [1] * 2 + [9999] * 3, device=dev)
+    bounded = _eval_lookup_storage(storage, q, ids, model._eval_initializer,
+        torch.tensor([10], device=dev), host_num_valid=9)
+    torch.testing.assert_close(bounded[:9], reference[:9], atol=0, rtol=0)
